@@ -1,6 +1,6 @@
 # Osaurus Telegram
 
-Connect Telegram chats to your Osaurus agents. Every message sent to your Telegram bot is forwarded to an Osaurus agent, and the agent's response streams back to the conversation in real time. Choose between **Work Mode** for background multi-step tasks or **Chat Mode** for fast, conversational exchanges with token-by-token streaming.
+Connect Telegram chats to your Osaurus agents. Messages sent to your bot get a streaming conversational response by default. Use the `/work` command to dispatch background multi-step tasks when you need the full agent runtime.
 
 ## How It Works
 
@@ -20,32 +20,35 @@ Telegram User                    Osaurus Telegram Plugin                Osaurus 
 ```
 
 1. A Telegram user sends a message to your bot.
-2. The plugin receives it via webhook and checks the configured **agent mode**.
-3. **Work Mode** dispatches a background agent task. As the agent works, the plugin relays progress updates (typing indicators, draft messages, or editable status messages) back to Telegram. When the task completes, the final result is sent as a message.
-4. **Chat Mode** (private chats) calls the host inference API with streaming enabled. Tokens arrive one by one, and the plugin pushes progressive draft updates to Telegram so the user sees the response being written in real time. In group chats, Chat Mode falls back to the Work Mode dispatch path.
+2. The plugin receives it via webhook.
+3. **Private chats** use the host inference API with streaming. Tokens arrive one by one, and the plugin pushes progressive draft updates to Telegram so the user sees the response being written in real time. A final permanent message is sent when streaming completes.
+4. **Group chats** dispatch a background agent task. The plugin relays progress updates (typing indicators, editable status messages) and sends the final result as a message.
+5. **`/work` command** explicitly dispatches a background agent task in any chat (e.g. `/work summarize today's news`). This is useful for complex multi-step tasks that benefit from full agent capabilities.
 
 ## Features
 
-### Work Mode (`agent_mode = "work"`)
+### Chat Mode (default)
 
-Best for complex, multi-step tasks that benefit from full agent capabilities (tool use, research, file access).
+All private chat messages use streaming inference for fast, conversational responses.
 
-- **Background agent dispatch** — Your message becomes a task that runs asynchronously on the Osaurus agent runtime.
-- **Real-time progress in private chats** — Uses Telegram's `sendMessageDraft` API to show live status updates ("Working on it...", "50% — Analyzing data...") without cluttering the chat with extra messages.
-- **Progress in group chats** — Sends typing indicators and optionally edits a status message with progress updates.
+- **Token-by-token streaming** — Calls the host's `complete_stream` inference API. Draft updates are pushed to Telegram so the user sees the response being typed out progressively.
+- **Conversation context** — The last 20 messages from the chat history are included, giving the model awareness of the ongoing conversation.
+- **Immediate feedback** — A "Thinking..." draft appears instantly while the model generates its response.
+
+### Work Mode (`/work` command)
+
+Use `/work <prompt>` for complex, multi-step tasks that benefit from full agent capabilities (tool use, research, file access).
+
+- **Background agent dispatch** — Your prompt becomes a task that runs asynchronously on the Osaurus agent runtime.
+- **Real-time progress** — In private chats, a real message is created and updated with streaming output. In group chats, typing indicators and status messages show progress.
 - **Clarification flow** — If the agent needs more information, an inline keyboard appears with options the user can tap. The selected answer is forwarded back to the agent automatically.
-- **Long message splitting** — Responses that exceed Telegram's 4096-character limit are split into multiple messages with MarkdownV2 formatting preserved.
+- **Long message splitting** — Responses that exceed Telegram's 4096-character limit are split into multiple messages.
 
 **Task lifecycle:** `started` -> `activity` -> `progress` -> `completed` / `failed` / `cancelled`
 
-### Chat Mode (`agent_mode = "chat"`)
+### Group Chats
 
-Best for quick, conversational back-and-forth without the overhead of a full agent task.
-
-- **Token-by-token streaming** — In private chats, the plugin calls the host's `complete_stream` inference API. As tokens arrive, draft updates are pushed to Telegram so the user sees the response being typed out progressively.
-- **Conversation context** — The last 20 messages from the chat history are included as context, giving the model awareness of the ongoing conversation.
-- **Group chat fallback** — In group chats, Chat Mode automatically falls back to the Work Mode dispatch path since Telegram drafts are only available in private chats.
-- **Immediate feedback** — A "Thinking..." draft appears instantly while the model generates its response.
+Group chat messages always use work mode dispatch since Telegram drafts are only available in private chats. The `/work` command also works in groups.
 
 ### Common Features
 
@@ -56,21 +59,7 @@ Best for quick, conversational back-and-forth without the overhead of a full age
 
 ## Conversation Examples
 
-### Work Mode — Multi-step task
-
-```
-You:   Summarize the top 5 Hacker News stories today
-
-Bot:   ⏳ Working on it...          (draft update)
-Bot:   ⏳ Fetching HN front page... (draft update)
-Bot:   ⏳ 60% — Summarizing...      (draft update)
-
-Bot:   Here are today's top 5 HN stories:
-       1. ...
-       2. ...
-```
-
-### Chat Mode — Streaming conversation
+### Chat — Streaming conversation (default)
 
 ```
 You:   What's the difference between TCP and UDP?
@@ -82,10 +71,23 @@ You:   Can you give me a simple analogy?
 Bot:   Think of TCP like a phone call — you dial,...   (streams in progressively)
 ```
 
+### Work — Background task via /work command
+
+```
+You:   /work summarize the top 5 Hacker News stories today
+
+Bot:   ⏳ Working on it...          (status update)
+Bot:   ⏳ Fetching HN front page... (status update)
+
+Bot:   Here are today's top 5 HN stories:
+       1. ...
+       2. ...
+```
+
 ### Clarification — Agent asks a follow-up
 
 ```
-You:   Deploy the latest build
+You:   /work deploy the latest build
 
 Bot:   ❓ Which environment should I deploy to?
        [ Staging ]  [ Production ]  [ Dev ]
@@ -118,11 +120,10 @@ osaurus tools install ./osaurus.telegram-0.1.0.zip
 2. Find the **Telegram** plugin
 3. Paste your bot token into the **Bot Token** field
 4. The plugin will automatically validate the token and register a webhook with Telegram
-5. Choose your preferred **Agent Mode** (Work or Chat)
 
 ### 4. Start Chatting
 
-Send a message to your bot in Telegram. In Work Mode, the plugin dispatches it to an Osaurus agent and relays the response. In Chat Mode (private chats), you get a streaming conversational response.
+Send a message to your bot in Telegram. In private chats, you get a streaming conversational response. Use `/work <prompt>` to dispatch a background agent task for complex multi-step work.
 
 ## Bot Commands
 
@@ -130,12 +131,14 @@ Send a message to your bot in Telegram. In Work Mode, the plugin dispatches it t
 |---------|-------------|
 | `/start` | Start the bot and show a welcome message |
 | `/clear` | Clear conversation history and start fresh |
+| `/work <prompt>` | Dispatch a background agent task for multi-step work |
 
 To make these appear in Telegram's command menu, send `/setcommands` to [@BotFather](https://t.me/BotFather) and enter:
 
 ```
 start - Start the bot
 clear - Clear conversation history
+work - Dispatch a background agent task
 ```
 
 ## Tools
@@ -159,10 +162,9 @@ The plugin exposes two tools that agents can call during task execution:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `bot_token` | secret | — | Telegram bot token from [@BotFather](https://t.me/BotFather). Required. |
-| `agent_mode` | select | `work` | `work` dispatches background agent tasks. `chat` uses streaming inference in private chats (falls back to work in groups). |
 | `allowed_chat_ids` | text | (empty) | Comma-separated Telegram chat IDs. Leave blank to allow all chats. |
-| `send_typing` | toggle | on | Show a typing indicator while the agent works. Applies to Work Mode in group chats. |
-| `send_progress` | toggle | off | Edit the status message with activity/progress text. Only applies to Work Mode in group chats (private chats use drafts instead). |
+| `send_typing` | toggle | on | Show a typing indicator while the agent works. Applies to work mode in group chats. |
+| `send_progress` | toggle | off | Edit the status message with activity/progress text. Only applies to work mode in group chats. |
 
 ## Development
 

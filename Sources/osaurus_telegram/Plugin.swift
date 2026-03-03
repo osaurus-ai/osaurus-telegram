@@ -259,16 +259,6 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
                 "title": "Behavior",
                 "fields": [
                   {
-                    "key": "agent_mode",
-                    "type": "select",
-                    "label": "Agent Mode",
-                    "options": [
-                      { "value": "work", "label": "Work Mode (background, multi-step)" },
-                      { "value": "chat", "label": "Chat Mode (conversational)" }
-                    ],
-                    "default": "work"
-                  },
-                  {
                     "key": "allowed_chat_ids",
                     "type": "text",
                     "label": "Allowed Chat IDs",

@@ -174,6 +174,27 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
     return
   }
 
+  if let text = message.text, text.hasPrefix("/work") {
+    let workPrompt = String(text.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+    guard let token = ctx.botToken else {
+      logWarn("handleMessage: /work received but no bot token")
+      return
+    }
+    guard !workPrompt.isEmpty else {
+      _ = telegramSendMessage(
+        token: token, chatId: chatId,
+        text: "Usage: /work <prompt>\nExample: /work find me new restaurants in Irvine",
+        replyTo: message.message_id)
+      return
+    }
+    logDebug("handleMessage: /work command, prompt=\"\(String(workPrompt.prefix(100)))\"")
+    telegramSendChatAction(token: token, chatId: chatId)
+    dispatchWorkTask(
+      token: token, chatId: chatId, prompt: workPrompt, message: message,
+      isPrivateChat: isPrivateChat, agentAddress: agentAddress)
+    return
+  }
+
   let prompt = buildPrompt(from: message)
   guard !prompt.isEmpty else {
     logDebug("handleMessage: empty prompt, ignoring message")
@@ -206,12 +227,11 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
 
   telegramSendChatAction(token: token, chatId: chatId)
 
-  let agentMode = configGet("agent_mode") ?? "work"
   logDebug(
-    "handleMessage: agent_mode=\(agentMode) isPrivate=\(isPrivateChat) complete_stream=\(hostAPI?.pointee.complete_stream != nil)"
+    "handleMessage: isPrivate=\(isPrivateChat) complete_stream=\(hostAPI?.pointee.complete_stream != nil)"
   )
 
-  if agentMode == "chat" && isPrivateChat && hostAPI?.pointee.complete_stream != nil {
+  if isPrivateChat && hostAPI?.pointee.complete_stream != nil {
     logDebug("handleMessage: -> chat mode streaming path")
     handleChatModeStreaming(
       token: token, chatId: chatId,
@@ -221,8 +241,18 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
     return
   }
 
-  logDebug("handleMessage: -> work mode dispatch path")
+  logDebug("handleMessage: -> work mode dispatch path (group chat)")
+  dispatchWorkTask(
+    token: token, chatId: chatId, prompt: prompt, message: message,
+    isPrivateChat: isPrivateChat, agentAddress: agentAddress)
+}
 
+// MARK: - Work Mode Dispatch
+
+private func dispatchWorkTask(
+  token: String, chatId: String, prompt: String, message: TelegramMessage,
+  isPrivateChat: Bool, agentAddress: String?
+) {
   let titleText = message.text ?? message.caption ?? "Media message"
   let firstLine = String(titleText.prefix(60))
 
@@ -232,10 +262,9 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
     return
   }
 
-  let dispatchMode = (agentMode == "chat" && !isPrivateChat) ? "work" : agentMode
   var dispatchPayload: [String: Any] = [
     "prompt": prompt,
-    "mode": dispatchMode,
+    "mode": "work",
     "title": "Telegram: \(firstLine)",
   ]
   if let agentAddress { dispatchPayload["agent_address"] = agentAddress }
@@ -244,9 +273,7 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
     return
   }
 
-  logDebug(
-    "handleMessage: dispatching with mode=\(dispatchMode) payload=\(String(dispatchJSON.prefix(300)))"
-  )
+  logDebug("handleMessage: dispatching work task payload=\(String(dispatchJSON.prefix(300)))")
 
   let dispatchResultStr: String? = dispatchJSON.withCString { ptr in
     guard let resultPtr = dispatch(ptr) else { return nil }

@@ -46,7 +46,7 @@ struct PluginContextTests {
     let ctx = PluginContext()
     ctx.botToken = "existing"
 
-    onConfigChanged(ctx: ctx, key: "agent_mode", value: "chat")
+    onConfigChanged(ctx: ctx, key: "allowed_chat_ids", value: "123")
 
     #expect(ctx.botToken == "existing")
   }

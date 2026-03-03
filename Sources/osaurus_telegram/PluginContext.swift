@@ -1,5 +1,12 @@
 import Foundation
 
+// MARK: - Types
+
+struct TaskStreamState {
+  var messageId: Int
+  var lastEditTime: Date
+}
+
 // MARK: - Plugin Context
 
 final class PluginContext: @unchecked Sendable {
@@ -9,6 +16,7 @@ final class PluginContext: @unchecked Sendable {
   var webhookSecret: String?
 
   var taskOutputTexts: [String: String] = [:]
+  var taskStreamStates: [String: TaskStreamState] = [:]
 
   let telegramSendTool = TelegramSendTool()
   let chatHistoryTool = TelegramGetChatHistoryTool()

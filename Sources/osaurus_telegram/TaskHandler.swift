@@ -27,6 +27,8 @@ private let taskEventNames: [Int32: String] = [
   4: "COMPLETED", 5: "FAILED", 6: "CANCELLED", 7: "OUTPUT",
 ]
 
+private let outputEditThrottleInterval: TimeInterval = 3.0
+
 func handleTaskEvent(ctx: PluginContext, taskId: String, eventType: Int32, eventJSON: String) {
   let eventName = taskEventNames[eventType] ?? "UNKNOWN(\(eventType))"
   logDebug(
@@ -82,6 +84,13 @@ func handleTaskEvent(ctx: PluginContext, taskId: String, eventType: Int32, event
   default:
     logWarn("Unknown task event type \(eventType) for task \(taskId)")
   }
+}
+
+// MARK: - Helpers
+
+private func cleanupTaskState(ctx: PluginContext, taskId: String) {
+  ctx.taskOutputTexts.removeValue(forKey: taskId)
+  ctx.taskStreamStates.removeValue(forKey: taskId)
 }
 
 // MARK: - Event Handlers
@@ -230,31 +239,35 @@ private func handleCompleted(
 ) {
   let event = parseJSON(eventJSON, as: TaskCompletedEvent.self)
   let summary = event?.summary ?? "Task completed."
-  let accumulatedOutput = ctx.taskOutputTexts.removeValue(forKey: task.taskId)
+  let accumulatedOutput = ctx.taskOutputTexts[task.taskId]
+  let streamState = ctx.taskStreamStates[task.taskId]
+  cleanupTaskState(ctx: ctx, taskId: task.taskId)
   let messageText = accumulatedOutput ?? summary
+  let outputDesc = accumulatedOutput.map { "\($0.count) chars" } ?? "none"
+  let streamDesc = streamState.map { "\($0.messageId)" } ?? "none"
   logDebug(
-    "handleCompleted: task \(task.taskId) summary=\(String(summary.prefix(200))) (\(summary.count) chars) accumulatedOutput=\(accumulatedOutput != nil ? "\(accumulatedOutput!.count) chars" : "none")"
+    "handleCompleted: task \(task.taskId) summary=\(summary.count) chars output=\(outputDesc) streamMsgId=\(streamDesc)"
   )
 
   if !isPrivate, let statusMsgId = task.statusMsgId {
     _ = telegramDeleteMessage(token: token, chatId: chatId, messageId: statusMsgId)
   }
 
-  let msgId = telegramSendLongMessage(token: token, chatId: chatId, text: messageText)
-  logDebug("handleCompleted: sent message, msgId=\(msgId.map { "\($0)" } ?? "nil")")
+  if let streamState {
+    let ok = telegramEditMessage(
+      token: token, chatId: chatId, messageId: streamState.messageId,
+      text: String(messageText.prefix(4096)))
+    logDebug("handleCompleted: final edit msg \(streamState.messageId) ok=\(ok)")
+  } else {
+    let msgId = telegramSendLongMessage(token: token, chatId: chatId, text: messageText)
+    logDebug("handleCompleted: sent new message, msgId=\(msgId.map { "\($0)" } ?? "nil")")
 
-  if let msgId {
-    DatabaseManager.insertMessage(
-      chatId: chatId,
-      messageId: msgId,
-      direction: "out",
-      senderId: nil,
-      senderName: "Agent",
-      text: messageText,
-      mediaType: nil,
-      mediaFileId: nil,
-      taskId: task.taskId
-    )
+    if let msgId {
+      DatabaseManager.insertMessage(
+        chatId: chatId, messageId: msgId, direction: "out",
+        senderId: nil, senderName: "Agent", text: messageText,
+        mediaType: nil, mediaFileId: nil, taskId: task.taskId)
+    }
   }
 
   DatabaseManager.updateTask(taskId: task.taskId, status: "completed", summary: summary)
@@ -265,7 +278,7 @@ private func handleFailed(
   ctx: PluginContext, token: String, chatId: String, task: TaskRow, isPrivate: Bool,
   eventJSON: String
 ) {
-  ctx.taskOutputTexts.removeValue(forKey: task.taskId)
+  cleanupTaskState(ctx: ctx, taskId: task.taskId)
   let event = parseJSON(eventJSON, as: TaskFailedEvent.self)
   let summary = event?.summary ?? "Task failed."
   logDebug("handleFailed: task \(task.taskId) summary=\"\(String(summary.prefix(200)))\"")
@@ -282,7 +295,7 @@ private func handleFailed(
 private func handleCancelled(
   ctx: PluginContext, token: String, chatId: String, task: TaskRow, isPrivate: Bool
 ) {
-  ctx.taskOutputTexts.removeValue(forKey: task.taskId)
+  cleanupTaskState(ctx: ctx, taskId: task.taskId)
   logDebug("handleCancelled: task \(task.taskId)")
   if !isPrivate, let statusMsgId = task.statusMsgId {
     _ = telegramDeleteMessage(token: token, chatId: chatId, messageId: statusMsgId)
@@ -309,11 +322,29 @@ private func handleOutput(
   ctx.taskOutputTexts[task.taskId] = text
 
   if isPrivate {
-    _ = telegramSendMessageDraft(
-      token: token, chatId: chatId,
-      draftId: draftId(for: task.taskId),
-      text: String(text.prefix(4096))
-    )
+    let truncated = String(text.prefix(4096))
+
+    if let state = ctx.taskStreamStates[task.taskId] {
+      let elapsed = Date().timeIntervalSince(state.lastEditTime)
+      if elapsed >= outputEditThrottleInterval {
+        let ok = telegramEditMessage(
+          token: token, chatId: chatId, messageId: state.messageId, text: truncated)
+        if ok {
+          ctx.taskStreamStates[task.taskId]?.lastEditTime = Date()
+        }
+        logDebug("handleOutput: edited msg \(state.messageId) ok=\(ok)")
+      }
+    } else {
+      if let msgId = telegramSendMessage(token: token, chatId: chatId, text: truncated) {
+        ctx.taskStreamStates[task.taskId] = TaskStreamState(
+          messageId: msgId, lastEditTime: Date())
+        DatabaseManager.insertMessage(
+          chatId: chatId, messageId: msgId, direction: "out",
+          senderId: nil, senderName: "Agent", text: truncated,
+          mediaType: nil, mediaFileId: nil, taskId: task.taskId)
+        logDebug("handleOutput: sent real msg \(msgId)")
+      }
+    }
   } else {
     telegramSendChatAction(token: token, chatId: chatId)
   }
