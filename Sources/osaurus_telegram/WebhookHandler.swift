@@ -285,8 +285,9 @@ func buildCompletionMessages(historyJSON: String, currentPrompt: String) -> [[St
   return messages
 }
 
-private func handleChatModeStreaming(token: String, chatId: String, prompt: String, messageId: Int, agentAddress: String?)
-{
+private func handleChatModeStreaming(
+  token: String, chatId: String, prompt: String, messageId: Int, agentAddress: String?
+) {
   let chatDraftId = draftId(for: "chat-\(chatId)-\(messageId)")
 
   _ = telegramSendMessageDraft(

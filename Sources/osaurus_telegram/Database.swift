@@ -184,10 +184,12 @@ enum DatabaseManager {
 
     guard let resultPtr = dbQuery(makeCString(sql), makeCString(params)) else { return nil }
     let resultStr = String(cString: resultPtr)
+    return parseTaskRow(resultStr)
+  }
 
-    guard let data = resultStr.data(using: .utf8),
-      let json = try? JSONSerialization.jsonObject(with: data) as? [[Any]],
-      let row = json.first, row.count >= 7
+  static func parseTaskRow(_ resultStr: String) -> TaskRow? {
+    guard let rows = extractRows(resultStr),
+      let row = rows.first, row.count >= 7
     else {
       return nil
     }
@@ -209,9 +211,8 @@ enum DatabaseManager {
     let params = serializeParams([chatId])
     guard let resultPtr = dbQuery(makeCString(sql), makeCString(params)) else { return nil }
     let resultStr = String(cString: resultPtr)
-    guard let data = resultStr.data(using: .utf8),
-      let json = try? JSONSerialization.jsonObject(with: data) as? [[Any]],
-      let row = json.first, !row.isEmpty
+    guard let rows = extractRows(resultStr),
+      let row = rows.first, !row.isEmpty
     else {
       return nil
     }
@@ -234,9 +235,7 @@ enum DatabaseManager {
     guard let resultPtr = dbQuery(makeCString(sql), makeCString(params)) else { return "[]" }
     let resultStr = String(cString: resultPtr)
 
-    guard let data = resultStr.data(using: .utf8),
-      let rows = try? JSONSerialization.jsonObject(with: data) as? [[Any]]
-    else {
+    guard let rows = extractRows(resultStr) else {
       return "[]"
     }
 
@@ -260,6 +259,28 @@ enum DatabaseManager {
   }
 
   // MARK: - Helpers
+
+  /// Extracts row arrays from a db_query result string.
+  /// Handles both `{"rows": [[...]]}` (host format) and bare `[[...]]`.
+  static func extractRows(_ resultStr: String) -> [[Any]]? {
+    guard let data = resultStr.data(using: .utf8),
+      let json = try? JSONSerialization.jsonObject(with: data)
+    else {
+      return nil
+    }
+
+    if let dict = json as? [String: Any],
+      let rows = dict["rows"] as? [[Any]]
+    {
+      return rows
+    }
+
+    if let rows = json as? [[Any]] {
+      return rows
+    }
+
+    return nil
+  }
 
   static func dbExec(_ sql: String, params: String) {
     guard let exec = hostAPI?.pointee.db_exec else {
