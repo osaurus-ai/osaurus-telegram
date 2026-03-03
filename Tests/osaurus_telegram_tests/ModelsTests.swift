@@ -219,6 +219,19 @@ struct TaskEventPayloadTests {
     #expect(event.detail == "src/main.swift")
   }
 
+  @Test("Decodes TaskOutputEvent")
+  func outputEvent() throws {
+    let json = "{\"text\":\"Here are the results:\\n\\n1. First item\"}"
+    let event = try #require(parseJSON(json, as: TaskOutputEvent.self))
+    #expect(event.text == "Here are the results:\n\n1. First item")
+  }
+
+  @Test("Decodes TaskOutputEvent with null text")
+  func outputEventNullText() throws {
+    let event = try #require(parseJSON("{}", as: TaskOutputEvent.self))
+    #expect(event.text == nil)
+  }
+
   @Test("Handles missing optional fields gracefully")
   func missingOptionals() throws {
     let event = try #require(parseJSON("{}", as: TaskCompletedEvent.self))

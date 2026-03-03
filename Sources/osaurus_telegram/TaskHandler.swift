@@ -10,6 +10,7 @@ private enum TaskEventType {
   static let completed: Int32 = 4
   static let failed: Int32 = 5
   static let cancelled: Int32 = 6
+  static let output: Int32 = 7
 }
 
 /// Derives a stable non-zero draft ID from a task ID string.
@@ -23,7 +24,7 @@ func draftId(for taskId: String) -> Int {
 
 private let taskEventNames: [Int32: String] = [
   0: "STARTED", 1: "ACTIVITY", 2: "PROGRESS", 3: "CLARIFICATION",
-  4: "COMPLETED", 5: "FAILED", 6: "CANCELLED",
+  4: "COMPLETED", 5: "FAILED", 6: "CANCELLED", 7: "OUTPUT",
 ]
 
 func handleTaskEvent(ctx: PluginContext, taskId: String, eventType: Int32, eventJSON: String) {
@@ -70,6 +71,10 @@ func handleTaskEvent(ctx: PluginContext, taskId: String, eventType: Int32, event
 
   case TaskEventType.cancelled:
     handleCancelled(token: token, chatId: chatId, task: task, isPrivate: isPrivate)
+
+  case TaskEventType.output:
+    handleOutput(
+      token: token, chatId: chatId, task: task, isPrivate: isPrivate, eventJSON: eventJSON)
 
   default:
     logWarn("Unknown task event type \(eventType) for task \(taskId)")
@@ -275,4 +280,27 @@ private func handleCancelled(token: String, chatId: String, task: TaskRow, isPri
   _ = telegramSendMessage(token: token, chatId: chatId, text: "\u{1F6AB} Task cancelled")
   DatabaseManager.updateTask(taskId: task.taskId, status: "cancelled")
   logInfo("Task \(task.taskId) cancelled for chat \(chatId)")
+}
+
+private func handleOutput(
+  token: String, chatId: String, task: TaskRow, isPrivate: Bool, eventJSON: String
+) {
+  guard let event = parseJSON(eventJSON, as: TaskOutputEvent.self),
+    let text = event.text, !text.isEmpty
+  else {
+    logDebug("handleOutput: task \(task.taskId) failed to parse output event or empty text")
+    return
+  }
+
+  logDebug("handleOutput: task \(task.taskId) text=\(text.count) chars")
+
+  if isPrivate {
+    _ = telegramSendMessageDraft(
+      token: token, chatId: chatId,
+      draftId: draftId(for: task.taskId),
+      text: String(text.prefix(4096))
+    )
+  } else {
+    telegramSendChatAction(token: token, chatId: chatId)
+  }
 }

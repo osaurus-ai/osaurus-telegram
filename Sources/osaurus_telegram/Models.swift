@@ -116,6 +116,10 @@ struct TaskFailedEvent: Decodable {
   let summary: String?
 }
 
+struct TaskOutputEvent: Decodable {
+  let text: String?
+}
+
 // MARK: - Dispatch Response
 
 struct DispatchResponse: Decodable {
