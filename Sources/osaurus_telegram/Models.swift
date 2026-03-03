@@ -140,14 +140,28 @@ struct TaskRow {
   let clarificationOptions: String?
 }
 
-// MARK: - Streaming Chunk (OpenAI-compatible)
+// MARK: - Streaming Chunk (OpenAI-compatible, agentic)
+
+struct StreamToolCallFunction: Decodable {
+  let name: String?
+  let arguments: String?
+}
+
+struct StreamToolCall: Decodable {
+  let id: String?
+  let function: StreamToolCallFunction?
+}
 
 struct StreamChunkDelta: Decodable {
   let content: String?
+  let tool_calls: [StreamToolCall]?
+  let role: String?
+  let tool_call_id: String?
 }
 
 struct StreamChunkChoice: Decodable {
   let delta: StreamChunkDelta?
+  let finish_reason: String?
 }
 
 struct StreamChunk: Decodable {

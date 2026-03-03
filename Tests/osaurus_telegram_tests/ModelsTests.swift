@@ -313,6 +313,54 @@ struct StreamChunkTests {
     let chunk = try #require(parseJSON(json, as: StreamChunk.self))
     #expect(chunk.choices == nil)
   }
+
+  @Test("Decodes a tool call chunk")
+  func toolCallChunk() throws {
+    let json = """
+      {"choices":[{"delta":{"tool_calls":[{"id":"call_abc","function":{"name":"file_read","arguments":"{\\"path\\":\\"main.swift\\"}"}}]},"finish_reason":"tool_calls"}]}
+      """
+    let chunk = try #require(parseJSON(json, as: StreamChunk.self))
+    let choice = try #require(chunk.choices?.first)
+    #expect(choice.finish_reason == "tool_calls")
+    let toolCall = try #require(choice.delta?.tool_calls?.first)
+    #expect(toolCall.id == "call_abc")
+    #expect(toolCall.function?.name == "file_read")
+    #expect(toolCall.function?.arguments?.contains("main.swift") == true)
+    #expect(choice.delta?.content == nil)
+  }
+
+  @Test("Decodes a tool result chunk")
+  func toolResultChunk() throws {
+    let json = """
+      {"choices":[{"delta":{"role":"tool","tool_call_id":"call_abc","content":"file contents here"}}]}
+      """
+    let chunk = try #require(parseJSON(json, as: StreamChunk.self))
+    let delta = try #require(chunk.choices?.first?.delta)
+    #expect(delta.role == "tool")
+    #expect(delta.tool_call_id == "call_abc")
+    #expect(delta.content == "file contents here")
+  }
+
+  @Test("Decodes a final stop chunk with finish_reason")
+  func stopChunk() throws {
+    let json = "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}"
+    let chunk = try #require(parseJSON(json, as: StreamChunk.self))
+    let choice = try #require(chunk.choices?.first)
+    #expect(choice.finish_reason == "stop")
+    #expect(choice.delta?.content == nil)
+    #expect(choice.delta?.tool_calls == nil)
+  }
+
+  @Test("Content chunk has nil tool fields")
+  func contentChunkNilTools() throws {
+    let json = "{\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}"
+    let chunk = try #require(parseJSON(json, as: StreamChunk.self))
+    let delta = try #require(chunk.choices?.first?.delta)
+    #expect(delta.content == "Hello")
+    #expect(delta.tool_calls == nil)
+    #expect(delta.role == nil)
+    #expect(delta.tool_call_id == nil)
+  }
 }
 
 // MARK: - DispatchResponse Decoding

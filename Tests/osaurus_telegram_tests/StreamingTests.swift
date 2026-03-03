@@ -81,6 +81,82 @@ struct ExtractStreamContentTests {
   }
 }
 
+// MARK: - extractToolCallInfo
+
+@Suite("Tool Call Info Extraction")
+struct ExtractToolCallInfoTests {
+
+  @Test("Extracts tool name from tool call chunk")
+  func extractsToolName() {
+    let chunk =
+      "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"function\":{\"name\":\"file_read\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}"
+    let info = extractToolCallInfo(chunk)
+    #expect(info != nil)
+    #expect(info?.name == "file_read")
+    #expect(info?.isToolResult == false)
+  }
+
+  @Test("Detects tool result chunk")
+  func detectsToolResult() {
+    let chunk =
+      "{\"choices\":[{\"delta\":{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"result data\"}}]}"
+    let info = extractToolCallInfo(chunk)
+    #expect(info != nil)
+    #expect(info?.isToolResult == true)
+    #expect(info?.name == nil)
+  }
+
+  @Test("Returns nil for content-only chunk")
+  func nilForContentChunk() {
+    let chunk = "{\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}"
+    #expect(extractToolCallInfo(chunk) == nil)
+  }
+
+  @Test("Returns nil for empty delta")
+  func nilForEmptyDelta() {
+    let chunk = "{\"choices\":[{\"delta\":{}}]}"
+    #expect(extractToolCallInfo(chunk) == nil)
+  }
+
+  @Test("Returns nil for non-JSON")
+  func nilForNonJSON() {
+    #expect(extractToolCallInfo("not json") == nil)
+  }
+
+  @Test("Returns nil for empty string")
+  func nilForEmpty() {
+    #expect(extractToolCallInfo("") == nil)
+  }
+
+  @Test("Handles tool call with no function name")
+  func noFunctionName() {
+    let chunk =
+      "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_2\"}]}}]}"
+    let info = extractToolCallInfo(chunk)
+    #expect(info != nil)
+    #expect(info?.name == nil)
+    #expect(info?.isToolResult == false)
+  }
+
+  @Test("extractStreamContent returns nil for tool call chunk")
+  func contentNilForToolCall() {
+    let chunk =
+      "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"function\":{\"name\":\"search\"}}]},\"finish_reason\":\"tool_calls\"}]}"
+    #expect(extractStreamContent(chunk) == nil)
+  }
+
+  @Test("extractStreamContent returns nil for tool result chunk")
+  func contentNilForToolResult() {
+    let chunk =
+      "{\"choices\":[{\"delta\":{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"result\"}}]}"
+    // tool result chunks have content, but extractStreamContent returns it — this is expected
+    // since tool result content is the tool's output, not the assistant's response,
+    // the callback handles this by checking extractToolCallInfo first
+    let content = extractStreamContent(chunk)
+    #expect(content == "result")
+  }
+}
+
 // MARK: - buildCompletionMessages
 
 @Suite("Completion Messages Builder")
@@ -140,11 +216,12 @@ struct BuildCompletionMessagesTests {
 @Suite("Chat Stream State")
 struct ChatStreamStateTests {
 
-  @Test("Initializes with empty accumulated text")
+  @Test("Initializes with empty accumulated text and nil tool name")
   func initialState() {
     let state = ChatStreamState(token: "tok", chatId: "123", draftId: 1)
     #expect(state.accumulated == "")
     #expect(state.lastFlushLength == 0)
+    #expect(state.currentToolName == nil)
   }
 
   @Test("Accumulates text")

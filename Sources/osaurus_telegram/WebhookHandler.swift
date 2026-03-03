@@ -319,6 +319,7 @@ final class ChatStreamState {
   var accumulated = ""
   var lastFlushLength = 0
   var receivedFirstChunk = false
+  var currentToolName: String?
   let token: String
   let chatId: String
   let draftId: Int
@@ -331,7 +332,7 @@ final class ChatStreamState {
   }
 }
 
-/// C-compatible callback for complete_stream chunks.
+/// C-compatible callback for complete_stream chunks (handles content, tool calls, and tool results).
 private let streamChunkCallback:
   @convention(c) (UnsafePointer<CChar>?, UnsafeMutableRawPointer?) -> Void = { chunkPtr, userData in
     guard let chunkPtr, let userData else { return }
@@ -343,7 +344,25 @@ private let streamChunkCallback:
       logDebug("streamChunkCallback: first chunk received (\(chunk.count) chars)")
     }
 
+    if let toolInfo = extractToolCallInfo(chunk) {
+      if toolInfo.isToolResult {
+        state.currentToolName = nil
+      } else if let name = toolInfo.name {
+        state.currentToolName = name
+        logDebug("streamChunkCallback: tool call \(name)")
+        let displayName = name.replacingOccurrences(of: "_", with: " ")
+        _ = telegramSendMessageDraft(
+          token: state.token,
+          chatId: state.chatId,
+          draftId: state.draftId,
+          text: "\u{1F6E0} Using \(displayName)..."
+        )
+      }
+      return
+    }
+
     if let content = extractStreamContent(chunk) {
+      state.currentToolName = nil
       state.accumulated += content
     }
 
@@ -371,6 +390,29 @@ func extractStreamContent(_ chunk: String) -> String? {
     return nil
   }
   return content
+}
+
+/// Extracts tool call metadata from an agentic streaming chunk.
+/// Returns the tool name for tool call requests, or flags tool result chunks.
+/// Returns nil if the chunk is not tool-related (e.g. a content delta).
+func extractToolCallInfo(_ chunk: String) -> (name: String?, isToolResult: Bool)? {
+  guard let parsed = parseJSON(chunk, as: StreamChunk.self),
+    let choices = parsed.choices,
+    let first = choices.first,
+    let delta = first.delta
+  else {
+    return nil
+  }
+
+  if delta.role == "tool" {
+    return (name: nil, isToolResult: true)
+  }
+
+  if let toolCalls = delta.tool_calls, let firstCall = toolCalls.first {
+    return (name: firstCall.function?.name, isToolResult: false)
+  }
+
+  return nil
 }
 
 /// Builds an OpenAI-compatible messages array from chat history + the current prompt.
@@ -422,6 +464,8 @@ private func handleChatModeStreaming(
       "model": "",
       "messages": messages,
       "max_tokens": 4096,
+      "tools": true,
+      "max_iterations": 10,
     ]
     if let agentAddress { request["agent_address"] = agentAddress }
     guard let requestJSON = makeJSONString(request) else {
