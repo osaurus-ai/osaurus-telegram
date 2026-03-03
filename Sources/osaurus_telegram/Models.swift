@@ -69,6 +69,12 @@ struct TelegramCallbackQuery: Decodable {
 
 // MARK: - Route Request/Response
 
+struct OsaurusRequestContext: Decodable {
+  let base_url: String?
+  let plugin_url: String?
+  let agent_address: String?
+}
+
 struct RouteRequest: Decodable {
   let route_id: String
   let method: String
@@ -77,6 +83,7 @@ struct RouteRequest: Decodable {
   let headers: [String: String]?
   let body: String?
   let plugin_id: String?
+  let osaurus: OsaurusRequestContext?
 }
 
 // MARK: - Task Event Payloads

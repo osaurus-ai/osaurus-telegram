@@ -48,8 +48,10 @@ private func handleWebhook(ctx: PluginContext, req: RouteRequest) -> String {
     return makeRouteResponse(status: 200, body: "ok")
   }
 
+  let agentAddress = req.osaurus?.agent_address
+
   if let message = update.message {
-    handleMessage(ctx: ctx, message: message)
+    handleMessage(ctx: ctx, message: message, agentAddress: agentAddress)
   } else if let callbackQuery = update.callback_query {
     handleCallback(ctx: ctx, query: callbackQuery)
   }
@@ -81,7 +83,7 @@ private func formatSenderName(from user: TelegramUser?) -> String? {
   return user.first_name
 }
 
-private func handleMessage(ctx: PluginContext, message: TelegramMessage) {
+private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAddress: String?) {
   let chat = message.chat
   let chatId = "\(chat.id)"
   let isPrivateChat = chat.type == "private"
@@ -142,7 +144,8 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage) {
   if agentMode == "chat" && isPrivateChat && hostAPI?.pointee.complete_stream != nil {
     handleChatModeStreaming(
       token: token, chatId: chatId,
-      prompt: prompt, messageId: message.message_id
+      prompt: prompt, messageId: message.message_id,
+      agentAddress: agentAddress
     )
     return
   }
@@ -157,11 +160,12 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage) {
     return
   }
 
-  let dispatchPayload: [String: Any] = [
+  var dispatchPayload: [String: Any] = [
     "prompt": prompt,
     "mode": agentMode,
     "title": "Telegram: \(firstLine)",
   ]
+  if let agentAddress { dispatchPayload["agent_address"] = agentAddress }
   guard let dispatchJSON = makeJSONString(dispatchPayload) else {
     logError("Failed to build dispatch JSON")
     return
@@ -281,7 +285,7 @@ func buildCompletionMessages(historyJSON: String, currentPrompt: String) -> [[St
   return messages
 }
 
-private func handleChatModeStreaming(token: String, chatId: String, prompt: String, messageId: Int)
+private func handleChatModeStreaming(token: String, chatId: String, prompt: String, messageId: Int, agentAddress: String?)
 {
   let chatDraftId = draftId(for: "chat-\(chatId)-\(messageId)")
 
@@ -294,11 +298,12 @@ private func handleChatModeStreaming(token: String, chatId: String, prompt: Stri
     let historyJSON = DatabaseManager.getMessages(chatId: chatId, limit: 20)
     let messages = buildCompletionMessages(historyJSON: historyJSON, currentPrompt: prompt)
 
-    let request: [String: Any] = [
+    var request: [String: Any] = [
       "model": "",
       "messages": messages,
       "max_tokens": 4096,
     ]
+    if let agentAddress { request["agent_address"] = agentAddress }
     guard let requestJSON = makeJSONString(request) else {
       _ = telegramSendMessage(token: token, chatId: chatId, text: "Failed to build request.")
       return
