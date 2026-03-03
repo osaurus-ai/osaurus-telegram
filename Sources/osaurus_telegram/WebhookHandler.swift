@@ -228,8 +228,6 @@ private let streamChunkCallback:
 
     if let content = extractStreamContent(chunk) {
       state.accumulated += content
-    } else {
-      state.accumulated += chunk
     }
 
     let newChars = state.accumulated.count - state.lastFlushLength
