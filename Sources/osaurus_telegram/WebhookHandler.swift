@@ -136,6 +136,20 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
   guard !prompt.isEmpty else { return }
   guard let token = ctx.botToken else { return }
 
+  if let pendingTask = DatabaseManager.getAwaitingClarification(chatId: chatId) {
+    if let clarify = hostAPI?.pointee.dispatch_clarify {
+      pendingTask.taskId.withCString { tid in
+        prompt.withCString { p in
+          clarify(tid, p)
+        }
+      }
+    }
+    DatabaseManager.updateTask(taskId: pendingTask.taskId, status: "running")
+    _ = telegramSendMessage(
+      token: token, chatId: chatId, text: "\u{2705} Response sent, continuing...")
+    return
+  }
+
   telegramSendChatAction(token: token, chatId: chatId)
 
   let agentMode = configGet("agent_mode") ?? "work"
@@ -160,9 +174,10 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
     return
   }
 
+  let dispatchMode = (agentMode == "chat" && !isPrivateChat) ? "work" : agentMode
   var dispatchPayload: [String: Any] = [
     "prompt": prompt,
-    "mode": agentMode,
+    "mode": dispatchMode,
     "title": "Telegram: \(firstLine)",
   ]
   if let agentAddress { dispatchPayload["agent_address"] = agentAddress }
@@ -171,12 +186,15 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
     return
   }
 
-  guard let resultPtr = dispatch(makeCString(dispatchJSON)) else {
+  let dispatchResultStr: String? = dispatchJSON.withCString { ptr in
+    guard let resultPtr = dispatch(ptr) else { return nil }
+    return String(cString: resultPtr)
+  }
+  guard let resultStr = dispatchResultStr else {
     logError("dispatch returned nil")
     _ = telegramSendMessage(token: token, chatId: chatId, text: "Failed to start agent task.")
     return
   }
-  let resultStr = String(cString: resultPtr)
 
   guard let dispatchResult = parseJSON(resultStr, as: DispatchResponse.self),
     let taskId = dispatchResult.id
@@ -244,8 +262,7 @@ private let streamChunkCallback:
 
 /// Extracts the text content from an OpenAI-compatible streaming chunk JSON.
 func extractStreamContent(_ chunk: String) -> String? {
-  guard let data = chunk.data(using: .utf8),
-    let parsed = parseJSON(chunk, as: StreamChunk.self),
+  guard let parsed = parseJSON(chunk, as: StreamChunk.self),
     let choices = parsed.choices,
     let first = choices.first,
     let delta = first.delta,
@@ -253,7 +270,6 @@ func extractStreamContent(_ chunk: String) -> String? {
   else {
     return nil
   }
-  _ = data
   return content
 }
 
@@ -311,14 +327,31 @@ private func handleChatModeStreaming(
     let state = ChatStreamState(token: token, chatId: chatId, draftId: chatDraftId)
     let statePtr = Unmanaged.passRetained(state).toOpaque()
 
-    let result = hostAPI?.pointee.complete_stream?(
-      makeCString(requestJSON),
-      streamChunkCallback,
-      statePtr
-    )
+    let result: UnsafePointer<CChar>? = requestJSON.withCString { ptr in
+      hostAPI?.pointee.complete_stream?(ptr, streamChunkCallback, statePtr)
+    }
 
-    let finalText =
-      state.accumulated.isEmpty ? "I couldn't generate a response." : state.accumulated
+    var streamError: String?
+    if let result {
+      let resultStr = String(cString: result)
+      free(UnsafeMutableRawPointer(mutating: result))
+      if let resultData = resultStr.data(using: .utf8),
+        let resultJSON = try? JSONSerialization.jsonObject(with: resultData) as? [String: Any],
+        let errorMsg = resultJSON["error"] as? String
+      {
+        logError("Streaming inference error: \(errorMsg)")
+        streamError = errorMsg
+      }
+    }
+
+    let finalText: String
+    if let streamError, state.accumulated.isEmpty {
+      finalText = "Error: \(streamError)"
+    } else if state.accumulated.isEmpty {
+      finalText = "I couldn't generate a response."
+    } else {
+      finalText = state.accumulated
+    }
 
     let msgId = telegramSendLongMessage(
       token: token, chatId: chatId, text: finalText, replyTo: messageId)
@@ -338,10 +371,6 @@ private func handleChatModeStreaming(
     }
 
     Unmanaged<ChatStreamState>.fromOpaque(statePtr).release()
-
-    if let result {
-      free(UnsafeMutableRawPointer(mutating: result))
-    }
 
     logInfo("Chat mode streaming complete for chat \(chatId)")
   }
@@ -365,17 +394,28 @@ private func handleCallback(ctx: PluginContext, query: TelegramCallbackQuery) {
 
   let taskId = String(parts[1])
 
-  guard DatabaseManager.getTask(taskId: taskId) != nil else {
+  guard let task = DatabaseManager.getTask(taskId: taskId) else {
     logWarn("Callback for unknown task: \(taskId)")
     return
   }
 
   guard let token = ctx.botToken else { return }
 
-  let selectedText = "Option \(optionIndex + 1)"
+  var selectedText = "Option \(optionIndex + 1)"
+  if let optionsJSON = task.clarificationOptions,
+    let optionsData = optionsJSON.data(using: .utf8),
+    let options = try? JSONSerialization.jsonObject(with: optionsData) as? [String],
+    optionIndex < options.count
+  {
+    selectedText = options[optionIndex]
+  }
 
   if let clarify = hostAPI?.pointee.dispatch_clarify {
-    clarify(makeCString(taskId), makeCString(selectedText))
+    taskId.withCString { tid in
+      selectedText.withCString { sel in
+        clarify(tid, sel)
+      }
+    }
   }
 
   telegramAnswerCallbackQuery(
@@ -391,7 +431,7 @@ private func handleCallback(ctx: PluginContext, query: TelegramCallbackQuery) {
     )
   }
 
-  DatabaseManager.updateTask(taskId: taskId, status: "running")
+  DatabaseManager.updateTask(taskId: taskId, status: "running", clarificationOptions: nil)
 }
 
 // MARK: - Health Endpoint

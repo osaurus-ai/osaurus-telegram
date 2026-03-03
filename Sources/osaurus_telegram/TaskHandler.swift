@@ -146,21 +146,33 @@ private func handleProgress(
 
 private func handleClarification(token: String, chatId: String, taskId: String, eventJSON: String) {
   guard let event = parseJSON(eventJSON, as: TaskClarificationEvent.self),
-    let question = event.question,
-    let options = event.options, !options.isEmpty
+    let question = event.question
   else {
-    logWarn("Clarification event missing question/options for task \(taskId)")
+    logWarn("Clarification event missing question for task \(taskId)")
     return
   }
 
-  let taskIdShort = String(taskId.prefix(32))
+  let options = event.options ?? []
+
+  if options.isEmpty {
+    _ = telegramSendMessage(
+      token: token,
+      chatId: chatId,
+      text: "\u{2753} \(question)"
+    )
+    DatabaseManager.updateTask(taskId: taskId, status: "awaiting_clarification")
+    return
+  }
 
   let keyboard: [[Any]] = options.enumerated().map { (idx, option) in
-    let callbackData = "clarify:\(taskIdShort):\(idx)"
+    let callbackData = "clarify:\(taskId):\(idx)"
     return [["text": String(option.prefix(128)), "callback_data": callbackData] as [String: Any]]
   }
 
   let replyMarkup: [String: Any] = ["inline_keyboard": keyboard]
+
+  let optionsJSON = (try? JSONSerialization.data(withJSONObject: options))
+    .flatMap { String(data: $0, encoding: .utf8) }
 
   _ = telegramSendMessage(
     token: token,
@@ -169,7 +181,10 @@ private func handleClarification(token: String, chatId: String, taskId: String, 
     replyMarkup: replyMarkup
   )
 
-  DatabaseManager.updateTask(taskId: taskId, status: "awaiting_clarification")
+  DatabaseManager.updateTask(
+    taskId: taskId, status: "awaiting_clarification",
+    clarificationOptions: optionsJSON
+  )
 }
 
 private func handleCompleted(

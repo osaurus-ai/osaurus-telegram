@@ -43,6 +43,7 @@ enum DatabaseManager {
         progress      REAL DEFAULT 0.0,
         status_msg_id INTEGER,
         summary       TEXT,
+        clarification_options TEXT,
         created_at    INTEGER DEFAULT (unixepoch()),
         updated_at    INTEGER DEFAULT (unixepoch()),
         FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
@@ -53,19 +54,15 @@ enum DatabaseManager {
       "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
     ]
 
-    guard let dbExec = hostAPI?.pointee.db_exec else {
-      logError("db_exec not available")
-      return
+    for sql in statements {
+      self.dbExec(sql, params: "[]")
     }
 
-    for sql in statements {
-      let result = dbExec(makeCString(sql), makeCString("[]"))
-      if let result {
-        let str = String(cString: result)
-        if str.contains("\"error\"") {
-          logError("Schema init failed: \(str)")
-        }
-      }
+    let migrations = [
+      "ALTER TABLE tasks ADD COLUMN clarification_options TEXT"
+    ]
+    for sql in migrations {
+      dbExecSilent(sql, params: "[]")
     }
   }
 
@@ -139,7 +136,8 @@ enum DatabaseManager {
     status: String? = nil,
     progress: Double? = nil,
     statusMsgId: Int? = nil,
-    summary: String? = nil
+    summary: String? = nil,
+    clarificationOptions: String? = nil
   ) {
     var setClauses: [String] = ["updated_at = unixepoch()"]
     var values: [Any] = []
@@ -165,6 +163,11 @@ enum DatabaseManager {
       values.append(summary)
       paramIdx += 1
     }
+    if let clarificationOptions {
+      setClauses.append("clarification_options = ?\(paramIdx)")
+      values.append(clarificationOptions)
+      paramIdx += 1
+    }
 
     values.append(taskId)
     let sql = "UPDATE tasks SET \(setClauses.joined(separator: ", ")) WHERE task_id = ?\(paramIdx)"
@@ -172,18 +175,15 @@ enum DatabaseManager {
   }
 
   static func getTask(taskId: String) -> TaskRow? {
-    guard let dbQuery = hostAPI?.pointee.db_query else { return nil }
-
     let sql = """
-      SELECT t.task_id, t.chat_id, t.message_id, t.status, t.status_msg_id, t.summary, c.chat_type
+      SELECT t.task_id, t.chat_id, t.message_id, t.status, t.status_msg_id, t.summary, c.chat_type, t.clarification_options
       FROM tasks t
       LEFT JOIN chats c ON t.chat_id = c.chat_id
       WHERE t.task_id = ?1
       """
     let params = serializeParams([taskId])
 
-    guard let resultPtr = dbQuery(makeCString(sql), makeCString(params)) else { return nil }
-    let resultStr = String(cString: resultPtr)
+    guard let resultStr = dbQuery(sql, params: params) else { return nil }
     return parseTaskRow(resultStr)
   }
 
@@ -201,16 +201,30 @@ enum DatabaseManager {
       status: "\(row[3])",
       statusMsgId: row[4] as? Int,
       summary: row[5] as? String,
-      chatType: (row[6] as? String) ?? "private"
+      chatType: (row[6] as? String) ?? "private",
+      clarificationOptions: row.count > 7 ? row[7] as? String : nil
     )
   }
 
+  static func getAwaitingClarification(chatId: String) -> TaskRow? {
+    let sql = """
+      SELECT t.task_id, t.chat_id, t.message_id, t.status, t.status_msg_id, t.summary, c.chat_type, t.clarification_options
+      FROM tasks t
+      LEFT JOIN chats c ON t.chat_id = c.chat_id
+      WHERE t.chat_id = ?1 AND t.status = 'awaiting_clarification'
+      ORDER BY t.updated_at DESC
+      LIMIT 1
+      """
+    let params = serializeParams([chatId])
+
+    guard let resultStr = dbQuery(sql, params: params) else { return nil }
+    return parseTaskRow(resultStr)
+  }
+
   static func getChatType(chatId: String) -> String? {
-    guard let dbQuery = hostAPI?.pointee.db_query else { return nil }
     let sql = "SELECT chat_type FROM chats WHERE chat_id = ?1"
     let params = serializeParams([chatId])
-    guard let resultPtr = dbQuery(makeCString(sql), makeCString(params)) else { return nil }
-    let resultStr = String(cString: resultPtr)
+    guard let resultStr = dbQuery(sql, params: params) else { return nil }
     guard let rows = extractRows(resultStr),
       let row = rows.first, !row.isEmpty
     else {
@@ -220,8 +234,6 @@ enum DatabaseManager {
   }
 
   static func getMessages(chatId: String, limit: Int) -> String {
-    guard let dbQuery = hostAPI?.pointee.db_query else { return "[]" }
-
     let clampedLimit = min(max(limit, 1), 200)
     let sql = """
       SELECT message_id, direction, sender_name, text, media_type, created_at
@@ -232,8 +244,7 @@ enum DatabaseManager {
       """
     let params = serializeParams([chatId, clampedLimit])
 
-    guard let resultPtr = dbQuery(makeCString(sql), makeCString(params)) else { return "[]" }
-    let resultStr = String(cString: resultPtr)
+    guard let resultStr = dbQuery(sql, params: params) else { return "[]" }
 
     guard let rows = extractRows(resultStr) else {
       return "[]"
@@ -287,11 +298,35 @@ enum DatabaseManager {
       logError("db_exec not available")
       return
     }
-    let result = exec(makeCString(sql), makeCString(params))
+    let result = sql.withCString { sqlPtr in
+      params.withCString { paramsPtr in
+        exec(sqlPtr, paramsPtr)
+      }
+    }
     if let result {
       let str = String(cString: result)
       if str.contains("\"error\"") {
         logWarn("DB exec error: \(str)")
+      }
+    }
+  }
+
+  /// Like `dbExec`, but silently ignores errors (used for idempotent migrations).
+  static func dbExecSilent(_ sql: String, params: String) {
+    guard let exec = hostAPI?.pointee.db_exec else { return }
+    sql.withCString { sqlPtr in
+      params.withCString { paramsPtr in
+        _ = exec(sqlPtr, paramsPtr)
+      }
+    }
+  }
+
+  static func dbQuery(_ sql: String, params: String) -> String? {
+    guard let query = hostAPI?.pointee.db_query else { return nil }
+    return sql.withCString { sqlPtr in
+      params.withCString { paramsPtr in
+        guard let resultPtr = query(sqlPtr, paramsPtr) else { return nil }
+        return String(cString: resultPtr)
       }
     }
   }

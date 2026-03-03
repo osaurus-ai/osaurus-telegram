@@ -34,11 +34,14 @@ func telegramRequest(token: String, method: String, body: [String: Any]? = nil) 
     return (false, nil, nil)
   }
 
-  guard let responsePtr = httpRequest(makeCString(requestJSON)) else {
+  let responseStr: String? = requestJSON.withCString { ptr in
+    guard let responsePtr = httpRequest(ptr) else { return nil }
+    return String(cString: responsePtr)
+  }
+  guard let responseStr else {
     logError("No response from http_request for \(method)")
     return (false, nil, nil)
   }
-  let responseStr = String(cString: responsePtr)
 
   guard let responseData = responseStr.data(using: .utf8),
     let httpResponse = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any]

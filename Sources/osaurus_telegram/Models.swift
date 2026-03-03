@@ -133,6 +133,7 @@ struct TaskRow {
   let statusMsgId: Int?
   let summary: String?
   let chatType: String
+  let clarificationOptions: String?
 }
 
 // MARK: - Streaming Chunk (OpenAI-compatible)

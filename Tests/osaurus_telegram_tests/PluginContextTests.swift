@@ -84,7 +84,8 @@ struct TaskRowTests {
       status: "running",
       statusMsgId: 99,
       summary: nil,
-      chatType: "private"
+      chatType: "private",
+      clarificationOptions: nil
     )
     #expect(row.taskId == "t1")
     #expect(row.chatId == "c1")
@@ -104,7 +105,8 @@ struct TaskRowTests {
       status: "completed",
       statusMsgId: nil,
       summary: "All done",
-      chatType: "supergroup"
+      chatType: "supergroup",
+      clarificationOptions: nil
     )
     #expect(row.messageId == nil)
     #expect(row.statusMsgId == nil)
