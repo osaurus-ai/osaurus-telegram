@@ -108,8 +108,8 @@ Bot:   Deploying to staging... done! Build v2.3.1 is live.
 
 ```bash
 swift build -c release
-osaurus tools package ai.osaurus.telegram 0.1.0
-osaurus tools install ./ai.osaurus.telegram-0.1.0.zip
+osaurus tools package osaurus.telegram 0.1.0
+osaurus tools install ./osaurus.telegram-0.1.0.zip
 ```
 
 ### 3. Configure
@@ -173,7 +173,7 @@ osaurus manifest extract .build/release/libosaurus-telegram.dylib
 ### Dev Mode (Hot Reload)
 
 ```bash
-osaurus tools dev ai.osaurus.telegram
+osaurus tools dev osaurus.telegram
 ```
 
 ## Publishing

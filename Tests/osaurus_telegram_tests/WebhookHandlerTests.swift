@@ -147,7 +147,7 @@ struct ManifestTests {
     // We test by deserializing the manifest JSON
     let manifest = """
       {
-        "plugin_id": "ai.osaurus.telegram",
+        "plugin_id": "osaurus.telegram",
         "name": "Telegram",
         "version": "0.1.0",
         "description": "Connect Telegram chats to your Osaurus agents",
@@ -165,7 +165,7 @@ struct ManifestTests {
       """
     let data = try #require(manifest.data(using: .utf8))
     let json = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
-    #expect(json["plugin_id"] as? String == "ai.osaurus.telegram")
+    #expect(json["plugin_id"] as? String == "osaurus.telegram")
     #expect(json["version"] as? String == "0.1.0")
 
     let caps = try #require(json["capabilities"] as? [String: Any])

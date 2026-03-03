@@ -47,7 +47,7 @@ func setupWebhook(ctx: PluginContext, token: String) {
   configSet("webhook_secret", secret)
 
   // Build webhook URL using the plugin_id
-  let pluginId = "ai.osaurus.telegram"
+  let pluginId = "osaurus.telegram"
   guard let tunnelBase = configGet("tunnel_url") else {
     // If tunnel_url isn't in config, we can't register webhook.
     // The host may provide it via plugin_url or the user sets it manually.

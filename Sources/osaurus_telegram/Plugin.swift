@@ -126,7 +126,7 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
   api.get_manifest = { _ in
     let manifest = """
       {
-        "plugin_id": "ai.osaurus.telegram",
+        "plugin_id": "osaurus.telegram",
         "name": "Telegram",
         "version": "0.1.0",
         "description": "Connect Telegram chats to your Osaurus agents",

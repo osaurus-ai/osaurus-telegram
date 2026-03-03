@@ -244,7 +244,7 @@ struct RouteRequestTests {
           "content-type": "application/json"
         },
         "body": "{\\"update_id\\":1}",
-        "plugin_id": "ai.osaurus.telegram"
+        "plugin_id": "osaurus.telegram"
       }
       """
     let req = try #require(parseJSON(json, as: RouteRequest.self))
@@ -252,7 +252,7 @@ struct RouteRequestTests {
     #expect(req.method == "POST")
     #expect(req.headers?["x-telegram-bot-api-secret-token"] == "abc123")
     #expect(req.body != nil)
-    #expect(req.plugin_id == "ai.osaurus.telegram")
+    #expect(req.plugin_id == "osaurus.telegram")
   }
 
   @Test("Decodes a health check request with minimal fields")
