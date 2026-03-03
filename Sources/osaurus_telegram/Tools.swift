@@ -13,11 +13,18 @@ struct TelegramSendTool {
   }
 
   func run(args: String) -> String {
+    logDebug("telegram_send: args=\(String(args.prefix(200)))")
     guard let input = parseJSON(args, as: Args.self) else {
+      logWarn("telegram_send: failed to parse args")
       return "{\"error\":\"Invalid arguments\"}"
     }
 
+    logDebug(
+      "telegram_send: chat_id=\(input.chat_id) text=\(input.text.count) chars replyTo=\(input.reply_to_message_id.map { "\($0)" } ?? "nil")"
+    )
+
     guard let token = configGet("bot_token"), !token.isEmpty else {
+      logWarn("telegram_send: no bot token configured")
       return "{\"error\":\"Bot token not configured\"}"
     }
 
@@ -29,6 +36,7 @@ struct TelegramSendTool {
         replyTo: input.reply_to_message_id
       )
     else {
+      logError("telegram_send: failed to send message to chat \(input.chat_id)")
       return "{\"error\":\"Failed to send message\"}"
     }
 
@@ -44,6 +52,7 @@ struct TelegramSendTool {
       taskId: nil
     )
 
+    logDebug("telegram_send: sent message_id=\(msgId) to chat \(input.chat_id)")
     return "{\"message_id\":\(msgId)}"
   }
 }
@@ -59,12 +68,17 @@ struct TelegramGetChatHistoryTool {
   }
 
   func run(args: String) -> String {
+    logDebug("telegram_get_chat_history: args=\(String(args.prefix(200)))")
     guard let input = parseJSON(args, as: Args.self) else {
+      logWarn("telegram_get_chat_history: failed to parse args")
       return "{\"error\":\"Invalid arguments\"}"
     }
 
     let limit = input.limit ?? 50
-    return DatabaseManager.getMessages(chatId: input.chat_id, limit: limit)
+    logDebug("telegram_get_chat_history: chat_id=\(input.chat_id) limit=\(limit)")
+    let result = DatabaseManager.getMessages(chatId: input.chat_id, limit: limit)
+    logDebug("telegram_get_chat_history: returned \(result.count) chars")
+    return result
   }
 }
 

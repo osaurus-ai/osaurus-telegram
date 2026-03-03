@@ -113,6 +113,27 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
   api.`init` = {
     let ctx = PluginContext()
     initPlugin(ctx)
+
+    var available: [String] = []
+    var missing: [String] = []
+    let checks: [(String, Bool)] = [
+      ("dispatch", hostAPI?.pointee.dispatch != nil),
+      ("complete_stream", hostAPI?.pointee.complete_stream != nil),
+      ("complete", hostAPI?.pointee.complete != nil),
+      ("http_request", hostAPI?.pointee.http_request != nil),
+      ("db_exec", hostAPI?.pointee.db_exec != nil),
+      ("db_query", hostAPI?.pointee.db_query != nil),
+      ("config_get", hostAPI?.pointee.config_get != nil),
+      ("log", hostAPI?.pointee.log != nil),
+      ("dispatch_clarify", hostAPI?.pointee.dispatch_clarify != nil),
+    ]
+    for (name, ok) in checks {
+      if ok { available.append(name) } else { missing.append(name) }
+    }
+    logInfo(
+      "Plugin init complete. Host APIs available: [\(available.joined(separator: ", "))], missing: [\(missing.joined(separator: ", "))]"
+    )
+
     return Unmanaged.passRetained(ctx).toOpaque()
   }
 
@@ -285,50 +306,75 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
   }
 
   api.invoke = { ctxPtr, typePtr, idPtr, payloadPtr in
-    guard let ctxPtr, let typePtr, let idPtr, let payloadPtr else { return nil }
+    guard let ctxPtr, let typePtr, let idPtr, let payloadPtr else {
+      logWarn("invoke called with nil parameters")
+      return nil
+    }
 
     let ctx = Unmanaged<PluginContext>.fromOpaque(ctxPtr).takeUnretainedValue()
     let type = String(cString: typePtr)
     let id = String(cString: idPtr)
     let payload = String(cString: payloadPtr)
 
+    logDebug("invoke: type=\(type) id=\(id) payload=\(payload.count) chars")
+
     guard type == "tool" else {
+      logWarn("invoke: unknown capability type '\(type)'")
       return makeCString("{\"error\":\"Unknown capability type\"}")
     }
 
+    let result: String
     switch id {
     case ctx.telegramSendTool.name:
-      return makeCString(ctx.telegramSendTool.run(args: payload))
+      result = ctx.telegramSendTool.run(args: payload)
     case ctx.chatHistoryTool.name:
-      return makeCString(ctx.chatHistoryTool.run(args: payload))
+      result = ctx.chatHistoryTool.run(args: payload)
     default:
+      logWarn("invoke: unknown tool '\(id)'")
       return makeCString("{\"error\":\"Unknown tool: \(id)\"}")
     }
+
+    logDebug("invoke: tool \(id) returned \(result.count) chars")
+    return makeCString(result)
   }
 
   api.version = 2
 
   api.handle_route = { ctxPtr, requestJsonPtr in
-    guard let ctxPtr, let requestJsonPtr else { return nil }
+    guard let ctxPtr, let requestJsonPtr else {
+      logWarn("handle_route called with nil parameters")
+      return nil
+    }
     let ctx = Unmanaged<PluginContext>.fromOpaque(ctxPtr).takeUnretainedValue()
     let requestJson = String(cString: requestJsonPtr)
+    logDebug("handle_route: received \(requestJson.count) chars")
     let response = handleRoute(ctx: ctx, requestJSON: requestJson)
     return makeCString(response)
   }
 
   api.on_config_changed = { ctxPtr, keyPtr, valuePtr in
-    guard let ctxPtr, let keyPtr else { return }
+    guard let ctxPtr, let keyPtr else {
+      logWarn("on_config_changed called with nil parameters")
+      return
+    }
     let ctx = Unmanaged<PluginContext>.fromOpaque(ctxPtr).takeUnretainedValue()
     let key = String(cString: keyPtr)
     let value = valuePtr.map { String(cString: $0) }
+    logDebug("on_config_changed: key=\(key) hasValue=\(value != nil)")
     onConfigChanged(ctx: ctx, key: key, value: value)
   }
 
   api.on_task_event = { ctxPtr, taskIdPtr, eventType, eventJsonPtr in
-    guard let ctxPtr, let taskIdPtr, let eventJsonPtr else { return }
+    guard let ctxPtr, let taskIdPtr, let eventJsonPtr else {
+      logWarn("on_task_event called with nil parameters")
+      return
+    }
     let ctx = Unmanaged<PluginContext>.fromOpaque(ctxPtr).takeUnretainedValue()
     let taskId = String(cString: taskIdPtr)
     let eventJson = String(cString: eventJsonPtr)
+    logDebug(
+      "on_task_event: taskId=\(taskId) eventType=\(eventType) json=\(String(eventJson.prefix(200)))"
+    )
     handleTaskEvent(ctx: ctx, taskId: taskId, eventType: eventType, eventJSON: eventJson)
   }
 

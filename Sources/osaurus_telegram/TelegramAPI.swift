@@ -7,16 +7,17 @@ import Foundation
 func telegramRequest(token: String, method: String, body: [String: Any]? = nil) -> (
   ok: Bool, resultJSON: Any?, retryAfter: Int?
 ) {
+  let bodyKeys = body.map { Array($0.keys).sorted().joined(separator: ", ") } ?? "none"
+  logDebug("telegramRequest: method=\(method) bodyKeys=[\(bodyKeys)]")
+
   guard let httpRequest = hostAPI?.pointee.http_request else {
     logError("http_request not available")
     return (false, nil, nil)
   }
 
-  let url = "https://api.telegram.org/bot\(token)/\(method)"
-
   var request: [String: Any] = [
     "method": "POST",
-    "url": url,
+    "url": "https://api.telegram.org/bot\(token)/\(method)",
     "headers": ["Content-Type": "application/json"],
     "timeout_ms": 10000,
   ]
@@ -26,6 +27,8 @@ func telegramRequest(token: String, method: String, body: [String: Any]? = nil) 
       let bodyStr = String(data: bodyData, encoding: .utf8)
     {
       request["body"] = bodyStr
+    } else {
+      logWarn("telegramRequest: failed to serialize body for \(method)")
     }
   }
 
@@ -46,7 +49,8 @@ func telegramRequest(token: String, method: String, body: [String: Any]? = nil) 
   guard let responseData = responseStr.data(using: .utf8),
     let httpResponse = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any]
   else {
-    logError("Failed to parse http_request response for \(method)")
+    logError(
+      "Failed to parse http_request response for \(method): \(String(responseStr.prefix(200)))")
     return (false, nil, nil)
   }
 
@@ -55,7 +59,9 @@ func telegramRequest(token: String, method: String, body: [String: Any]? = nil) 
     let bodyData = httpBody.data(using: .utf8),
     let tgResponse = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any]
   else {
-    logError("Telegram \(method) returned non-JSON body (HTTP \(httpStatus))")
+    logError(
+      "Telegram \(method) returned non-JSON body (HTTP \(httpStatus)): \(String((httpResponse["body"] as? String ?? "").prefix(200)))"
+    )
     return (false, nil, nil)
   }
 
@@ -64,6 +70,10 @@ func telegramRequest(token: String, method: String, body: [String: Any]? = nil) 
   let description = tgResponse["description"] as? String
   let parameters = tgResponse["parameters"] as? [String: Any]
   let retryAfter = parameters?["retry_after"] as? Int
+
+  logDebug(
+    "telegramRequest: \(method) HTTP \(httpStatus) ok=\(ok)\(description.map { " desc=\"\($0)\"" } ?? "")"
+  )
 
   if !ok {
     if httpStatus == 401 {
@@ -130,18 +140,23 @@ func telegramSendMessage(
   let (ok, result, _) = telegramRequest(token: token, method: "sendMessage", body: body)
 
   if !ok, parseMode != nil {
-    // Retry without parse_mode on failure (bad formatting)
-    logWarn("sendMessage failed with parse_mode, retrying as plain text")
+    logWarn("sendMessage failed with parse_mode=\(parseMode!), retrying as plain text")
     var plainBody: [String: Any] = ["chat_id": chatId, "text": text]
     if let replyTo { plainBody["reply_to_message_id"] = replyTo }
     if let replyMarkup { plainBody["reply_markup"] = replyMarkup }
     let (retryOk, retryResult, _) = telegramRequest(
       token: token, method: "sendMessage", body: plainBody)
-    guard retryOk, let dict = retryResult as? [String: Any] else { return nil }
+    guard retryOk, let dict = retryResult as? [String: Any] else {
+      logWarn("sendMessage: plain text retry also failed for chat \(chatId)")
+      return nil
+    }
     return dict["message_id"] as? Int
   }
 
-  guard ok, let dict = result as? [String: Any] else { return nil }
+  guard ok, let dict = result as? [String: Any] else {
+    logDebug("sendMessage: failed for chat \(chatId)")
+    return nil
+  }
   return dict["message_id"] as? Int
 }
 
@@ -162,6 +177,7 @@ func telegramEditMessage(
 
   let (ok, _, _) = telegramRequest(token: token, method: "editMessageText", body: body)
   if !ok, parseMode != nil {
+    logWarn("editMessageText failed with parse_mode=\(parseMode!), retrying as plain text")
     let plainBody: [String: Any] = [
       "chat_id": chatId,
       "message_id": messageId,
@@ -216,6 +232,9 @@ func telegramSendMessageDraft(
   ]
   if let parseMode { body["parse_mode"] = parseMode }
   let (ok, _, _) = telegramRequest(token: token, method: "sendMessageDraft", body: body)
+  if !ok {
+    logDebug("sendMessageDraft: failed for chat \(chatId) draftId=\(draftId)")
+  }
   return ok
 }
 

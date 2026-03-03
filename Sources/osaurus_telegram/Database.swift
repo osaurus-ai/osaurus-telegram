@@ -277,6 +277,9 @@ enum DatabaseManager {
     guard let data = resultStr.data(using: .utf8),
       let json = try? JSONSerialization.jsonObject(with: data)
     else {
+      logDebug(
+        "extractRows: failed to parse JSON (\(resultStr.count) chars): \(String(resultStr.prefix(200)))"
+      )
       return nil
     }
 
@@ -290,6 +293,7 @@ enum DatabaseManager {
       return rows
     }
 
+    logDebug("extractRows: JSON parsed but no rows found in result")
     return nil
   }
 
@@ -322,13 +326,20 @@ enum DatabaseManager {
   }
 
   static func dbQuery(_ sql: String, params: String) -> String? {
-    guard let query = hostAPI?.pointee.db_query else { return nil }
-    return sql.withCString { sqlPtr in
+    guard let query = hostAPI?.pointee.db_query else {
+      logDebug("dbQuery: db_query not available")
+      return nil
+    }
+    let result: String? = sql.withCString { sqlPtr in
       params.withCString { paramsPtr in
         guard let resultPtr = query(sqlPtr, paramsPtr) else { return nil }
         return String(cString: resultPtr)
       }
     }
+    if result == nil {
+      logDebug("dbQuery: query returned nil for sql=\(String(sql.prefix(100)))")
+    }
+    return result
   }
 
   /// Serializes an array of mixed values to a JSON array string for SQLite params.
@@ -336,6 +347,7 @@ enum DatabaseManager {
     guard let data = try? JSONSerialization.data(withJSONObject: values),
       let str = String(data: data, encoding: .utf8)
     else {
+      logWarn("serializeParams: failed to serialize \(values.count) values, returning empty array")
       return "[]"
     }
     return str

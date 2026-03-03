@@ -15,23 +15,30 @@ final class PluginContext: @unchecked Sendable {
 // MARK: - Lifecycle
 
 func initPlugin(_ ctx: PluginContext) {
+  logDebug("initPlugin: starting")
   DatabaseManager.initSchema()
+  logDebug("initPlugin: schema initialized")
 
   if let token = configGet("bot_token"), !token.isEmpty {
     ctx.botToken = token
+    logDebug("initPlugin: bot_token found (\(token.count) chars)")
 
-    // Restore cached webhook secret
     if let secret = configGet("webhook_secret"), !secret.isEmpty {
       ctx.webhookSecret = secret
+      logDebug("initPlugin: restored cached webhook_secret")
+    } else {
+      logDebug("initPlugin: no cached webhook_secret")
     }
 
     setupWebhook(ctx: ctx, token: token)
   } else {
     logInfo("No bot_token configured — waiting for configuration")
   }
+  logDebug("initPlugin: complete")
 }
 
 func setupWebhook(ctx: PluginContext, token: String) {
+  logDebug("setupWebhook: calling getMe to validate token")
   guard let botInfo = telegramGetMe(token: token) else {
     logError("Failed to validate bot token with getMe")
     configSet("webhook_registered", "false")
@@ -45,17 +52,16 @@ func setupWebhook(ctx: PluginContext, token: String) {
   let secret = randomHexString(bytes: 32)
   ctx.webhookSecret = secret
   configSet("webhook_secret", secret)
+  logDebug("setupWebhook: generated new webhook secret")
 
-  // Build webhook URL using the plugin_id
   let pluginId = "osaurus.telegram"
   guard let tunnelBase = configGet("tunnel_url") else {
-    // If tunnel_url isn't in config, we can't register webhook.
-    // The host may provide it via plugin_url or the user sets it manually.
     logWarn("No tunnel_url in config, skipping webhook registration")
     return
   }
 
   let webhookURL = "\(tunnelBase)/plugins/\(pluginId)/webhook"
+  logDebug("setupWebhook: registering webhook at \(webhookURL)")
 
   if telegramSetWebhook(token: token, url: webhookURL, secretToken: secret) {
     configSet("webhook_registered", "true")
@@ -67,15 +73,20 @@ func setupWebhook(ctx: PluginContext, token: String) {
 }
 
 func onConfigChanged(ctx: PluginContext, key: String, value: String?) {
-  guard key == "bot_token" else { return }
-
-  // Tear down old webhook if we had a token
-  if let oldToken = ctx.botToken, !oldToken.isEmpty {
-    _ = telegramDeleteWebhook(token: oldToken)
-    logInfo("Old webhook deleted")
+  logDebug("onConfigChanged: key=\(key) hasValue=\(value != nil)")
+  guard key == "bot_token" else {
+    logDebug("onConfigChanged: ignoring key '\(key)' (not bot_token)")
+    return
   }
 
-  // Clear bot state
+  if let oldToken = ctx.botToken, !oldToken.isEmpty {
+    logDebug("onConfigChanged: tearing down old webhook (had token)")
+    _ = telegramDeleteWebhook(token: oldToken)
+    logInfo("Old webhook deleted")
+  } else {
+    logDebug("onConfigChanged: no old token to tear down")
+  }
+
   ctx.botToken = nil
   ctx.botId = nil
   ctx.botUsername = nil
@@ -88,6 +99,7 @@ func onConfigChanged(ctx: PluginContext, key: String, value: String?) {
     return
   }
 
+  logDebug("onConfigChanged: new token provided (\(newToken.count) chars), setting up webhook")
   ctx.botToken = newToken
   setupWebhook(ctx: ctx, token: newToken)
 }

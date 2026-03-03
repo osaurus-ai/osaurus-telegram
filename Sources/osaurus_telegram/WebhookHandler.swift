@@ -4,8 +4,11 @@ import Foundation
 
 func handleRoute(ctx: PluginContext, requestJSON: String) -> String {
   guard let req = parseJSON(requestJSON, as: RouteRequest.self) else {
+    logWarn("handleRoute: failed to parse request JSON (\(requestJSON.count) chars)")
     return makeRouteResponse(status: 400, body: "{\"error\":\"Invalid request\"}")
   }
+
+  logDebug("handleRoute: route_id=\(req.route_id) method=\(req.method)")
 
   switch req.route_id {
   case "webhook":
@@ -13,6 +16,7 @@ func handleRoute(ctx: PluginContext, requestJSON: String) -> String {
   case "health":
     return handleHealth(ctx: ctx)
   default:
+    logWarn("handleRoute: unknown route_id '\(req.route_id)'")
     return makeRouteResponse(status: 404, body: "{\"error\":\"Not found\"}")
   }
 }
@@ -26,6 +30,8 @@ private func extractSecretHeader(from headers: [String: String]) -> String? {
 }
 
 private func handleWebhook(ctx: PluginContext, req: RouteRequest) -> String {
+  logDebug("handleWebhook: body=\(String((req.body ?? "nil").prefix(300)))")
+
   guard let secret = ctx.webhookSecret else {
     logWarn("Webhook request rejected: no webhook secret configured")
     return makeRouteResponse(status: 401, body: "{\"error\":\"Unauthorized\"}")
@@ -37,23 +43,30 @@ private func handleWebhook(ctx: PluginContext, req: RouteRequest) -> String {
   }
 
   guard let headerToken = extractSecretHeader(from: headers), headerToken == secret else {
-    logWarn("Webhook request rejected: invalid secret token")
+    logWarn(
+      "Webhook request rejected: invalid secret token (header present: \(extractSecretHeader(from: headers) != nil))"
+    )
     return makeRouteResponse(status: 401, body: "{\"error\":\"Unauthorized\"}")
   }
 
   guard let body = req.body,
     let update = parseJSON(body, as: TelegramUpdate.self)
   else {
-    logWarn("Webhook: failed to parse update body")
+    logWarn("Webhook: failed to parse update body (\(req.body?.count ?? 0) chars)")
     return makeRouteResponse(status: 200, body: "ok")
   }
 
   let agentAddress = req.osaurus?.agent_address
+  logDebug(
+    "handleWebhook: update_id=\(update.update_id) hasMessage=\(update.message != nil) hasCallback=\(update.callback_query != nil) agentAddress=\(agentAddress ?? "nil")"
+  )
 
   if let message = update.message {
     handleMessage(ctx: ctx, message: message, agentAddress: agentAddress)
   } else if let callbackQuery = update.callback_query {
     handleCallback(ctx: ctx, query: callbackQuery)
+  } else {
+    logDebug("handleWebhook: update has neither message nor callback_query, ignoring")
   }
 
   return makeRouteResponse(status: 200, body: "ok")
@@ -87,6 +100,11 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
   let chat = message.chat
   let chatId = "\(chat.id)"
   let isPrivateChat = chat.type == "private"
+  let senderName = formatSenderName(from: message.from)
+
+  logDebug(
+    "handleMessage: chatId=\(chatId) type=\(chat.type) sender=\(senderName ?? "unknown") msgId=\(message.message_id)"
+  )
 
   let chatTitle = chat.title ?? chat.first_name ?? chat.username
   DatabaseManager.upsertChat(
@@ -96,7 +114,6 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
     username: chat.username
   )
 
-  let senderName = formatSenderName(from: message.from)
   let mediaType = detectMediaType(message: message)
   let mediaFileId = detectMediaFileId(message: message)
 
@@ -111,20 +128,31 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
     mediaFileId: mediaFileId,
     taskId: nil
   )
+  logDebug(
+    "handleMessage: stored incoming message (text=\((message.text ?? message.caption)?.count ?? 0) chars, media=\(mediaType ?? "none"))"
+  )
 
   if let allowed = configGet("allowed_chat_ids"), !allowed.isEmpty {
     let allowedIds = Set(
       allowed.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) })
     if !allowedIds.contains(chatId) {
-      guard let token = ctx.botToken else { return }
+      guard let token = ctx.botToken else {
+        logWarn("handleMessage: chat \(chatId) not allowed and no bot token to send rejection")
+        return
+      }
       _ = telegramSendMessage(token: token, chatId: chatId, text: "Not authorized.")
-      logWarn("Chat \(chatId) not in allowed_chat_ids, rejecting")
+      logWarn("Chat \(chatId) not in allowed_chat_ids [\(allowed)], rejecting")
       return
     }
+    logDebug("handleMessage: chat \(chatId) is in allowed_chat_ids")
   }
 
   if let text = message.text, text.hasPrefix("/start") {
-    guard let token = ctx.botToken else { return }
+    guard let token = ctx.botToken else {
+      logWarn("handleMessage: /start received but no bot token")
+      return
+    }
+    logDebug("handleMessage: /start command received")
     let welcome =
       "Hello! I'm connected to your Osaurus agent. Send me a message and I'll get to work."
     _ = telegramSendMessage(
@@ -133,16 +161,28 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
   }
 
   let prompt = buildPrompt(from: message)
-  guard !prompt.isEmpty else { return }
-  guard let token = ctx.botToken else { return }
+  guard !prompt.isEmpty else {
+    logDebug("handleMessage: empty prompt, ignoring message")
+    return
+  }
+  guard let token = ctx.botToken else {
+    logWarn("handleMessage: no bot token configured, cannot respond to chat \(chatId)")
+    return
+  }
+
+  logDebug("handleMessage: prompt=\"\(String(prompt.prefix(100)))\" (\(prompt.count) chars)")
 
   if let pendingTask = DatabaseManager.getAwaitingClarification(chatId: chatId) {
+    logDebug("handleMessage: found pending clarification for task \(pendingTask.taskId)")
     if let clarify = hostAPI?.pointee.dispatch_clarify {
       pendingTask.taskId.withCString { tid in
         prompt.withCString { p in
           clarify(tid, p)
         }
       }
+      logDebug("handleMessage: sent clarification response for task \(pendingTask.taskId)")
+    } else {
+      logWarn("handleMessage: dispatch_clarify not available, cannot respond to clarification")
     }
     DatabaseManager.updateTask(taskId: pendingTask.taskId, status: "running")
     _ = telegramSendMessage(
@@ -153,9 +193,12 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
   telegramSendChatAction(token: token, chatId: chatId)
 
   let agentMode = configGet("agent_mode") ?? "work"
+  logDebug(
+    "handleMessage: agent_mode=\(agentMode) isPrivate=\(isPrivateChat) complete_stream=\(hostAPI?.pointee.complete_stream != nil)"
+  )
 
-  // Chat mode streaming for private chats
   if agentMode == "chat" && isPrivateChat && hostAPI?.pointee.complete_stream != nil {
+    logDebug("handleMessage: -> chat mode streaming path")
     handleChatModeStreaming(
       token: token, chatId: chatId,
       prompt: prompt, messageId: message.message_id,
@@ -164,7 +207,8 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
     return
   }
 
-  // Work mode (or fallback): dispatch agent task
+  logDebug("handleMessage: -> work mode dispatch path")
+
   let titleText = message.text ?? message.caption ?? "Media message"
   let firstLine = String(titleText.prefix(60))
 
@@ -182,9 +226,13 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
   ]
   if let agentAddress { dispatchPayload["agent_address"] = agentAddress }
   guard let dispatchJSON = makeJSONString(dispatchPayload) else {
-    logError("Failed to build dispatch JSON")
+    logError("Failed to build dispatch JSON from payload keys: \(Array(dispatchPayload.keys))")
     return
   }
+
+  logDebug(
+    "handleMessage: dispatching with mode=\(dispatchMode) payload=\(String(dispatchJSON.prefix(300)))"
+  )
 
   let dispatchResultStr: String? = dispatchJSON.withCString { ptr in
     guard let resultPtr = dispatch(ptr) else { return nil }
@@ -196,6 +244,8 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
     return
   }
 
+  logDebug("handleMessage: dispatch result=\(String(resultStr.prefix(300)))")
+
   guard let dispatchResult = parseJSON(resultStr, as: DispatchResponse.self),
     let taskId = dispatchResult.id
   else {
@@ -204,15 +254,17 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
   }
 
   DatabaseManager.insertTask(taskId: taskId, chatId: chatId, messageId: message.message_id)
+  logDebug("handleMessage: inserted task \(taskId) for chat \(chatId)")
 
-  // For private chats, the task handler uses sendMessageDraft for progress.
-  // For groups, create a status message that can be edited.
   let sendTypingEnabled = configGet("send_typing") != "false"
   if sendTypingEnabled && !isPrivateChat {
     if let statusMsgId = telegramSendMessage(
       token: token, chatId: chatId, text: "\u{23F3} Working on it...")
     {
       DatabaseManager.updateTask(taskId: taskId, statusMsgId: statusMsgId)
+      logDebug("handleMessage: created status message \(statusMsgId) for task \(taskId)")
+    } else {
+      logWarn("handleMessage: failed to send status message for task \(taskId)")
     }
   }
 
@@ -225,6 +277,7 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
 final class ChatStreamState {
   var accumulated = ""
   var lastFlushLength = 0
+  var receivedFirstChunk = false
   let token: String
   let chatId: String
   let draftId: Int
@@ -244,12 +297,18 @@ private let streamChunkCallback:
     let state = Unmanaged<ChatStreamState>.fromOpaque(userData).takeUnretainedValue()
     let chunk = String(cString: chunkPtr)
 
+    if !state.receivedFirstChunk {
+      state.receivedFirstChunk = true
+      logDebug("streamChunkCallback: first chunk received (\(chunk.count) chars)")
+    }
+
     if let content = extractStreamContent(chunk) {
       state.accumulated += content
     }
 
     let newChars = state.accumulated.count - state.lastFlushLength
     if newChars >= ChatStreamState.flushThreshold {
+      logDebug("streamChunkCallback: flush at \(state.accumulated.count) chars")
       _ = telegramSendMessageDraft(
         token: state.token,
         chatId: state.chatId,
@@ -302,16 +361,21 @@ func buildCompletionMessages(historyJSON: String, currentPrompt: String) -> [[St
 private func handleChatModeStreaming(
   token: String, chatId: String, prompt: String, messageId: Int, agentAddress: String?
 ) {
+  logDebug(
+    "handleChatModeStreaming: chatId=\(chatId) prompt=\(prompt.count) chars msgId=\(messageId)")
+
   let chatDraftId = draftId(for: "chat-\(chatId)-\(messageId)")
 
-  _ = telegramSendMessageDraft(
+  let draftOk = telegramSendMessageDraft(
     token: token, chatId: chatId,
     draftId: chatDraftId, text: "Thinking..."
   )
+  logDebug("handleChatModeStreaming: initial draft sent ok=\(draftOk)")
 
   DispatchQueue.global(qos: .userInitiated).async {
     let historyJSON = DatabaseManager.getMessages(chatId: chatId, limit: 20)
     let messages = buildCompletionMessages(historyJSON: historyJSON, currentPrompt: prompt)
+    logDebug("handleChatModeStreaming: built \(messages.count) completion messages from history")
 
     var request: [String: Any] = [
       "model": "",
@@ -320,9 +384,12 @@ private func handleChatModeStreaming(
     ]
     if let agentAddress { request["agent_address"] = agentAddress }
     guard let requestJSON = makeJSONString(request) else {
+      logError("handleChatModeStreaming: failed to serialize completion request")
       _ = telegramSendMessage(token: token, chatId: chatId, text: "Failed to build request.")
       return
     }
+
+    logDebug("handleChatModeStreaming: calling complete_stream (\(requestJSON.count) chars)")
 
     let state = ChatStreamState(token: token, chatId: chatId, draftId: chatDraftId)
     let statePtr = Unmanaged.passRetained(state).toOpaque()
@@ -335,6 +402,8 @@ private func handleChatModeStreaming(
     if let result {
       let resultStr = String(cString: result)
       free(UnsafeMutableRawPointer(mutating: result))
+      logDebug(
+        "handleChatModeStreaming: complete_stream returned: \(String(resultStr.prefix(300)))")
       if let resultData = resultStr.data(using: .utf8),
         let resultJSON = try? JSONSerialization.jsonObject(with: resultData) as? [String: Any],
         let errorMsg = resultJSON["error"] as? String
@@ -342,12 +411,19 @@ private func handleChatModeStreaming(
         logError("Streaming inference error: \(errorMsg)")
         streamError = errorMsg
       }
+    } else {
+      logDebug("handleChatModeStreaming: complete_stream returned nil (no error object)")
     }
+
+    logDebug(
+      "handleChatModeStreaming: stream finished, accumulated=\(state.accumulated.count) chars, error=\(streamError ?? "none")"
+    )
 
     let finalText: String
     if let streamError, state.accumulated.isEmpty {
       finalText = "Error: \(streamError)"
     } else if state.accumulated.isEmpty {
+      logWarn("handleChatModeStreaming: no content accumulated and no error")
       finalText = "I couldn't generate a response."
     } else {
       finalText = state.accumulated
@@ -355,6 +431,7 @@ private func handleChatModeStreaming(
 
     let msgId = telegramSendLongMessage(
       token: token, chatId: chatId, text: finalText, replyTo: messageId)
+    logDebug("handleChatModeStreaming: sent final message, msgId=\(msgId.map { "\($0)" } ?? "nil")")
 
     if let msgId {
       DatabaseManager.insertMessage(
@@ -379,6 +456,8 @@ private func handleChatModeStreaming(
 // MARK: - Callback Handler
 
 private func handleCallback(ctx: PluginContext, query: TelegramCallbackQuery) {
+  logDebug("handleCallback: callbackId=\(query.id) data=\(query.data ?? "nil")")
+
   guard let data = query.data, data.hasPrefix("clarify:") else {
     logWarn("Callback query with unrecognized data: \(query.data ?? "nil")")
     return
@@ -393,13 +472,17 @@ private func handleCallback(ctx: PluginContext, query: TelegramCallbackQuery) {
   }
 
   let taskId = String(parts[1])
+  logDebug("handleCallback: taskId=\(taskId) optionIndex=\(optionIndex)")
 
   guard let task = DatabaseManager.getTask(taskId: taskId) else {
     logWarn("Callback for unknown task: \(taskId)")
     return
   }
 
-  guard let token = ctx.botToken else { return }
+  guard let token = ctx.botToken else {
+    logWarn("handleCallback: no bot token, cannot process callback for task \(taskId)")
+    return
+  }
 
   var selectedText = "Option \(optionIndex + 1)"
   if let optionsJSON = task.clarificationOptions,
@@ -409,6 +492,7 @@ private func handleCallback(ctx: PluginContext, query: TelegramCallbackQuery) {
   {
     selectedText = options[optionIndex]
   }
+  logDebug("handleCallback: selectedText=\"\(selectedText)\"")
 
   if let clarify = hostAPI?.pointee.dispatch_clarify {
     taskId.withCString { tid in
@@ -416,6 +500,9 @@ private func handleCallback(ctx: PluginContext, query: TelegramCallbackQuery) {
         clarify(tid, sel)
       }
     }
+    logDebug("handleCallback: sent clarification response to host")
+  } else {
+    logWarn("handleCallback: dispatch_clarify not available, clarification not sent to host")
   }
 
   telegramAnswerCallbackQuery(
@@ -432,6 +519,7 @@ private func handleCallback(ctx: PluginContext, query: TelegramCallbackQuery) {
   }
 
   DatabaseManager.updateTask(taskId: taskId, status: "running", clarificationOptions: nil)
+  logDebug("handleCallback: task \(taskId) updated to running")
 }
 
 // MARK: - Health Endpoint

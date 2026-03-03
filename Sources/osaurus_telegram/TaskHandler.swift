@@ -21,19 +21,29 @@ func draftId(for taskId: String) -> Int {
   return Int(h & 0x7FFF_FFFE) | 1
 }
 
+private let taskEventNames: [Int32: String] = [
+  0: "STARTED", 1: "ACTIVITY", 2: "PROGRESS", 3: "CLARIFICATION",
+  4: "COMPLETED", 5: "FAILED", 6: "CANCELLED",
+]
+
 func handleTaskEvent(ctx: PluginContext, taskId: String, eventType: Int32, eventJSON: String) {
+  let eventName = taskEventNames[eventType] ?? "UNKNOWN(\(eventType))"
+  logDebug(
+    "handleTaskEvent: taskId=\(taskId) type=\(eventName) json=\(String(eventJSON.prefix(200)))")
+
   guard let task = DatabaseManager.getTask(taskId: taskId) else {
-    logWarn("Task event for unknown task \(taskId), event type \(eventType)")
+    logWarn("Task event for unknown task \(taskId), event type \(eventName)")
     return
   }
 
   guard let token = ctx.botToken, !token.isEmpty else {
-    logWarn("No bot token for task event \(taskId)")
+    logWarn("No bot token for task event \(taskId) (\(eventName))")
     return
   }
 
   let chatId = task.chatId
   let isPrivate = task.chatType == "private"
+  logDebug("handleTaskEvent: chatId=\(chatId) isPrivate=\(isPrivate) status=\(task.status)")
 
   switch eventType {
   case TaskEventType.started:
@@ -69,13 +79,15 @@ func handleTaskEvent(ctx: PluginContext, taskId: String, eventType: Int32, event
 // MARK: - Event Handlers
 
 private func handleStarted(token: String, chatId: String, task: TaskRow, isPrivate: Bool) {
+  logDebug("handleStarted: task \(task.taskId) isPrivate=\(isPrivate)")
   DatabaseManager.updateTask(taskId: task.taskId, status: "running")
   if isPrivate {
-    _ = telegramSendMessageDraft(
+    let ok = telegramSendMessageDraft(
       token: token, chatId: chatId,
       draftId: draftId(for: task.taskId),
       text: "\u{23F3} Working on it..."
     )
+    logDebug("handleStarted: sent draft ok=\(ok)")
   } else {
     telegramSendChatAction(token: token, chatId: chatId)
   }
@@ -88,11 +100,14 @@ private func handleActivity(
     if let event = parseJSON(eventJSON, as: TaskActivityEvent.self),
       let title = event.title
     {
+      logDebug("handleActivity: task \(task.taskId) title=\"\(title)\"")
       _ = telegramSendMessageDraft(
         token: token, chatId: chatId,
         draftId: draftId(for: task.taskId),
         text: "\u{23F3} \(title)..."
       )
+    } else {
+      logDebug("handleActivity: task \(task.taskId) failed to parse activity event")
     }
     return
   }
@@ -107,12 +122,17 @@ private func handleActivity(
     if let event = parseJSON(eventJSON, as: TaskActivityEvent.self),
       let title = event.title
     {
+      logDebug(
+        "handleActivity: task \(task.taskId) updating status msg \(statusMsgId) title=\"\(title)\"")
       _ = telegramEditMessage(
         token: token,
         chatId: chatId,
         messageId: statusMsgId,
         text: "\u{23F3} \(title)..."
       )
+    } else {
+      logDebug(
+        "handleActivity: task \(task.taskId) failed to parse activity event for status update")
     }
   }
 }
@@ -120,13 +140,17 @@ private func handleActivity(
 private func handleProgress(
   token: String, chatId: String, task: TaskRow, isPrivate: Bool, eventJSON: String
 ) {
-  guard let event = parseJSON(eventJSON, as: TaskProgressEvent.self) else { return }
+  guard let event = parseJSON(eventJSON, as: TaskProgressEvent.self) else {
+    logDebug("handleProgress: task \(task.taskId) failed to parse progress event")
+    return
+  }
 
   let progressValue = event.progress ?? 0.0
   DatabaseManager.updateTask(taskId: task.taskId, progress: progressValue)
 
   let pct = Int(progressValue * 100)
   let step = event.current_step ?? "Processing"
+  logDebug("handleProgress: task \(task.taskId) \(pct)% step=\"\(step)\"")
 
   if isPrivate {
     _ = telegramSendMessageDraft(
@@ -148,11 +172,16 @@ private func handleClarification(token: String, chatId: String, taskId: String, 
   guard let event = parseJSON(eventJSON, as: TaskClarificationEvent.self),
     let question = event.question
   else {
-    logWarn("Clarification event missing question for task \(taskId)")
+    logWarn(
+      "Clarification event missing question for task \(taskId), json=\(String(eventJSON.prefix(200)))"
+    )
     return
   }
 
   let options = event.options ?? []
+  logDebug(
+    "handleClarification: task \(taskId) question=\"\(String(question.prefix(100)))\" options=\(options.count)"
+  )
 
   if options.isEmpty {
     _ = telegramSendMessage(
@@ -192,12 +221,16 @@ private func handleCompleted(
 ) {
   let event = parseJSON(eventJSON, as: TaskCompletedEvent.self)
   let summary = event?.summary ?? "Task completed."
+  logDebug(
+    "handleCompleted: task \(task.taskId) summary=\(String(summary.prefix(200))) (\(summary.count) chars)"
+  )
 
   if !isPrivate, let statusMsgId = task.statusMsgId {
     _ = telegramDeleteMessage(token: token, chatId: chatId, messageId: statusMsgId)
   }
 
   let msgId = telegramSendLongMessage(token: token, chatId: chatId, text: summary)
+  logDebug("handleCompleted: sent summary message, msgId=\(msgId.map { "\($0)" } ?? "nil")")
 
   if let msgId {
     DatabaseManager.insertMessage(
@@ -222,6 +255,7 @@ private func handleFailed(
 ) {
   let event = parseJSON(eventJSON, as: TaskFailedEvent.self)
   let summary = event?.summary ?? "Task failed."
+  logDebug("handleFailed: task \(task.taskId) summary=\"\(String(summary.prefix(200)))\"")
 
   if !isPrivate, let statusMsgId = task.statusMsgId {
     _ = telegramDeleteMessage(token: token, chatId: chatId, messageId: statusMsgId)
@@ -229,10 +263,11 @@ private func handleFailed(
 
   _ = telegramSendMessage(token: token, chatId: chatId, text: "\u{274C} \(summary)")
   DatabaseManager.updateTask(taskId: task.taskId, status: "failed", summary: summary)
-  logWarn("Task \(task.taskId) failed for chat \(chatId)")
+  logWarn("Task \(task.taskId) failed for chat \(chatId): \(summary)")
 }
 
 private func handleCancelled(token: String, chatId: String, task: TaskRow, isPrivate: Bool) {
+  logDebug("handleCancelled: task \(task.taskId)")
   if !isPrivate, let statusMsgId = task.statusMsgId {
     _ = telegramDeleteMessage(token: token, chatId: chatId, messageId: statusMsgId)
   }

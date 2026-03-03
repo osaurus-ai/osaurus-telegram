@@ -120,18 +120,22 @@ private func withCString(_ s: String, _ body: (UnsafePointer<CChar>) -> Void) {
 }
 
 func logDebug(_ message: String) {
+  print("[TELEGRAM][DEBUG] \(message)")
   withCString(message) { hostAPI?.pointee.log?(0, $0) }
 }
 
 func logInfo(_ message: String) {
+  print("[TELEGRAM][INFO] \(message)")
   withCString(message) { hostAPI?.pointee.log?(1, $0) }
 }
 
 func logWarn(_ message: String) {
+  print("[TELEGRAM][WARN] \(message)")
   withCString(message) { hostAPI?.pointee.log?(2, $0) }
 }
 
 func logError(_ message: String) {
+  print("[TELEGRAM][ERROR] \(message)")
   withCString(message) { hostAPI?.pointee.log?(3, $0) }
 }
 
