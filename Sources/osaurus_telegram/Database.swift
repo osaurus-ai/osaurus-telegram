@@ -233,6 +233,12 @@ enum DatabaseManager {
     return row[0] as? String
   }
 
+  static func clearChat(chatId: String) {
+    let params = serializeParams([chatId])
+    dbExec("DELETE FROM messages WHERE chat_id = ?1", params: params)
+    dbExec("DELETE FROM tasks WHERE chat_id = ?1", params: params)
+  }
+
   static func getMessages(chatId: String, limit: Int) -> String {
     let clampedLimit = min(max(limit, 1), 200)
     let sql = """

@@ -124,6 +124,20 @@ osaurus tools install ./osaurus.telegram-0.1.0.zip
 
 Send a message to your bot in Telegram. In Work Mode, the plugin dispatches it to an Osaurus agent and relays the response. In Chat Mode (private chats), you get a streaming conversational response.
 
+## Bot Commands
+
+| Command | Description |
+|---------|-------------|
+| `/start` | Start the bot and show a welcome message |
+| `/clear` | Clear conversation history and start fresh |
+
+To make these appear in Telegram's command menu, send `/setcommands` to [@BotFather](https://t.me/BotFather) and enter:
+
+```
+start - Start the bot
+clear - Clear conversation history
+```
+
 ## Tools
 
 The plugin exposes two tools that agents can call during task execution:

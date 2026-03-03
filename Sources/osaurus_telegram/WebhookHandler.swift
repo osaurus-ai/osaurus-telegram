@@ -160,6 +160,20 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
     return
   }
 
+  if let text = message.text, text.hasPrefix("/clear") {
+    guard let token = ctx.botToken else {
+      logWarn("handleMessage: /clear received but no bot token")
+      return
+    }
+    logDebug("handleMessage: /clear command received for chat \(chatId)")
+    DatabaseManager.clearChat(chatId: chatId)
+    _ = telegramSendMessage(
+      token: token, chatId: chatId,
+      text: "Conversation cleared. Send a new message to start fresh.",
+      replyTo: message.message_id)
+    return
+  }
+
   let prompt = buildPrompt(from: message)
   guard !prompt.isEmpty else {
     logDebug("handleMessage: empty prompt, ignoring message")
