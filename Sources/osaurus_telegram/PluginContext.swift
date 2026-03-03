@@ -8,6 +8,8 @@ final class PluginContext: @unchecked Sendable {
   var botUsername: String?
   var webhookSecret: String?
 
+  var taskOutputTexts: [String: String] = [:]
+
   let telegramSendTool = TelegramSendTool()
   let chatHistoryTool = TelegramGetChatHistoryTool()
 }

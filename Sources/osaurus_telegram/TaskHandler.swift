@@ -63,18 +63,21 @@ func handleTaskEvent(ctx: PluginContext, taskId: String, eventType: Int32, event
 
   case TaskEventType.completed:
     handleCompleted(
-      token: token, chatId: chatId, task: task, isPrivate: isPrivate, eventJSON: eventJSON)
+      ctx: ctx, token: token, chatId: chatId, task: task, isPrivate: isPrivate, eventJSON: eventJSON
+    )
 
   case TaskEventType.failed:
     handleFailed(
-      token: token, chatId: chatId, task: task, isPrivate: isPrivate, eventJSON: eventJSON)
+      ctx: ctx, token: token, chatId: chatId, task: task, isPrivate: isPrivate, eventJSON: eventJSON
+    )
 
   case TaskEventType.cancelled:
-    handleCancelled(token: token, chatId: chatId, task: task, isPrivate: isPrivate)
+    handleCancelled(ctx: ctx, token: token, chatId: chatId, task: task, isPrivate: isPrivate)
 
   case TaskEventType.output:
     handleOutput(
-      token: token, chatId: chatId, task: task, isPrivate: isPrivate, eventJSON: eventJSON)
+      ctx: ctx, token: token, chatId: chatId, task: task, isPrivate: isPrivate, eventJSON: eventJSON
+    )
 
   default:
     logWarn("Unknown task event type \(eventType) for task \(taskId)")
@@ -222,20 +225,23 @@ private func handleClarification(token: String, chatId: String, taskId: String, 
 }
 
 private func handleCompleted(
-  token: String, chatId: String, task: TaskRow, isPrivate: Bool, eventJSON: String
+  ctx: PluginContext, token: String, chatId: String, task: TaskRow, isPrivate: Bool,
+  eventJSON: String
 ) {
   let event = parseJSON(eventJSON, as: TaskCompletedEvent.self)
   let summary = event?.summary ?? "Task completed."
+  let accumulatedOutput = ctx.taskOutputTexts.removeValue(forKey: task.taskId)
+  let messageText = accumulatedOutput ?? summary
   logDebug(
-    "handleCompleted: task \(task.taskId) summary=\(String(summary.prefix(200))) (\(summary.count) chars)"
+    "handleCompleted: task \(task.taskId) summary=\(String(summary.prefix(200))) (\(summary.count) chars) accumulatedOutput=\(accumulatedOutput != nil ? "\(accumulatedOutput!.count) chars" : "none")"
   )
 
   if !isPrivate, let statusMsgId = task.statusMsgId {
     _ = telegramDeleteMessage(token: token, chatId: chatId, messageId: statusMsgId)
   }
 
-  let msgId = telegramSendLongMessage(token: token, chatId: chatId, text: summary)
-  logDebug("handleCompleted: sent summary message, msgId=\(msgId.map { "\($0)" } ?? "nil")")
+  let msgId = telegramSendLongMessage(token: token, chatId: chatId, text: messageText)
+  logDebug("handleCompleted: sent message, msgId=\(msgId.map { "\($0)" } ?? "nil")")
 
   if let msgId {
     DatabaseManager.insertMessage(
@@ -244,7 +250,7 @@ private func handleCompleted(
       direction: "out",
       senderId: nil,
       senderName: "Agent",
-      text: summary,
+      text: messageText,
       mediaType: nil,
       mediaFileId: nil,
       taskId: task.taskId
@@ -256,8 +262,10 @@ private func handleCompleted(
 }
 
 private func handleFailed(
-  token: String, chatId: String, task: TaskRow, isPrivate: Bool, eventJSON: String
+  ctx: PluginContext, token: String, chatId: String, task: TaskRow, isPrivate: Bool,
+  eventJSON: String
 ) {
+  ctx.taskOutputTexts.removeValue(forKey: task.taskId)
   let event = parseJSON(eventJSON, as: TaskFailedEvent.self)
   let summary = event?.summary ?? "Task failed."
   logDebug("handleFailed: task \(task.taskId) summary=\"\(String(summary.prefix(200)))\"")
@@ -271,7 +279,10 @@ private func handleFailed(
   logWarn("Task \(task.taskId) failed for chat \(chatId): \(summary)")
 }
 
-private func handleCancelled(token: String, chatId: String, task: TaskRow, isPrivate: Bool) {
+private func handleCancelled(
+  ctx: PluginContext, token: String, chatId: String, task: TaskRow, isPrivate: Bool
+) {
+  ctx.taskOutputTexts.removeValue(forKey: task.taskId)
   logDebug("handleCancelled: task \(task.taskId)")
   if !isPrivate, let statusMsgId = task.statusMsgId {
     _ = telegramDeleteMessage(token: token, chatId: chatId, messageId: statusMsgId)
@@ -283,7 +294,8 @@ private func handleCancelled(token: String, chatId: String, task: TaskRow, isPri
 }
 
 private func handleOutput(
-  token: String, chatId: String, task: TaskRow, isPrivate: Bool, eventJSON: String
+  ctx: PluginContext, token: String, chatId: String, task: TaskRow, isPrivate: Bool,
+  eventJSON: String
 ) {
   guard let event = parseJSON(eventJSON, as: TaskOutputEvent.self),
     let text = event.text, !text.isEmpty
@@ -293,6 +305,8 @@ private func handleOutput(
   }
 
   logDebug("handleOutput: task \(task.taskId) text=\(text.count) chars")
+
+  ctx.taskOutputTexts[task.taskId] = text
 
   if isPrivate {
     _ = telegramSendMessageDraft(
