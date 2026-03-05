@@ -259,11 +259,11 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
                 "title": "Behavior",
                 "fields": [
                   {
-                    "key": "allowed_chat_ids",
+                    "key": "allowed_users",
                     "type": "text",
-                    "label": "Allowed Chat IDs",
-                    "placeholder": "Leave blank to allow all, or comma-separated IDs",
-                    "description": "Restrict which Telegram chats can dispatch agent work. Empty = all chats allowed."
+                    "label": "Allowed Users",
+                    "placeholder": "@alice, @bob",
+                    "description": "Comma-separated Telegram usernames. Only these users can interact with the agent. Leave blank to allow everyone."
                   },
                   {
                     "key": "send_typing",

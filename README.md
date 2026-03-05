@@ -2,29 +2,6 @@
 
 Connect Telegram chats to your Osaurus agents. Messages sent to your bot get a streaming conversational response by default. Use the `/work` command to dispatch background multi-step tasks when you need the full agent runtime.
 
-## How It Works
-
-```
-Telegram User                    Osaurus Telegram Plugin                Osaurus Host
-     |                                    |                                  |
-     |-- sends message ----------------->|                                  |
-     |                                    |-- (Work) dispatch agent task --->|
-     |                                    |<-- task events (progress, etc) --|
-     |<-- typing / draft updates --------|                                  |
-     |<-- final response ----------------|                                  |
-     |                                    |                                  |
-     |-- sends message ----------------->|                                  |
-     |                                    |-- (Chat) complete_stream ------->|
-     |<-- draft updates (token stream) --|<-- streaming tokens -------------|
-     |<-- final message -----------------|                                  |
-```
-
-1. A Telegram user sends a message to your bot.
-2. The plugin receives it via webhook.
-3. **Private chats** use the host inference API with streaming. Tokens arrive one by one, and the plugin pushes progressive draft updates to Telegram so the user sees the response being written in real time. A final permanent message is sent when streaming completes.
-4. **Group chats** dispatch a background agent task. The plugin relays progress updates (typing indicators, editable status messages) and sends the final result as a message.
-5. **`/work` command** explicitly dispatches a background agent task in any chat (e.g. `/work summarize today's news`). This is useful for complex multi-step tasks that benefit from full agent capabilities.
-
 ## Features
 
 ### Chat Mode (default)
@@ -52,7 +29,7 @@ Group chat messages always use work mode dispatch since Telegram drafts are only
 
 ### Common Features
 
-- **Chat allowlisting** — Restrict which Telegram chats can interact with your agent by configuring a comma-separated list of allowed chat IDs. Leave blank to allow all.
+- **User allowlisting** — Restrict which Telegram users can interact with your agent by configuring a comma-separated list of usernames (e.g. `@alice, @bob`). Leave blank to allow everyone.
 - **Message history** — Every inbound and outbound message is logged to a local SQLite database. Agents can query this history via the `telegram_get_chat_history` tool.
 - **Automatic webhook management** — The plugin registers and deregisters its Telegram webhook automatically when you configure or change the bot token.
 - **Secure webhook verification** — A random secret token is generated and verified on every incoming webhook request.
@@ -106,22 +83,14 @@ Bot:   Deploying to staging... done! Build v2.3.1 is live.
 2. Send `/newbot` and follow the prompts to choose a name and username
 3. Copy the **bot token** (e.g. `123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11`)
 
-### 2. Install the Plugin
-
-```bash
-swift build -c release
-osaurus tools package osaurus.telegram 0.1.0
-osaurus tools install ./osaurus.telegram-0.1.0.zip
-```
-
-### 3. Configure
+### 2. Configure
 
 1. Open Osaurus and go to **Tools** settings (Cmd+Shift+M)
 2. Find the **Telegram** plugin
 3. Paste your bot token into the **Bot Token** field
 4. The plugin will automatically validate the token and register a webhook with Telegram
 
-### 4. Start Chatting
+### 3. Start Chatting
 
 Send a message to your bot in Telegram. In private chats, you get a streaming conversational response. Use `/work <prompt>` to dispatch a background agent task for complex multi-step work.
 
@@ -162,59 +131,9 @@ The plugin exposes two tools that agents can call during task execution:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `bot_token` | secret | — | Telegram bot token from [@BotFather](https://t.me/BotFather). Required. |
-| `allowed_chat_ids` | text | (empty) | Comma-separated Telegram chat IDs. Leave blank to allow all chats. |
+| `allowed_users` | text | (empty) | Comma-separated Telegram usernames (e.g. `@alice, @bob`). Leave blank to allow everyone. |
 | `send_typing` | toggle | on | Show a typing indicator while the agent works. Applies to work mode in group chats. |
 | `send_progress` | toggle | off | Edit the status message with activity/progress text. Only applies to work mode in group chats. |
-
-## Development
-
-### Build
-
-```bash
-swift build -c release
-```
-
-### Run Tests
-
-```bash
-swift test
-```
-
-### Verify Manifest
-
-```bash
-osaurus manifest extract .build/release/libosaurus-telegram.dylib
-```
-
-### Dev Mode (Hot Reload)
-
-```bash
-osaurus tools dev osaurus.telegram
-```
-
-## Publishing
-
-This project includes a GitHub Actions workflow (`.github/workflows/release.yml`) that automatically builds and releases the plugin when you push a version tag.
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-## Project Structure
-
-```
-Sources/osaurus_telegram/
-├── Plugin.swift          # C ABI entry points and manifest
-├── Models.swift          # Telegram API types and internal data models
-├── Utilities.swift       # MarkdownV2 escaping, message splitting, JSON helpers
-├── Database.swift        # SQLite schema and CRUD operations
-├── TelegramAPI.swift     # Outbound Telegram Bot API calls (including sendMessageDraft)
-├── PluginContext.swift   # Plugin state and lifecycle management
-├── WebhookHandler.swift  # Inbound webhook, route handling, and chat-mode streaming
-├── TaskHandler.swift     # Agent task event processing with draft updates
-└── Tools.swift           # telegram_send and telegram_get_chat_history
-```
 
 ## License
 

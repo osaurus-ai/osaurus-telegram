@@ -132,19 +132,26 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
     "handleMessage: stored incoming message (text=\((message.text ?? message.caption)?.count ?? 0) chars, media=\(mediaType ?? "none"))"
   )
 
-  if let allowed = configGet("allowed_chat_ids"), !allowed.isEmpty {
-    let allowedIds = Set(
-      allowed.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) })
-    if !allowedIds.contains(chatId) {
+  if let allowed = configGet("allowed_users"), !allowed.isEmpty {
+    let allowedUsers = Set(
+      allowed.split(separator: ",").map {
+        $0.trimmingCharacters(in: .whitespaces)
+          .lowercased()
+          .replacingOccurrences(of: "@", with: "")
+      })
+    let senderUsername = message.from?.username?.lowercased()
+    guard let username = senderUsername, allowedUsers.contains(username) else {
       guard let token = ctx.botToken else {
-        logWarn("handleMessage: chat \(chatId) not allowed and no bot token to send rejection")
+        logWarn(
+          "handleMessage: user \(senderUsername ?? "unknown") not allowed and no bot token to send rejection"
+        )
         return
       }
       _ = telegramSendMessage(token: token, chatId: chatId, text: "Not authorized.")
-      logWarn("Chat \(chatId) not in allowed_chat_ids [\(allowed)], rejecting")
+      logWarn("User \(senderUsername ?? "unknown") not in allowed_users [\(allowed)], rejecting")
       return
     }
-    logDebug("handleMessage: chat \(chatId) is in allowed_chat_ids")
+    logDebug("handleMessage: user @\(username) is in allowed_users")
   }
 
   if let text = message.text, text.hasPrefix("/start") {
