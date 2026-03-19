@@ -84,8 +84,23 @@ func setupWebhook(ctx: PluginContext, token: String) {
 
 func onConfigChanged(ctx: PluginContext, key: String, value: String?) {
   logDebug("onConfigChanged: key=\(key) hasValue=\(value != nil)")
+
+  if key == "tunnel_url" {
+    guard let tunnelURL = value, !tunnelURL.isEmpty else {
+      logDebug("onConfigChanged: tunnel_url cleared, ignoring")
+      return
+    }
+    guard let token = ctx.botToken, !token.isEmpty else {
+      logDebug("onConfigChanged: tunnel_url set but no bot_token yet, ignoring")
+      return
+    }
+    logDebug("onConfigChanged: tunnel_url now available, registering webhook")
+    setupWebhook(ctx: ctx, token: token)
+    return
+  }
+
   guard key == "bot_token" else {
-    logDebug("onConfigChanged: ignoring key '\(key)' (not bot_token)")
+    logDebug("onConfigChanged: ignoring key '\(key)' (not bot_token or tunnel_url)")
     return
   }
 
