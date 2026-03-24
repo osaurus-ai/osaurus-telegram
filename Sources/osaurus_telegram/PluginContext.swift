@@ -61,7 +61,6 @@ func setupWebhook(ctx: PluginContext, token: String) {
 
   let secret = randomHexString(bytes: 32)
   ctx.webhookSecret = secret
-  configSet("webhook_secret", secret)
   logDebug("setupWebhook: generated new webhook secret")
 
   let pluginId = "osaurus.telegram"
@@ -74,6 +73,7 @@ func setupWebhook(ctx: PluginContext, token: String) {
   logDebug("setupWebhook: registering webhook at \(webhookURL)")
 
   if telegramSetWebhook(token: token, url: webhookURL, secretToken: secret) {
+    configSet("webhook_secret", secret)
     configSet("webhook_registered", "true")
     logInfo("Webhook registered at \(webhookURL)")
   } else {
@@ -127,6 +127,12 @@ func onConfigChanged(ctx: PluginContext, key: String, value: String?) {
   logDebug("onConfigChanged: new token provided (\(newToken.count) chars), setting up webhook")
   ctx.botToken = newToken
   setupWebhook(ctx: ctx, token: newToken)
+  if ctx.webhookSecret == nil,
+    let cached = configGet("webhook_secret"), !cached.isEmpty
+  {
+    ctx.webhookSecret = cached
+    logWarn("onConfigChanged: getMe failed, using cached webhook_secret as fallback")
+  }
 }
 
 func destroyPlugin(_ ctx: PluginContext) {
