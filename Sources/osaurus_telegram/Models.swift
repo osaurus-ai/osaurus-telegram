@@ -120,6 +120,16 @@ struct TaskOutputEvent: Decodable {
   let text: String?
 }
 
+// MARK: - Artifact Payload
+
+struct ArtifactPayload: Decodable {
+  let filename: String
+  let host_path: String
+  let mime_type: String?
+  let size: Int?
+  let is_directory: Bool?
+}
+
 // MARK: - Dispatch Response
 
 struct DispatchResponse: Decodable {

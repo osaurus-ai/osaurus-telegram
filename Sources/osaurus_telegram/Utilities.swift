@@ -104,6 +104,82 @@ func parseJSON<T: Decodable>(_ jsonString: String, as type: T.Type) -> T? {
   return try? JSONDecoder().decode(type, from: data)
 }
 
+// MARK: - Host File Read
+
+struct HostFileResult {
+  let data: Data
+  let mimeType: String
+}
+
+enum HostFileError: Error {
+  case unavailable
+  case readFailed(String)
+}
+
+/// Reads a file via host->file_read and returns decoded data + MIME type.
+func readHostFile(path: String) -> Result<HostFileResult, HostFileError> {
+  guard let fileRead = hostAPI?.pointee.file_read else {
+    return .failure(.unavailable)
+  }
+
+  guard let readReq = makeJSONString(["path": path]) else {
+    return .failure(.readFailed("Internal error"))
+  }
+
+  let readResultStr: String? = readReq.withCString { ptr in
+    guard let resultPtr = fileRead(ptr) else { return nil }
+    return String(cString: resultPtr)
+  }
+  guard let readResultStr,
+    let readData = readResultStr.data(using: .utf8),
+    let readResult = try? JSONSerialization.jsonObject(with: readData) as? [String: Any]
+  else {
+    return .failure(.readFailed("Invalid response"))
+  }
+
+  if let error = readResult["error"] as? String {
+    return .failure(.readFailed(error))
+  }
+
+  guard let base64Data = readResult["data"] as? String,
+    let fileData = Data(base64Encoded: base64Data)
+  else {
+    return .failure(.readFailed("Failed to decode file data"))
+  }
+
+  let mimeType = readResult["mime_type"] as? String ?? "application/octet-stream"
+  return .success(HostFileResult(data: fileData, mimeType: mimeType))
+}
+
+/// Uploads a file to Telegram, choosing sendPhoto or sendDocument based on MIME type.
+func uploadFileToTelegram(
+  token: String,
+  chatId: String,
+  fileData: Data,
+  filename: String,
+  mimeType: String,
+  caption: String? = nil,
+  replyTo: Int? = nil
+) -> (messageId: Int, isPhoto: Bool)? {
+  let isPhoto = mimeType.hasPrefix("image/") && !mimeType.contains("svg")
+
+  let msgId: Int?
+  if isPhoto {
+    msgId = telegramSendPhoto(
+      token: token, chatId: chatId,
+      fileData: fileData, filename: filename,
+      caption: caption, replyTo: replyTo)
+  } else {
+    msgId = telegramSendDocument(
+      token: token, chatId: chatId,
+      fileData: fileData, filename: filename, mimeType: mimeType,
+      caption: caption, replyTo: replyTo)
+  }
+
+  guard let msgId else { return nil }
+  return (messageId: msgId, isPhoto: isPhoto)
+}
+
 // MARK: - Random Hex
 
 /// Generates a random hex string of the given byte length (output is 2x bytes in chars).

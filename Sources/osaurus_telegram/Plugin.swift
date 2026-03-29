@@ -35,6 +35,9 @@ typealias osr_list_models_fn = @convention(c) () -> UnsafePointer<CChar>?
 // HTTP Client
 typealias osr_http_request_fn = @convention(c) (UnsafePointer<CChar>?) -> UnsafePointer<CChar>?
 
+// File I/O
+typealias osr_file_read_fn = @convention(c) (UnsafePointer<CChar>?) -> UnsafePointer<CChar>?
+
 struct osr_host_api {
   var version: UInt32 = 0
 
@@ -60,6 +63,9 @@ struct osr_host_api {
 
   // HTTP Client
   var http_request: osr_http_request_fn?
+
+  // File I/O
+  var file_read: osr_file_read_fn?
 }
 
 private typealias osr_free_string_t = @convention(c) (UnsafePointer<CChar>?) -> Void
@@ -126,6 +132,7 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
       ("config_get", hostAPI?.pointee.config_get != nil),
       ("log", hostAPI?.pointee.log != nil),
       ("dispatch_clarify", hostAPI?.pointee.dispatch_clarify != nil),
+      ("file_read", hostAPI?.pointee.file_read != nil),
     ]
     for (name, ok) in checks {
       if ok { available.append(name) } else { missing.append(name) }
@@ -204,8 +211,37 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
               },
               "requirements": [],
               "permission_policy": "auto"
+            },
+            {
+              "id": "telegram_send_file",
+              "description": "Upload a file (photo or document) to a Telegram chat. Reads files from Osaurus artifact paths.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "chat_id": {
+                    "type": "string",
+                    "description": "Telegram chat ID to send to"
+                  },
+                  "file_path": {
+                    "type": "string",
+                    "description": "Absolute path to the file (must be within ~/.osaurus/artifacts/)"
+                  },
+                  "caption": {
+                    "type": "string",
+                    "description": "Optional caption for the file"
+                  },
+                  "reply_to_message_id": {
+                    "type": "integer",
+                    "description": "Optional message ID to reply to"
+                  }
+                },
+                "required": ["chat_id", "file_path"]
+              },
+              "requirements": [],
+              "permission_policy": "auto"
             }
           ],
+          "artifact_handler": true,
           "routes": [
             {
               "id": "webhook",
@@ -252,6 +288,55 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
                     "type": "status",
                     "label": "Webhook",
                     "connected_when": "webhook_registered"
+                  }
+                ]
+              },
+              {
+                "title": "Agent Settings",
+                "fields": [
+                  {
+                    "key": "enable_preflight",
+                    "type": "toggle",
+                    "label": "Enable preflight capability search",
+                    "description": "Auto-discover relevant tools and context before inference",
+                    "default": false
+                  },
+                  {
+                    "key": "enable_tools",
+                    "type": "toggle",
+                    "label": "Enable tool calling",
+                    "description": "Allow the agent to use tools during chat mode. Disabling restricts to text-only responses.",
+                    "default": true
+                  },
+                  {
+                    "key": "enable_sandbox",
+                    "type": "toggle",
+                    "label": "Enable sandbox access",
+                    "description": "Allow the agent to execute code and read/write files in the sandboxed environment",
+                    "default": true
+                  },
+                  {
+                    "key": "max_iterations",
+                    "type": "number",
+                    "label": "Max iterations",
+                    "description": "Maximum agentic loop iterations for chat mode inference",
+                    "default": 10,
+                    "validation": {
+                      "min": 1,
+                      "max": 30
+                    }
+                  }
+                ]
+              },
+              {
+                "title": "File Upload",
+                "fields": [
+                  {
+                    "key": "auto_upload_artifacts",
+                    "type": "toggle",
+                    "label": "Auto-upload artifacts to chat",
+                    "description": "Automatically upload files produced by agent tasks to the originating Telegram chat",
+                    "default": true
                   }
                 ]
               },
@@ -308,6 +393,12 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
 
     logDebug("invoke: type=\(type) id=\(id) payload=\(payload.count) chars")
 
+    if type == "artifact" && id == "share" {
+      let result = handleArtifactShare(ctx: ctx, payload: payload)
+      logDebug("invoke: artifact share returned \(result.count) chars")
+      return makeCString(result)
+    }
+
     guard type == "tool" else {
       logWarn("invoke: unknown capability type '\(type)'")
       return makeCString("{\"error\":\"Unknown capability type\"}")
@@ -319,6 +410,8 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
       result = ctx.telegramSendTool.run(args: payload)
     case ctx.chatHistoryTool.name:
       result = ctx.chatHistoryTool.run(args: payload)
+    case ctx.sendFileTool.name:
+      result = ctx.sendFileTool.run(args: payload)
     default:
       logWarn("invoke: unknown tool '\(id)'")
       return makeCString("{\"error\":\"Unknown tool: \(id)\"}")

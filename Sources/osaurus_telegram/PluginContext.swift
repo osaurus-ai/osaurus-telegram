@@ -18,9 +18,11 @@ final class PluginContext: @unchecked Sendable {
 
   var taskOutputTexts: [String: String] = [:]
   var taskStreamStates: [String: TaskStreamState] = [:]
+  var lastActiveChatId: String?
 
   let telegramSendTool = TelegramSendTool()
   let chatHistoryTool = TelegramGetChatHistoryTool()
+  let sendFileTool = TelegramSendFileTool()
 }
 
 // MARK: - Lifecycle

@@ -82,6 +82,72 @@ struct TelegramGetChatHistoryTool {
   }
 }
 
+// MARK: - telegram_send_file Tool
+
+struct TelegramSendFileTool {
+  let name = "telegram_send_file"
+
+  struct Args: Decodable {
+    let chat_id: String
+    let file_path: String
+    let caption: String?
+    let reply_to_message_id: Int?
+  }
+
+  func run(args: String) -> String {
+    logDebug("telegram_send_file: args=\(String(args.prefix(200)))")
+    guard let input = parseJSON(args, as: Args.self) else {
+      logWarn("telegram_send_file: failed to parse args")
+      return "{\"error\":\"Invalid arguments\"}"
+    }
+
+    guard let token = configGet("bot_token"), !token.isEmpty else {
+      logWarn("telegram_send_file: no bot token configured")
+      return "{\"error\":\"Bot token not configured\"}"
+    }
+
+    let file: HostFileResult
+    switch readHostFile(path: input.file_path) {
+    case .success(let f):
+      file = f
+    case .failure(let error):
+      logError("telegram_send_file: \(error)")
+      return "{\"error\":\"Failed to read file\"}"
+    }
+
+    let filename = (input.file_path as NSString).lastPathComponent
+    logDebug(
+      "telegram_send_file: read \(file.data.count) bytes, mime=\(file.mimeType), filename=\(filename)"
+    )
+
+    guard
+      let result = uploadFileToTelegram(
+        token: token, chatId: input.chat_id,
+        fileData: file.data, filename: filename, mimeType: file.mimeType,
+        caption: input.caption, replyTo: input.reply_to_message_id)
+    else {
+      logError("telegram_send_file: failed to upload to chat \(input.chat_id)")
+      return "{\"error\":\"Failed to upload file\"}"
+    }
+
+    DatabaseManager.insertMessage(
+      chatId: input.chat_id,
+      messageId: result.messageId,
+      direction: "out",
+      senderId: nil,
+      senderName: "Agent",
+      text: input.caption,
+      mediaType: result.isPhoto ? "photo" : "document",
+      mediaFileId: nil,
+      taskId: nil
+    )
+
+    logDebug(
+      "telegram_send_file: uploaded message_id=\(result.messageId) to chat \(input.chat_id)")
+    return "{\"message_id\":\(result.messageId)}"
+  }
+}
+
 // MARK: - AnyCodable Helper
 
 /// A type-erased Codable wrapper for handling arbitrary JSON (e.g. reply_markup).

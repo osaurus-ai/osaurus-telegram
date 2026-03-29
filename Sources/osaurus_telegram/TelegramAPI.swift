@@ -238,6 +238,145 @@ func telegramSendMessageDraft(
   return ok
 }
 
+// MARK: - File Upload (Multipart)
+
+private func buildMultipartBody(
+  boundary: String,
+  fields: [(name: String, value: String)],
+  fileField: String,
+  fileData: Data,
+  filename: String,
+  mimeType: String
+) -> Data {
+  var body = Data()
+  let crlf = "\r\n"
+
+  for field in fields {
+    body.append("--\(boundary)\(crlf)".data(using: .utf8)!)
+    body.append(
+      "Content-Disposition: form-data; name=\"\(field.name)\"\(crlf)\(crlf)".data(using: .utf8)!)
+    body.append("\(field.value)\(crlf)".data(using: .utf8)!)
+  }
+
+  body.append("--\(boundary)\(crlf)".data(using: .utf8)!)
+  body.append(
+    "Content-Disposition: form-data; name=\"\(fileField)\"; filename=\"\(filename)\"\(crlf)"
+      .data(using: .utf8)!)
+  body.append("Content-Type: \(mimeType)\(crlf)\(crlf)".data(using: .utf8)!)
+  body.append(fileData)
+  body.append("\(crlf)--\(boundary)--\(crlf)".data(using: .utf8)!)
+
+  return body
+}
+
+/// Sends a multipart/form-data file upload to the Telegram Bot API.
+/// Used by both sendDocument and sendPhoto.
+private func telegramMultipartUpload(
+  token: String,
+  method: String,
+  fileField: String,
+  chatId: String,
+  fileData: Data,
+  filename: String,
+  mimeType: String,
+  caption: String?,
+  replyTo: Int?
+) -> Int? {
+  guard let httpRequest = hostAPI?.pointee.http_request else {
+    logError("http_request not available for \(method)")
+    return nil
+  }
+
+  let boundary = "OsaurusTelegram\(randomHexString(bytes: 16))"
+  var fields: [(name: String, value: String)] = [("chat_id", chatId)]
+  if let caption { fields.append(("caption", caption)) }
+  if let replyTo { fields.append(("reply_to_message_id", "\(replyTo)")) }
+
+  let body = buildMultipartBody(
+    boundary: boundary, fields: fields,
+    fileField: fileField, fileData: fileData,
+    filename: filename, mimeType: mimeType)
+
+  let request: [String: Any] = [
+    "method": "POST",
+    "url": "https://api.telegram.org/bot\(token)/\(method)",
+    "headers": ["Content-Type": "multipart/form-data; boundary=\(boundary)"],
+    "body": body.base64EncodedString(),
+    "body_encoding": "base64",
+    "timeout_ms": 60000,
+  ]
+
+  guard let requestJSON = makeJSONString(request) else {
+    logError("Failed to serialize \(method) request")
+    return nil
+  }
+
+  let responseStr: String? = requestJSON.withCString { ptr in
+    guard let responsePtr = httpRequest(ptr) else { return nil }
+    return String(cString: responsePtr)
+  }
+  guard let responseStr else {
+    logError("No response from \(method)")
+    return nil
+  }
+
+  guard let responseData = responseStr.data(using: .utf8),
+    let httpResponse = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
+    let httpBody = httpResponse["body"] as? String,
+    let bodyData = httpBody.data(using: .utf8),
+    let tgResponse = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any],
+    let ok = tgResponse["ok"] as? Bool, ok,
+    let result = tgResponse["result"] as? [String: Any],
+    let messageId = result["message_id"] as? Int
+  else {
+    logError("\(method) failed: \(String(responseStr.prefix(300)))")
+    return nil
+  }
+
+  logDebug("\(method): sent message_id=\(messageId)")
+  return messageId
+}
+
+func telegramSendDocument(
+  token: String,
+  chatId: String,
+  fileData: Data,
+  filename: String,
+  mimeType: String,
+  caption: String? = nil,
+  replyTo: Int? = nil
+) -> Int? {
+  telegramMultipartUpload(
+    token: token, method: "sendDocument", fileField: "document",
+    chatId: chatId, fileData: fileData, filename: filename,
+    mimeType: mimeType, caption: caption, replyTo: replyTo)
+}
+
+func telegramSendPhoto(
+  token: String,
+  chatId: String,
+  fileData: Data,
+  filename: String,
+  caption: String? = nil,
+  replyTo: Int? = nil
+) -> Int? {
+  let ext = (filename as NSString).pathExtension.lowercased()
+  let mimeType: String
+  switch ext {
+  case "png": mimeType = "image/png"
+  case "gif": mimeType = "image/gif"
+  case "webp": mimeType = "image/webp"
+  default: mimeType = "image/jpeg"
+  }
+
+  return telegramMultipartUpload(
+    token: token, method: "sendPhoto", fileField: "photo",
+    chatId: chatId, fileData: fileData, filename: filename,
+    mimeType: mimeType, caption: caption, replyTo: replyTo)
+}
+
+// MARK: - Long Message Sending
+
 /// Sends a long response, splitting into multiple messages as needed.
 func telegramSendLongMessage(
   token: String,

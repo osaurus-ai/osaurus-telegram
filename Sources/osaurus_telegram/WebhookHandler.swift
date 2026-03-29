@@ -106,6 +106,8 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
     "handleMessage: chatId=\(chatId) type=\(chat.type) sender=\(senderName ?? "unknown") msgId=\(message.message_id)"
   )
 
+  ctx.lastActiveChatId = chatId
+
   let chatTitle = chat.title ?? chat.first_name ?? chat.username
   DatabaseManager.upsertChat(
     chatId: chatId,
@@ -464,16 +466,33 @@ private func handleChatModeStreaming(
 
   DispatchQueue.global(qos: .userInitiated).async {
     let historyJSON = DatabaseManager.getMessages(chatId: chatId, limit: 20)
-    let messages = buildCompletionMessages(historyJSON: historyJSON, currentPrompt: prompt)
+    var messages = buildCompletionMessages(historyJSON: historyJSON, currentPrompt: prompt)
     logDebug("handleChatModeStreaming: built \(messages.count) completion messages from history")
+
+    let enableTools = configGet("enable_tools") != "false"
+    let enableSandbox = configGet("enable_sandbox") != "false"
+    let enablePreflight = configGet("enable_preflight") == "true"
+    let maxIter = Int(configGet("max_iterations") ?? "") ?? 10
+
+    if enableTools && !enableSandbox {
+      messages.insert(
+        [
+          "role": "system",
+          "content":
+            "IMPORTANT: Do not use sandbox tools (sandbox_exec, sandbox_read_file, sandbox_write_file, sandbox_list_directory, sandbox_search_files, sandbox_install). Only use non-sandbox tools.",
+        ], at: 1)
+    }
 
     var request: [String: Any] = [
       "model": "",
       "messages": messages,
       "max_tokens": 4096,
-      "tools": true,
-      "max_iterations": 10,
     ]
+    if enableTools {
+      request["tools"] = true
+      request["max_iterations"] = maxIter
+    }
+    if enablePreflight { request["preflight"] = true }
     if let agentAddress { request["agent_address"] = agentAddress }
     guard let requestJSON = makeJSONString(request) else {
       logError("handleChatModeStreaming: failed to serialize completion request")
@@ -655,6 +674,74 @@ private func buildPrompt(from message: TelegramMessage) -> String {
   }
 
   return parts.joined(separator: "\n")
+}
+
+// MARK: - Artifact Handler
+
+func handleArtifactShare(ctx: PluginContext, payload: String) -> String {
+  guard configGet("auto_upload_artifacts") != "false" else {
+    logDebug("handleArtifactShare: auto_upload_artifacts disabled, skipping")
+    return "{\"skipped\":true}"
+  }
+
+  guard let artifact = parseJSON(payload, as: ArtifactPayload.self) else {
+    logWarn("handleArtifactShare: failed to parse artifact payload")
+    return "{\"error\":\"Invalid artifact payload\"}"
+  }
+
+  if artifact.is_directory == true {
+    logDebug("handleArtifactShare: skipping directory artifact \(artifact.filename)")
+    return "{\"skipped\":true}"
+  }
+
+  guard let chatId = ctx.lastActiveChatId else {
+    logWarn("handleArtifactShare: no active chat to upload to")
+    return "{\"error\":\"No active chat\"}"
+  }
+
+  guard let token = ctx.botToken, !token.isEmpty else {
+    logWarn("handleArtifactShare: no bot token configured")
+    return "{\"error\":\"Bot token not configured\"}"
+  }
+
+  let file: HostFileResult
+  switch readHostFile(path: artifact.host_path) {
+  case .success(let f):
+    file = f
+  case .failure(let error):
+    logError("handleArtifactShare: \(error)")
+    return "{\"error\":\"Failed to read artifact file\"}"
+  }
+
+  let mimeType = artifact.mime_type ?? file.mimeType
+  logDebug(
+    "handleArtifactShare: uploading \(artifact.filename) (\(file.data.count) bytes, \(mimeType)) to chat \(chatId)"
+  )
+
+  guard
+    let result = uploadFileToTelegram(
+      token: token, chatId: chatId,
+      fileData: file.data, filename: artifact.filename, mimeType: mimeType)
+  else {
+    logError("handleArtifactShare: failed to upload \(artifact.filename) to chat \(chatId)")
+    return "{\"error\":\"Failed to upload artifact\"}"
+  }
+
+  DatabaseManager.insertMessage(
+    chatId: chatId,
+    messageId: result.messageId,
+    direction: "out",
+    senderId: nil,
+    senderName: "Agent",
+    text: artifact.filename,
+    mediaType: result.isPhoto ? "photo" : "document",
+    mediaFileId: nil,
+    taskId: nil
+  )
+
+  logInfo(
+    "Artifact \(artifact.filename) uploaded to chat \(chatId) as message \(result.messageId)")
+  return "{\"uploaded\":true,\"message_id\":\(result.messageId)}"
 }
 
 // MARK: - Response Builder
