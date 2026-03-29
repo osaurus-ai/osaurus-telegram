@@ -99,6 +99,46 @@ enum DatabaseManager {
     dbExec(sql, params: params)
   }
 
+  static func getChats(username: String? = nil, chatType: String? = nil) -> [[String: Any]] {
+    var conditions: [String] = []
+    var values: [Any] = []
+    var paramIdx = 1
+
+    if let username {
+      let cleaned = username.replacingOccurrences(of: "@", with: "").lowercased()
+      conditions.append("LOWER(username) = ?\(paramIdx)")
+      values.append(cleaned)
+      paramIdx += 1
+    }
+    if let chatType {
+      conditions.append("chat_type = ?\(paramIdx)")
+      values.append(chatType)
+      paramIdx += 1
+    }
+
+    var sql = "SELECT chat_id, chat_type, title, username, last_active FROM chats"
+    if !conditions.isEmpty {
+      sql += " WHERE " + conditions.joined(separator: " AND ")
+    }
+    sql += " ORDER BY last_active DESC LIMIT 50"
+
+    guard let resultStr = dbQuery(sql, params: serializeParams(values)),
+      let rows = extractRows(resultStr)
+    else {
+      return []
+    }
+
+    return rows.map { row in
+      var chat: [String: Any] = [:]
+      if row.count > 0 { chat["chat_id"] = row[0] }
+      if row.count > 1, let t = row[1] as? String { chat["chat_type"] = t }
+      if row.count > 2, let title = row[2] as? String, !title.isEmpty { chat["title"] = title }
+      if row.count > 3, let u = row[3] as? String, !u.isEmpty { chat["username"] = u }
+      if row.count > 4 { chat["last_active"] = row[4] }
+      return chat
+    }
+  }
+
   // MARK: - Users
 
   static func upsertUser(userId: String, username: String?, firstName: String?, lastName: String?) {
@@ -119,6 +159,29 @@ enum DatabaseManager {
         last_active = unixepoch()
       """
     dbExec(sql, params: params)
+  }
+
+  static func getUserByUsername(_ username: String) -> [String: Any]? {
+    let cleaned = username.replacingOccurrences(of: "@", with: "").lowercased()
+    let sql = """
+      SELECT user_id, username, first_name, last_name
+      FROM users
+      WHERE LOWER(username) = ?1
+      LIMIT 1
+      """
+    guard let resultStr = dbQuery(sql, params: serializeParams([cleaned])),
+      let rows = extractRows(resultStr),
+      let row = rows.first
+    else {
+      return nil
+    }
+
+    var user: [String: Any] = [:]
+    if row.count > 0 { user["user_id"] = row[0] }
+    if row.count > 1, let u = row[1] as? String { user["username"] = u }
+    if row.count > 2, let fn = row[2] as? String { user["first_name"] = fn }
+    if row.count > 3, let ln = row[3] as? String { user["last_name"] = ln }
+    return user
   }
 
   // MARK: - Messages

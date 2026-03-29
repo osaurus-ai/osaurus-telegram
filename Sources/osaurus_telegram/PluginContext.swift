@@ -31,8 +31,9 @@ final class PluginContext: @unchecked Sendable {
 
   private var draftPingTimer: DispatchSourceTimer?
 
-  let telegramSendTool = TelegramSendTool()
+  let listChatsTool = TelegramListChatsTool()
   let chatHistoryTool = TelegramGetChatHistoryTool()
+  let telegramSendTool = TelegramSendTool()
   let sendFileTool = TelegramSendFileTool()
 
   func startDraftPing() {

@@ -1,5 +1,69 @@
 import Foundation
 
+// MARK: - telegram_list_chats Tool
+
+struct TelegramListChatsTool {
+  let name = "telegram_list_chats"
+
+  struct Args: Decodable {
+    let username: String?
+    let chat_type: String?
+  }
+
+  func run(args: String) -> String {
+    logDebug("telegram_list_chats: args=\(String(args.prefix(200)))")
+    let input = parseJSON(args, as: Args.self)
+
+    let chats = DatabaseManager.getChats(
+      username: input?.username, chatType: input?.chat_type)
+    logDebug("telegram_list_chats: found \(chats.count) chats")
+
+    var result: [String: Any] = ["chats": chats]
+
+    if chats.isEmpty, let username = input?.username, !username.isEmpty {
+      if let user = DatabaseManager.getUserByUsername(username) {
+        var resolved = user
+        resolved["note"] =
+          "No active chat found. You can try using this user_id as chat_id -- it will work if the user has previously started a conversation with the bot."
+        result["resolved_user"] = resolved
+        logDebug("telegram_list_chats: resolved user fallback for @\(username)")
+      }
+    }
+
+    guard let data = try? JSONSerialization.data(withJSONObject: result),
+      let json = String(data: data, encoding: .utf8)
+    else {
+      return "{\"chats\":[]}"
+    }
+    return json
+  }
+}
+
+// MARK: - telegram_get_chat_history Tool
+
+struct TelegramGetChatHistoryTool {
+  let name = "telegram_get_chat_history"
+
+  struct Args: Decodable {
+    let chat_id: String
+    let limit: Int?
+  }
+
+  func run(args: String) -> String {
+    logDebug("telegram_get_chat_history: args=\(String(args.prefix(200)))")
+    guard let input = parseJSON(args, as: Args.self) else {
+      logWarn("telegram_get_chat_history: failed to parse args")
+      return "{\"error\":\"Invalid arguments\"}"
+    }
+
+    let limit = input.limit ?? 50
+    logDebug("telegram_get_chat_history: chat_id=\(input.chat_id) limit=\(limit)")
+    let result = DatabaseManager.getMessages(chatId: input.chat_id, limit: limit)
+    logDebug("telegram_get_chat_history: returned \(result.count) chars")
+    return result
+  }
+}
+
 // MARK: - telegram_send Tool
 
 struct TelegramSendTool {
@@ -54,31 +118,6 @@ struct TelegramSendTool {
 
     logDebug("telegram_send: sent message_id=\(msgId) to chat \(input.chat_id)")
     return "{\"message_id\":\(msgId)}"
-  }
-}
-
-// MARK: - telegram_get_chat_history Tool
-
-struct TelegramGetChatHistoryTool {
-  let name = "telegram_get_chat_history"
-
-  struct Args: Decodable {
-    let chat_id: String
-    let limit: Int?
-  }
-
-  func run(args: String) -> String {
-    logDebug("telegram_get_chat_history: args=\(String(args.prefix(200)))")
-    guard let input = parseJSON(args, as: Args.self) else {
-      logWarn("telegram_get_chat_history: failed to parse args")
-      return "{\"error\":\"Invalid arguments\"}"
-    }
-
-    let limit = input.limit ?? 50
-    logDebug("telegram_get_chat_history: chat_id=\(input.chat_id) limit=\(limit)")
-    let result = DatabaseManager.getMessages(chatId: input.chat_id, limit: limit)
-    logDebug("telegram_get_chat_history: returned \(result.count) chars")
-    return result
   }
 }
 

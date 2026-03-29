@@ -183,6 +183,46 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
         "capabilities": {
           "tools": [
             {
+              "id": "telegram_list_chats",
+              "description": "List known Telegram chats the bot has interacted with. Can filter by username or chat type. Use this to discover chat IDs before sending messages.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "username": {
+                    "type": "string",
+                    "description": "Filter by Telegram username (with or without @)"
+                  },
+                  "chat_type": {
+                    "type": "string",
+                    "description": "Filter by chat type: private, group, supergroup, or channel"
+                  }
+                },
+                "required": []
+              },
+              "requirements": [],
+              "permission_policy": "auto"
+            },
+            {
+              "id": "telegram_get_chat_history",
+              "description": "Retrieve recent messages from the plugin's local message log for a given Telegram chat.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "chat_id": {
+                    "type": "string",
+                    "description": "Telegram chat ID"
+                  },
+                  "limit": {
+                    "type": "integer",
+                    "description": "Max messages to return (default 50, max 200)"
+                  }
+                },
+                "required": ["chat_id"]
+              },
+              "requirements": [],
+              "permission_policy": "auto"
+            },
+            {
               "id": "telegram_send",
               "description": "Send a message to a Telegram chat. Supports text and reply_markup for inline keyboards.",
               "parameters": {
@@ -206,26 +246,6 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
                   }
                 },
                 "required": ["chat_id", "text"]
-              },
-              "requirements": [],
-              "permission_policy": "auto"
-            },
-            {
-              "id": "telegram_get_chat_history",
-              "description": "Retrieve recent messages from the plugin's local message log for a given Telegram chat.",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "chat_id": {
-                    "type": "string",
-                    "description": "Telegram chat ID"
-                  },
-                  "limit": {
-                    "type": "integer",
-                    "description": "Max messages to return (default 50, max 200)"
-                  }
-                },
-                "required": ["chat_id"]
               },
               "requirements": [],
               "permission_policy": "auto"
@@ -418,10 +438,12 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
 
     let result: String
     switch id {
-    case ctx.telegramSendTool.name:
-      result = ctx.telegramSendTool.run(args: payload)
+    case ctx.listChatsTool.name:
+      result = ctx.listChatsTool.run(args: payload)
     case ctx.chatHistoryTool.name:
       result = ctx.chatHistoryTool.run(args: payload)
+    case ctx.telegramSendTool.name:
+      result = ctx.telegramSendTool.run(args: payload)
     case ctx.sendFileTool.name:
       result = ctx.sendFileTool.run(args: payload)
     default:
