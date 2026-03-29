@@ -392,16 +392,14 @@ func telegramSendLongMessage(
     )
   }
 
-  // Split into chunks and send sequentially
   let chunks = splitMessage(text)
   var lastMsgId: Int? = nil
   for (i, chunk) in chunks.enumerated() {
-    // Only apply parseMode and replyTo to the first chunk
     lastMsgId = telegramSendMessage(
       token: token,
       chatId: chatId,
       text: chunk,
-      parseMode: i == 0 ? parseMode : nil,
+      parseMode: parseMode,
       replyTo: i == 0 ? replyTo : nil
     )
   }

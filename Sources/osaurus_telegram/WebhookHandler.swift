@@ -426,13 +426,7 @@ func extractToolCallInfo(_ chunk: String) -> (name: String?, isToolResult: Bool)
 
 /// Builds an OpenAI-compatible messages array from chat history + the current prompt.
 func buildCompletionMessages(historyJSON: String, currentPrompt: String) -> [[String: Any]] {
-  var messages: [[String: Any]] = [
-    [
-      "role": "system",
-      "content":
-        "You are a helpful assistant communicating via Telegram. Keep responses concise and well-formatted.",
-    ]
-  ]
+  var messages: [[String: Any]] = []
 
   if let data = historyJSON.data(using: .utf8),
     let history = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
@@ -480,7 +474,7 @@ private func handleChatModeStreaming(
           "role": "system",
           "content":
             "IMPORTANT: Do not use sandbox tools (sandbox_exec, sandbox_read_file, sandbox_write_file, sandbox_list_directory, sandbox_search_files, sandbox_install). Only use non-sandbox tools.",
-        ], at: 1)
+        ], at: 0)
     }
 
     var request: [String: Any] = [
@@ -540,8 +534,10 @@ private func handleChatModeStreaming(
       finalText = state.accumulated
     }
 
+    let htmlText = markdownToTelegramHTML(finalText)
     let msgId = telegramSendLongMessage(
-      token: token, chatId: chatId, text: finalText, replyTo: messageId)
+      token: token, chatId: chatId, text: htmlText,
+      parseMode: "HTML", replyTo: messageId)
     logDebug("handleChatModeStreaming: sent final message, msgId=\(msgId.map { "\($0)" } ?? "nil")")
 
     if let msgId {

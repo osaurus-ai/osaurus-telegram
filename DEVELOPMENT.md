@@ -62,7 +62,7 @@ git push origin v0.1.0
 Sources/osaurus_telegram/
 ├── Plugin.swift          # C ABI entry points and manifest
 ├── Models.swift          # Telegram API types and internal data models
-├── Utilities.swift       # MarkdownV2 escaping, message splitting, JSON helpers
+├── Utilities.swift       # Markdown→HTML conversion, message splitting, JSON helpers
 ├── Database.swift        # SQLite schema and CRUD operations
 ├── TelegramAPI.swift     # Outbound Telegram Bot API calls (including sendMessageDraft)
 ├── PluginContext.swift   # Plugin state and lifecycle management

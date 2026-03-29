@@ -162,13 +162,12 @@ struct ExtractToolCallInfoTests {
 @Suite("Completion Messages Builder")
 struct BuildCompletionMessagesTests {
 
-  @Test("Includes system prompt and current message")
+  @Test("Includes current message without hardcoded system prompt")
   func basicMessages() {
     let messages = buildCompletionMessages(historyJSON: "[]", currentPrompt: "Hello")
-    #expect(messages.count == 2)
-    #expect(messages[0]["role"] as? String == "system")
-    #expect(messages[1]["role"] as? String == "user")
-    #expect(messages[1]["content"] as? String == "Hello")
+    #expect(messages.count == 1)
+    #expect(messages[0]["role"] as? String == "user")
+    #expect(messages[0]["content"] as? String == "Hello")
   }
 
   @Test("Incorporates chat history in chronological order")
@@ -180,15 +179,14 @@ struct BuildCompletionMessagesTests {
       ]
       """
     let messages = buildCompletionMessages(historyJSON: history, currentPrompt: "Follow up")
-    // system + 2 history (reversed) + current = 4
-    #expect(messages.count == 4)
-    #expect(messages[0]["role"] as? String == "system")
+    // 2 history (reversed) + current = 3
+    #expect(messages.count == 3)
     // History is DESC in DB, reversed to chronological: out first, then in
-    #expect(messages[1]["role"] as? String == "assistant")
-    #expect(messages[1]["content"] as? String == "Response")
-    #expect(messages[2]["role"] as? String == "user")
-    #expect(messages[2]["content"] as? String == "First message")
-    #expect(messages[3]["content"] as? String == "Follow up")
+    #expect(messages[0]["role"] as? String == "assistant")
+    #expect(messages[0]["content"] as? String == "Response")
+    #expect(messages[1]["role"] as? String == "user")
+    #expect(messages[1]["content"] as? String == "First message")
+    #expect(messages[2]["content"] as? String == "Follow up")
   }
 
   @Test("Skips empty text entries in history")
@@ -200,14 +198,14 @@ struct BuildCompletionMessagesTests {
       ]
       """
     let messages = buildCompletionMessages(historyJSON: history, currentPrompt: "Hi")
-    // system + 1 non-empty history + current = 3
-    #expect(messages.count == 3)
+    // 1 non-empty history + current = 2
+    #expect(messages.count == 2)
   }
 
   @Test("Handles invalid history JSON gracefully")
   func invalidHistory() {
     let messages = buildCompletionMessages(historyJSON: "not json", currentPrompt: "Hi")
-    #expect(messages.count == 2)
+    #expect(messages.count == 1)
   }
 }
 

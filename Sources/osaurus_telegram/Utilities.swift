@@ -1,46 +1,159 @@
 import Foundation
 
-// MARK: - MarkdownV2 Escaping
+// MARK: - Markdown → Telegram HTML
 
-/// Escapes special characters for Telegram MarkdownV2 format.
-/// Characters inside ``` code blocks are left untouched.
-func escapeMarkdownV2(_ text: String) -> String {
-  let specialChars: Set<Character> = [
-    "_", "*", "[", "]", "(", ")", "~", "`", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!",
-  ]
+func escapeHTML(_ text: String) -> String {
+  text.replacingOccurrences(of: "&", with: "&amp;")
+    .replacingOccurrences(of: "<", with: "&lt;")
+    .replacingOccurrences(of: ">", with: "&gt;")
+}
 
-  var result = ""
-  var i = text.startIndex
-
-  while i < text.endIndex {
-    // Check for ``` code block — pass through verbatim
-    if text[i] == "`" && text[i...].hasPrefix("```") {
-      if let closeRange = text[text.index(i, offsetBy: 3)...].range(of: "```") {
-        let blockEnd = closeRange.upperBound
-        result.append(contentsOf: text[i..<blockEnd])
-        i = blockEnd
-        continue
-      }
+private func stripHeadingPrefix(_ line: String) -> String? {
+  for prefix in ["#### ", "### ", "## ", "# "] {
+    if line.hasPrefix(prefix) {
+      return String(line.dropFirst(prefix.count))
     }
+  }
+  return nil
+}
 
-    // Check for inline ` code span — pass through verbatim
-    if text[i] == "`" {
-      if let closeIdx = text[text.index(after: i)...].firstIndex(of: "`") {
-        let blockEnd = text.index(after: closeIdx)
-        result.append(contentsOf: text[i..<blockEnd])
-        i = blockEnd
-        continue
-      }
-    }
+func formatInlineMarkdown(_ text: String) -> String {
+  var codeSpans: [String] = []
+  var processed = text
 
-    if specialChars.contains(text[i]) {
-      result.append("\\")
-    }
-    result.append(text[i])
-    i = text.index(after: i)
+  while let startIdx = processed.firstIndex(of: "`") {
+    let afterStart = processed.index(after: startIdx)
+    guard afterStart < processed.endIndex,
+      let endIdx = processed[afterStart...].firstIndex(of: "`")
+    else { break }
+
+    let codeContent = String(processed[afterStart..<endIdx])
+    let placeholder = "\u{FFFD}\(codeSpans.count)\u{FFFD}"
+    codeSpans.append("<code>\(codeContent)</code>")
+    processed =
+      String(processed[..<startIdx]) + placeholder
+      + String(processed[processed.index(after: endIdx)...])
   }
 
-  return result
+  processed = processed.replacingOccurrences(
+    of: "\\[([^\\]]+)\\]\\(([^)]+)\\)", with: "<a href=\"$2\">$1</a>",
+    options: .regularExpression)
+
+  processed = processed.replacingOccurrences(
+    of: "\\*\\*(.+?)\\*\\*", with: "<b>$1</b>",
+    options: .regularExpression)
+
+  processed = processed.replacingOccurrences(
+    of: "__(.+?)__", with: "<b>$1</b>",
+    options: .regularExpression)
+
+  processed = processed.replacingOccurrences(
+    of: "~~(.+?)~~", with: "<s>$1</s>",
+    options: .regularExpression)
+
+  processed = processed.replacingOccurrences(
+    of: "(?<!\\w)\\*(.+?)\\*(?!\\w)", with: "<i>$1</i>",
+    options: .regularExpression)
+
+  processed = processed.replacingOccurrences(
+    of: "(?<!\\w)_(.+?)_(?!\\w)", with: "<i>$1</i>",
+    options: .regularExpression)
+
+  for (idx, span) in codeSpans.enumerated() {
+    processed = processed.replacingOccurrences(of: "\u{FFFD}\(idx)\u{FFFD}", with: span)
+  }
+
+  return processed
+}
+
+func markdownToTelegramHTML(_ text: String) -> String {
+  let lines = text.components(separatedBy: "\n")
+  var result: [String] = []
+  var i = 0
+
+  while i < lines.count {
+    let line = lines[i]
+    let trimmed = line.trimmingCharacters(in: .whitespaces)
+
+    if trimmed.hasPrefix("```") {
+      let lang = String(trimmed.dropFirst(3)).trimmingCharacters(in: .whitespaces)
+      var codeLines: [String] = []
+      i += 1
+      while i < lines.count
+        && !lines[i].trimmingCharacters(in: .whitespaces).hasPrefix("```")
+      {
+        codeLines.append(lines[i])
+        i += 1
+      }
+      if i < lines.count { i += 1 }
+      let code = escapeHTML(codeLines.joined(separator: "\n"))
+      if !lang.isEmpty {
+        result.append(
+          "<pre><code class=\"language-\(escapeHTML(lang))\">\(code)</code></pre>")
+      } else {
+        result.append("<pre>\(code)</pre>")
+      }
+      continue
+    }
+
+    if let heading = stripHeadingPrefix(trimmed) {
+      let formatted = formatInlineMarkdown(escapeHTML(heading))
+      if !result.isEmpty && result.last != "" {
+        result.append("")
+      }
+      result.append("<b>\(formatted)</b>")
+      i += 1
+      continue
+    }
+
+    if trimmed.hasPrefix("> ") || trimmed == ">" {
+      var quoteLines: [String] = []
+      while i < lines.count {
+        let ql = lines[i].trimmingCharacters(in: .whitespaces)
+        if ql.hasPrefix("> ") {
+          quoteLines.append(String(ql.dropFirst(2)))
+        } else if ql == ">" {
+          quoteLines.append("")
+        } else {
+          break
+        }
+        i += 1
+      }
+      let quoteText = formatInlineMarkdown(
+        escapeHTML(quoteLines.joined(separator: "\n")))
+      result.append("<blockquote>\(quoteText)</blockquote>")
+      continue
+    }
+
+    if (trimmed.hasPrefix("- ") || trimmed.hasPrefix("* "))
+      && trimmed != "---" && trimmed != "***"
+    {
+      let content = String(trimmed.dropFirst(2))
+      result.append("• \(formatInlineMarkdown(escapeHTML(content)))")
+      i += 1
+      continue
+    }
+
+    if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+      i += 1
+      continue
+    }
+
+    if trimmed.isEmpty {
+      result.append("")
+      i += 1
+      continue
+    }
+
+    result.append(formatInlineMarkdown(escapeHTML(line)))
+    i += 1
+  }
+
+  var output = result.joined(separator: "\n")
+  while output.contains("\n\n\n") {
+    output = output.replacingOccurrences(of: "\n\n\n", with: "\n\n")
+  }
+  return output.trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
 // MARK: - Message Splitting

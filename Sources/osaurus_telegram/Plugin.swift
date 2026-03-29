@@ -158,6 +158,7 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
         "name": "Telegram",
         "version": "0.1.0",
         "description": "Connect Telegram chats to your Osaurus agents",
+        "instructions": "You are responding via Telegram. Format your responses for Telegram: use **bold** for emphasis and section titles instead of markdown headings (# ## etc). Keep responses concise with short paragraphs. Use - for bullet lists. Use backticks for code. Avoid markdown tables, horizontal rules, image syntax, and raw HTML tags.",
         "license": "MIT",
         "authors": [],
         "min_macos": "15.0",
@@ -166,7 +167,7 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
           "tools": [
             {
               "id": "telegram_send",
-              "description": "Send a message to a Telegram chat. Supports text, markdown, and reply_markup for inline keyboards.",
+              "description": "Send a message to a Telegram chat. Supports text and reply_markup for inline keyboards.",
               "parameters": {
                 "type": "object",
                 "properties": {
@@ -176,7 +177,7 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
                   },
                   "text": {
                     "type": "string",
-                    "description": "Message text. Supports MarkdownV2 formatting."
+                    "description": "Message text to send"
                   },
                   "reply_to_message_id": {
                     "type": "integer",

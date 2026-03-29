@@ -3,68 +3,130 @@ import Testing
 
 @testable import osaurus_telegram
 
-// MARK: - escapeMarkdownV2
+// MARK: - escapeHTML
 
-@Suite("MarkdownV2 Escaping")
-struct EscapeMarkdownV2Tests {
+@Suite("HTML Escaping")
+struct EscapeHTMLTests {
 
-  @Test("Escapes all special characters")
+  @Test("Escapes ampersand, angle brackets")
   func escapesSpecialChars() {
-    let input =
-      "Hello_world *bold* [link](url) ~strike~ `code` >quote #tag +plus -minus =eq |pipe {brace} .dot !bang"
-    let escaped = escapeMarkdownV2(input)
-    #expect(escaped.contains("\\_"))
-    #expect(escaped.contains("\\*"))
-    #expect(escaped.contains("\\["))
-    #expect(escaped.contains("\\]"))
-    #expect(escaped.contains("\\("))
-    #expect(escaped.contains("\\)"))
-    #expect(escaped.contains("\\~"))
-    #expect(escaped.contains("\\>"))
-    #expect(escaped.contains("\\#"))
-    #expect(escaped.contains("\\+"))
-    #expect(escaped.contains("\\-"))
-    #expect(escaped.contains("\\="))
-    #expect(escaped.contains("\\|"))
-    #expect(escaped.contains("\\{"))
-    #expect(escaped.contains("\\}"))
-    #expect(escaped.contains("\\."))
-    #expect(escaped.contains("\\!"))
+    #expect(escapeHTML("a & b") == "a &amp; b")
+    #expect(escapeHTML("<tag>") == "&lt;tag&gt;")
+    #expect(escapeHTML("1 < 2 & 3 > 1") == "1 &lt; 2 &amp; 3 &gt; 1")
   }
 
-  @Test("Preserves text without special characters")
-  func noSpecialChars() {
-    let input = "Hello world 123"
-    #expect(escapeMarkdownV2(input) == "Hello world 123")
-  }
-
-  @Test("Preserves inline code spans")
-  func preservesInlineCode() {
-    let input = "Use `foo_bar` here"
-    let escaped = escapeMarkdownV2(input)
-    #expect(escaped.contains("`foo_bar`"))
-    #expect(!escaped.contains("`foo\\_bar`"))
-  }
-
-  @Test("Preserves fenced code blocks")
-  func preservesCodeBlocks() {
-    let input = "Before ```let x = 1 + 2``` after"
-    let escaped = escapeMarkdownV2(input)
-    // The code block content is passed through verbatim (no escaping of +)
-    #expect(escaped.contains("```let x = 1 + 2```"))
-    // Text outside the code block IS escaped
-    #expect(!escaped.contains("\\+"))  // no + outside the code block
+  @Test("Leaves plain text unchanged")
+  func plainText() {
+    #expect(escapeHTML("Hello world") == "Hello world")
   }
 
   @Test("Handles empty string")
   func emptyString() {
-    #expect(escapeMarkdownV2("") == "")
+    #expect(escapeHTML("") == "")
+  }
+}
+
+// MARK: - formatInlineMarkdown
+
+@Suite("Inline Markdown Formatting")
+struct FormatInlineMarkdownTests {
+
+  @Test("Converts bold syntax")
+  func bold() {
+    #expect(formatInlineMarkdown("**hello**") == "<b>hello</b>")
+    #expect(formatInlineMarkdown("__hello__") == "<b>hello</b>")
   }
 
-  @Test("Handles string of only special chars")
-  func onlySpecial() {
-    let escaped = escapeMarkdownV2("_*")
-    #expect(escaped == "\\_\\*")
+  @Test("Converts italic syntax")
+  func italic() {
+    #expect(formatInlineMarkdown("*hello*") == "<i>hello</i>")
+    #expect(formatInlineMarkdown("_hello_") == "<i>hello</i>")
+  }
+
+  @Test("Converts strikethrough syntax")
+  func strikethrough() {
+    #expect(formatInlineMarkdown("~~hello~~") == "<s>hello</s>")
+  }
+
+  @Test("Converts link syntax")
+  func links() {
+    #expect(
+      formatInlineMarkdown("[text](https://example.com)")
+        == "<a href=\"https://example.com\">text</a>")
+  }
+
+  @Test("Preserves inline code spans")
+  func inlineCode() {
+    let result = formatInlineMarkdown("Use `**not bold**` here")
+    #expect(result.contains("<code>**not bold**</code>"))
+    #expect(!result.contains("<b>"))
+  }
+}
+
+// MARK: - markdownToTelegramHTML
+
+@Suite("Markdown to Telegram HTML")
+struct MarkdownToTelegramHTMLTests {
+
+  @Test("Converts headings to bold")
+  func headings() {
+    #expect(markdownToTelegramHTML("# Title").contains("<b>Title</b>"))
+    #expect(markdownToTelegramHTML("## Subtitle").contains("<b>Subtitle</b>"))
+    #expect(markdownToTelegramHTML("### Section").contains("<b>Section</b>"))
+  }
+
+  @Test("Converts fenced code blocks")
+  func codeBlocks() {
+    let input = "```swift\nlet x = 1\n```"
+    let result = markdownToTelegramHTML(input)
+    #expect(result.contains("<pre><code class=\"language-swift\">"))
+    #expect(result.contains("let x = 1"))
+    #expect(result.contains("</code></pre>"))
+  }
+
+  @Test("Converts plain fenced code blocks")
+  func plainCodeBlocks() {
+    let input = "```\nfoo\n```"
+    let result = markdownToTelegramHTML(input)
+    #expect(result.contains("<pre>foo</pre>"))
+  }
+
+  @Test("Converts bullet lists")
+  func bulletLists() {
+    #expect(markdownToTelegramHTML("- item one").contains("• item one"))
+    #expect(markdownToTelegramHTML("* item two").contains("• item two"))
+  }
+
+  @Test("Converts blockquotes")
+  func blockquotes() {
+    let result = markdownToTelegramHTML("> quoted text")
+    #expect(result.contains("<blockquote>quoted text</blockquote>"))
+  }
+
+  @Test("Strips horizontal rules")
+  func horizontalRules() {
+    #expect(!markdownToTelegramHTML("---").contains("---"))
+    #expect(!markdownToTelegramHTML("***").contains("***"))
+  }
+
+  @Test("Escapes HTML in regular text")
+  func escapesHTML() {
+    let result = markdownToTelegramHTML("a < b & c > d")
+    #expect(result.contains("&lt;"))
+    #expect(result.contains("&amp;"))
+    #expect(result.contains("&gt;"))
+  }
+
+  @Test("Collapses multiple blank lines")
+  func collapsesBlankLines() {
+    let input = "line1\n\n\n\nline2"
+    let result = markdownToTelegramHTML(input)
+    #expect(!result.contains("\n\n\n"))
+  }
+
+  @Test("Handles empty string")
+  func emptyString() {
+    #expect(markdownToTelegramHTML("") == "")
   }
 }
 

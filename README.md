@@ -116,7 +116,7 @@ The plugin exposes two tools that agents can call during task execution:
 
 | Tool | Description |
 |------|-------------|
-| `telegram_send` | Send a message to a Telegram chat. Supports MarkdownV2 formatting, reply threading, and inline keyboard markup. |
+| `telegram_send` | Send a message to a Telegram chat. Supports reply threading and inline keyboard markup. |
 | `telegram_get_chat_history` | Retrieve recent messages from the local message log for a given chat. Returns up to 200 messages with sender info, timestamps, and media metadata. |
 
 ## Routes

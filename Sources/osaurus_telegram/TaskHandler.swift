@@ -253,13 +253,16 @@ private func handleCompleted(
     _ = telegramDeleteMessage(token: token, chatId: chatId, messageId: statusMsgId)
   }
 
+  let htmlText = markdownToTelegramHTML(messageText)
+
   if let streamState {
     let ok = telegramEditMessage(
       token: token, chatId: chatId, messageId: streamState.messageId,
-      text: String(messageText.prefix(4096)))
+      text: String(htmlText.prefix(4096)), parseMode: "HTML")
     logDebug("handleCompleted: final edit msg \(streamState.messageId) ok=\(ok)")
   } else {
-    let msgId = telegramSendLongMessage(token: token, chatId: chatId, text: messageText)
+    let msgId = telegramSendLongMessage(
+      token: token, chatId: chatId, text: htmlText, parseMode: "HTML")
     logDebug("handleCompleted: sent new message, msgId=\(msgId.map { "\($0)" } ?? "nil")")
 
     if let msgId {
