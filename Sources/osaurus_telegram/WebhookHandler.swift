@@ -101,12 +101,11 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
   let chatId = "\(chat.id)"
   let isPrivateChat = chat.type == "private"
   let senderName = formatSenderName(from: message.from)
+  let senderId = message.from.map { "\($0.id)" }
 
   logDebug(
     "handleMessage: chatId=\(chatId) type=\(chat.type) sender=\(senderName ?? "unknown") msgId=\(message.message_id)"
   )
-
-  ctx.lastActiveChatId = chatId
 
   let chatTitle = chat.title ?? chat.first_name ?? chat.username
   DatabaseManager.upsertChat(
@@ -116,6 +115,15 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
     username: chat.username
   )
 
+  if let from = message.from {
+    DatabaseManager.upsertUser(
+      userId: "\(from.id)",
+      username: from.username,
+      firstName: from.first_name,
+      lastName: from.last_name
+    )
+  }
+
   let mediaType = detectMediaType(message: message)
   let mediaFileId = detectMediaFileId(message: message)
 
@@ -123,7 +131,7 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
     chatId: chatId,
     messageId: message.message_id,
     direction: "in",
-    senderId: message.from.map { "\($0.id)" },
+    senderId: senderId,
     senderName: senderName,
     text: message.text ?? message.caption,
     mediaType: mediaType,
@@ -156,52 +164,69 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
     logDebug("handleMessage: user @\(username) is in allowed_users")
   }
 
-  if let text = message.text, text.hasPrefix("/start") {
+  if let text = message.text, text.hasPrefix("/") {
     guard let token = ctx.botToken else {
-      logWarn("handleMessage: /start received but no bot token")
+      logWarn("handleMessage: command received but no bot token")
       return
     }
-    logDebug("handleMessage: /start command received")
-    let welcome =
-      "Hello! I'm connected to your Osaurus agent. Send me a message and I'll get to work."
-    _ = telegramSendMessage(
-      token: token, chatId: chatId, text: welcome, replyTo: message.message_id)
-    return
-  }
 
-  if let text = message.text, text.hasPrefix("/clear") {
-    guard let token = ctx.botToken else {
-      logWarn("handleMessage: /clear received but no bot token")
-      return
-    }
-    logDebug("handleMessage: /clear command received for chat \(chatId)")
-    DatabaseManager.clearChat(chatId: chatId)
-    _ = telegramSendMessage(
-      token: token, chatId: chatId,
-      text: "Conversation cleared. Send a new message to start fresh.",
-      replyTo: message.message_id)
-    return
-  }
-
-  if let text = message.text, text.hasPrefix("/work") {
-    let workPrompt = String(text.dropFirst(5)).trimmingCharacters(in: .whitespaces)
-    guard let token = ctx.botToken else {
-      logWarn("handleMessage: /work received but no bot token")
-      return
-    }
-    guard !workPrompt.isEmpty else {
+    if text.hasPrefix("/start") {
+      let welcome =
+        "Hello! I'm connected to your Osaurus agent. Send me a message and I'll get to work."
       _ = telegramSendMessage(
-        token: token, chatId: chatId,
-        text: "Usage: /work <prompt>\nExample: /work find me new restaurants in Irvine",
-        replyTo: message.message_id)
+        token: token, chatId: chatId, text: welcome, replyTo: message.message_id)
       return
     }
-    logDebug("handleMessage: /work command, prompt=\"\(String(workPrompt.prefix(100)))\"")
-    telegramSendChatAction(token: token, chatId: chatId)
-    dispatchWorkTask(
-      token: token, chatId: chatId, prompt: workPrompt, message: message,
-      isPrivateChat: isPrivateChat, agentAddress: agentAddress)
-    return
+
+    if text.hasPrefix("/clear") {
+      logDebug("handleMessage: /clear for chat \(chatId)")
+      if !isPrivateChat, let userId = senderId {
+        DatabaseManager.clearUserInChat(chatId: chatId, userId: userId)
+        _ = telegramSendMessage(
+          token: token, chatId: chatId,
+          text: "Your conversation history cleared. Send a new message to start fresh.",
+          replyTo: message.message_id)
+      } else {
+        DatabaseManager.clearChat(chatId: chatId)
+        _ = telegramSendMessage(
+          token: token, chatId: chatId,
+          text: "Conversation cleared. Send a new message to start fresh.",
+          replyTo: message.message_id)
+      }
+      return
+    }
+
+    if text.hasPrefix("/status") {
+      handleStatusCommand(
+        token: token, chatId: chatId, message: message,
+        isPrivateChat: isPrivateChat, userId: senderId)
+      return
+    }
+
+    if text.hasPrefix("/cancel") {
+      handleCancelCommand(
+        token: token, chatId: chatId, message: message,
+        isPrivateChat: isPrivateChat, userId: senderId)
+      return
+    }
+
+    if text.hasPrefix("/work") {
+      let workPrompt = String(text.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+      guard !workPrompt.isEmpty else {
+        _ = telegramSendMessage(
+          token: token, chatId: chatId,
+          text: "Usage: /work <prompt>\nExample: /work find me new restaurants in Irvine",
+          replyTo: message.message_id)
+        return
+      }
+      logDebug("handleMessage: /work prompt=\"\(String(workPrompt.prefix(100)))\"")
+      telegramSendChatAction(token: token, chatId: chatId)
+      dispatchWorkTask(
+        token: token, chatId: chatId, prompt: workPrompt, message: message,
+        isPrivateChat: isPrivateChat, senderName: senderName,
+        userId: senderId, agentAddress: agentAddress)
+      return
+    }
   }
 
   let prompt = buildPrompt(from: message)
@@ -216,7 +241,21 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
 
   logDebug("handleMessage: prompt=\"\(String(prompt.prefix(100)))\" (\(prompt.count) chars)")
 
-  if let pendingTask = DatabaseManager.getAwaitingClarification(chatId: chatId) {
+  if let replyTo = message.reply_to_message,
+    let task = DatabaseManager.getTaskByMessageId(chatId: chatId, messageId: replyTo.message_id)
+  {
+    logDebug(
+      "handleMessage: reply to task thread \(task.taskId) status=\(task.status)")
+    handleWorkThreadReply(
+      token: token, chatId: chatId, prompt: prompt, message: message,
+      task: task, isPrivateChat: isPrivateChat, senderName: senderName,
+      userId: senderId, agentAddress: agentAddress)
+    return
+  }
+
+  if let pendingTask = DatabaseManager.getAwaitingClarification(
+    chatId: chatId, userId: isPrivateChat ? nil : senderId)
+  {
     logDebug("handleMessage: found pending clarification for task \(pendingTask.taskId)")
     if let clarify = hostAPI?.pointee.dispatch_clarify {
       pendingTask.taskId.withCString { tid in
@@ -230,7 +269,8 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
     }
     DatabaseManager.updateTask(taskId: pendingTask.taskId, status: "running")
     _ = telegramSendMessage(
-      token: token, chatId: chatId, text: "Got it, continuing")
+      token: token, chatId: chatId, text: "Got it, continuing",
+      replyTo: message.message_id)
     return
   }
 
@@ -256,14 +296,15 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
   logDebug("handleMessage: -> work mode dispatch path (group chat)")
   dispatchWorkTask(
     token: token, chatId: chatId, prompt: prompt, message: message,
-    isPrivateChat: isPrivateChat, agentAddress: agentAddress)
+    isPrivateChat: isPrivateChat, senderName: senderName,
+    userId: senderId, agentAddress: agentAddress)
 }
 
 // MARK: - Work Mode Dispatch
 
 private func dispatchWorkTask(
   token: String, chatId: String, prompt: String, message: TelegramMessage,
-  isPrivateChat: Bool, agentAddress: String?
+  isPrivateChat: Bool, senderName: String?, userId: String?, agentAddress: String?
 ) {
   let titleText = message.text ?? message.caption ?? "Media message"
   let firstLine = String(titleText.prefix(60))
@@ -274,8 +315,13 @@ private func dispatchWorkTask(
     return
   }
 
+  var enrichedPrompt = prompt
+  if !isPrivateChat, let name = senderName {
+    enrichedPrompt = "[\(name)] asked: \(prompt)"
+  }
+
   var dispatchPayload: [String: Any] = [
-    "prompt": prompt,
+    "prompt": enrichedPrompt,
     "mode": "work",
     "title": "Telegram: \(firstLine)",
   ]
@@ -285,7 +331,7 @@ private func dispatchWorkTask(
     return
   }
 
-  logDebug("handleMessage: dispatching work task payload=\(String(dispatchJSON.prefix(300)))")
+  logDebug("dispatchWorkTask: payload=\(String(dispatchJSON.prefix(300)))")
 
   let dispatchResultStr: String? = dispatchJSON.withCString { ptr in
     guard let resultPtr = dispatch(ptr) else { return nil }
@@ -297,31 +343,245 @@ private func dispatchWorkTask(
     return
   }
 
-  logDebug("handleMessage: dispatch result=\(String(resultStr.prefix(300)))")
+  logDebug("dispatchWorkTask: result=\(String(resultStr.prefix(300)))")
 
   guard let dispatchResult = parseJSON(resultStr, as: DispatchResponse.self),
     let taskId = dispatchResult.id
   else {
     logError("Failed to parse dispatch response: \(resultStr)")
+    _ = telegramSendMessage(
+      token: token, chatId: chatId, text: "Failed to start task.",
+      replyTo: message.message_id)
     return
   }
 
-  DatabaseManager.insertTask(taskId: taskId, chatId: chatId, messageId: message.message_id)
-  logDebug("handleMessage: inserted task \(taskId) for chat \(chatId)")
+  DatabaseManager.insertTask(
+    taskId: taskId, chatId: chatId, messageId: message.message_id, userId: userId)
+  logDebug("dispatchWorkTask: inserted task \(taskId) for chat \(chatId) user \(userId ?? "nil")")
 
   let sendTypingEnabled = configGet("send_typing") != "false"
   if sendTypingEnabled && !isPrivateChat {
     if let statusMsgId = telegramSendMessage(
-      token: token, chatId: chatId, text: "\u{23F3} Working on it...")
+      token: token, chatId: chatId, text: "\u{23F3} Working on it...",
+      replyTo: message.message_id)
     {
       DatabaseManager.updateTask(taskId: taskId, statusMsgId: statusMsgId)
-      logDebug("handleMessage: created status message \(statusMsgId) for task \(taskId)")
+      logDebug("dispatchWorkTask: created status message \(statusMsgId) for task \(taskId)")
     } else {
-      logWarn("handleMessage: failed to send status message for task \(taskId)")
+      logWarn("dispatchWorkTask: failed to send status message for task \(taskId)")
     }
   }
 
   logInfo("Dispatched task \(taskId) for chat \(chatId)")
+}
+
+// MARK: - Work Thread Reply
+
+private func handleWorkThreadReply(
+  token: String, chatId: String, prompt: String, message: TelegramMessage,
+  task: TaskRow, isPrivateChat: Bool, senderName: String?, userId: String?,
+  agentAddress: String?
+) {
+  switch task.status {
+  case "awaiting_clarification":
+    clarifyTask(taskId: task.taskId, response: prompt)
+    DatabaseManager.updateTask(taskId: task.taskId, status: "running")
+    _ = telegramSendMessage(
+      token: token, chatId: chatId, text: "Got it, continuing",
+      replyTo: message.message_id)
+
+  case "running":
+    interruptRunningTask(taskId: task.taskId, prompt: prompt)
+    DatabaseManager.updateTask(taskId: task.taskId, status: "running")
+    _ = telegramSendMessage(
+      token: token, chatId: chatId, text: "Got it, redirecting",
+      replyTo: message.message_id)
+
+  default:
+    resumeEndedTask(
+      token: token, chatId: chatId, prompt: prompt, message: message,
+      task: task, isPrivateChat: isPrivateChat, senderName: senderName,
+      userId: userId, agentAddress: agentAddress)
+  }
+}
+
+private func clarifyTask(taskId: String, response: String) {
+  logDebug("clarifyTask: \(taskId)")
+  guard let clarify = hostAPI?.pointee.dispatch_clarify else {
+    logWarn("clarifyTask: dispatch_clarify not available")
+    return
+  }
+  taskId.withCString { tid in
+    response.withCString { r in clarify(tid, r) }
+  }
+}
+
+private func interruptRunningTask(taskId: String, prompt: String) {
+  logDebug("interruptRunningTask: \(taskId)")
+  if let interrupt = hostAPI?.pointee.dispatch_interrupt {
+    taskId.withCString { tid in
+      prompt.withCString { p in interrupt(tid, p) }
+    }
+  } else {
+    logDebug("interruptRunningTask: fallback to clarify")
+    clarifyTask(taskId: taskId, response: prompt)
+  }
+}
+
+private func resumeEndedTask(
+  token: String, chatId: String, prompt: String, message: TelegramMessage,
+  task: TaskRow, isPrivateChat: Bool, senderName: String?, userId: String?,
+  agentAddress: String?
+) {
+  logDebug("resumeEndedTask: adding issue to \(task.status) task \(task.taskId)")
+
+  guard let addIssue = hostAPI?.pointee.dispatch_add_issue else {
+    logWarn("resumeEndedTask: dispatch_add_issue not available, falling back")
+    fallbackToNewDispatch(
+      token: token, chatId: chatId, prompt: prompt, message: message,
+      task: task, isPrivateChat: isPrivateChat, senderName: senderName,
+      userId: userId, agentAddress: agentAddress)
+    return
+  }
+
+  let issuePayload: [String: Any] = [
+    "title": String(prompt.prefix(60)),
+    "description": prompt,
+  ]
+  guard let issueJSON = makeJSONString(issuePayload) else {
+    logError("resumeEndedTask: failed to build issue JSON")
+    return
+  }
+
+  let resultStr: String? = task.taskId.withCString { tid in
+    issueJSON.withCString { payload in
+      guard let resultPtr = addIssue(tid, payload) else { return nil }
+      return String(cString: resultPtr)
+    }
+  }
+
+  guard let resultStr else {
+    logWarn("resumeEndedTask: dispatch_add_issue returned nil, falling back")
+    fallbackToNewDispatch(
+      token: token, chatId: chatId, prompt: prompt, message: message,
+      task: task, isPrivateChat: isPrivateChat, senderName: senderName,
+      userId: userId, agentAddress: agentAddress)
+    return
+  }
+
+  logDebug("resumeEndedTask: result=\(String(resultStr.prefix(200)))")
+  _ = telegramSendMessage(
+    token: token, chatId: chatId, text: "\u{23F3} Resuming task...",
+    replyTo: message.message_id)
+  DatabaseManager.updateTask(taskId: task.taskId, status: "running")
+}
+
+private func fallbackToNewDispatch(
+  token: String, chatId: String, prompt: String, message: TelegramMessage,
+  task: TaskRow, isPrivateChat: Bool, senderName: String?, userId: String?,
+  agentAddress: String?
+) {
+  var enrichedPrompt = prompt
+  if let summary = task.summary, !summary.isEmpty {
+    enrichedPrompt = "Follow-up on previous task: \(summary)\n\nUser asked: \(prompt)"
+  }
+  telegramSendChatAction(token: token, chatId: chatId)
+  dispatchWorkTask(
+    token: token, chatId: chatId, prompt: enrichedPrompt, message: message,
+    isPrivateChat: isPrivateChat, senderName: senderName,
+    userId: userId, agentAddress: agentAddress)
+}
+
+// MARK: - Status Command
+
+private func handleStatusCommand(
+  token: String, chatId: String, message: TelegramMessage,
+  isPrivateChat: Bool, userId: String?
+) {
+  let tasks = DatabaseManager.getRecentTasks(chatId: chatId, limit: 5)
+
+  if tasks.isEmpty {
+    _ = telegramSendMessage(
+      token: token, chatId: chatId, text: "No recent tasks.",
+      replyTo: message.message_id)
+    return
+  }
+
+  var lines: [String] = []
+  for task in tasks {
+    let icon: String
+    switch task.status {
+    case "running": icon = "\u{23F3}"
+    case "completed": icon = "\u{2705}"
+    case "failed": icon = "\u{274C}"
+    case "cancelled": icon = "\u{1F6AB}"
+    case "awaiting_clarification": icon = "\u{2753}"
+    default: icon = "\u{2022}"
+    }
+
+    let shortId = String(task.taskId.prefix(8))
+    let summaryText = task.summary.map { " \u{2014} \(String($0.prefix(80)))" } ?? ""
+    lines.append("\(icon) \(shortId) [\(task.status)]\(summaryText)")
+  }
+
+  let responseText = lines.joined(separator: "\n")
+  _ = telegramSendMessage(
+    token: token, chatId: chatId, text: responseText,
+    replyTo: message.message_id)
+}
+
+// MARK: - Cancel Command
+
+private func handleCancelCommand(
+  token: String, chatId: String, message: TelegramMessage,
+  isPrivateChat: Bool, userId: String?
+) {
+  let arg = String((message.text ?? "").dropFirst(7)).trimmingCharacters(in: .whitespaces)
+
+  let taskToCancel: TaskRow?
+  if !arg.isEmpty {
+    taskToCancel = DatabaseManager.getTask(taskId: arg)
+    if taskToCancel == nil {
+      _ = telegramSendMessage(
+        token: token, chatId: chatId,
+        text: "Task \(arg) not found.",
+        replyTo: message.message_id)
+      return
+    }
+  } else {
+    taskToCancel = DatabaseManager.getRunningTask(
+      chatId: chatId, userId: isPrivateChat ? nil : userId)
+  }
+
+  guard let task = taskToCancel else {
+    _ = telegramSendMessage(
+      token: token, chatId: chatId, text: "No running task to cancel.",
+      replyTo: message.message_id)
+    return
+  }
+
+  guard task.status == "running" || task.status == "awaiting_clarification" else {
+    _ = telegramSendMessage(
+      token: token, chatId: chatId,
+      text: "Task is already \(task.status).",
+      replyTo: message.message_id)
+    return
+  }
+
+  if let cancel = hostAPI?.pointee.dispatch_cancel {
+    task.taskId.withCString { tid in
+      cancel(tid)
+    }
+    logDebug("handleCancelCommand: cancelled task \(task.taskId)")
+  } else {
+    logWarn("handleCancelCommand: dispatch_cancel not available")
+  }
+
+  let shortId = String(task.taskId.prefix(8))
+  _ = telegramSendMessage(
+    token: token, chatId: chatId,
+    text: "\u{1F6AB} Cancelling task \(shortId)...",
+    replyTo: message.message_id)
 }
 
 // MARK: - Chat Mode Streaming
@@ -454,7 +714,11 @@ func friendlyToolName(_ name: String) -> String {
 }
 
 /// Builds an OpenAI-compatible messages array from chat history + the current prompt.
-func buildCompletionMessages(historyJSON: String, currentPrompt: String) -> [[String: Any]] {
+/// When `isGroupChat` is true, user messages are prefixed with the sender's name
+/// so the model can distinguish between participants.
+func buildCompletionMessages(
+  historyJSON: String, currentPrompt: String, isGroupChat: Bool = false
+) -> [[String: Any]] {
   var messages: [[String: Any]] = []
 
   if let data = historyJSON.data(using: .utf8),
@@ -465,7 +729,12 @@ func buildCompletionMessages(historyJSON: String, currentPrompt: String) -> [[St
       let text = msg["text"] as? String ?? ""
       guard !text.isEmpty else { continue }
       let role = direction == "out" ? "assistant" : "user"
-      messages.append(["role": role, "content": text])
+
+      if isGroupChat && role == "user", let name = msg["sender_name"] as? String {
+        messages.append(["role": role, "content": "[\(name)]: \(text)"])
+      } else {
+        messages.append(["role": role, "content": text])
+      }
     }
   }
 
@@ -732,7 +1001,7 @@ func handleArtifactShare(ctx: PluginContext, payload: String) -> String {
     return "{\"skipped\":true}"
   }
 
-  guard let chatId = ctx.lastActiveChatId else {
+  guard let chatId = DatabaseManager.getLastActiveChatId() else {
     logWarn("handleArtifactShare: no active chat to upload to")
     return "{\"error\":\"No active chat\"}"
   }

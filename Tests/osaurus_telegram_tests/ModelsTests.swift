@@ -152,6 +152,44 @@ struct TelegramMessageTests {
     #expect(voice.duration == 15)
   }
 
+  @Test("Decodes a reply message")
+  func replyMessage() throws {
+    let json = """
+      {
+        "message_id": 20,
+        "from": { "id": 42, "is_bot": false, "first_name": "Alice" },
+        "chat": { "id": 42, "type": "private" },
+        "date": 1700000000,
+        "text": "Follow up on that",
+        "reply_to_message": {
+          "message_id": 15,
+          "chat": { "id": 42, "type": "private" },
+          "date": 1699999999,
+          "text": "Original message"
+        }
+      }
+      """
+    let msg = try #require(parseJSON(json, as: TelegramMessage.self))
+    #expect(msg.message_id == 20)
+    #expect(msg.text == "Follow up on that")
+    let reply = try #require(msg.reply_to_message)
+    #expect(reply.message_id == 15)
+  }
+
+  @Test("Decodes a message without reply_to_message")
+  func noReply() throws {
+    let json = """
+      {
+        "message_id": 21,
+        "chat": { "id": 42, "type": "private" },
+        "date": 1700000000,
+        "text": "Standalone message"
+      }
+      """
+    let msg = try #require(parseJSON(json, as: TelegramMessage.self))
+    #expect(msg.reply_to_message == nil)
+  }
+
   @Test("Decodes a group chat message")
   func groupChat() throws {
     let json = """
@@ -183,6 +221,20 @@ struct TaskEventPayloadTests {
     #expect(event.success == true)
     #expect(event.summary == "Done!")
     #expect(event.session_id == "sess-1")
+    #expect(event.output == nil)
+    #expect(event.title == nil)
+  }
+
+  @Test("Decodes TaskCompletedEvent with output and title")
+  func completedEventWithOutput() throws {
+    let json = """
+      {"success":true,"summary":"Built the website","session_id":"s1","output":"Here is the final result...","title":"Website Builder"}
+      """
+    let event = try #require(parseJSON(json, as: TaskCompletedEvent.self))
+    #expect(event.success == true)
+    #expect(event.summary == "Built the website")
+    #expect(event.output == "Here is the final result...")
+    #expect(event.title == "Website Builder")
   }
 
   @Test("Decodes TaskFailedEvent")
@@ -199,6 +251,16 @@ struct TaskEventPayloadTests {
     let event = try #require(parseJSON(json, as: TaskProgressEvent.self))
     #expect(event.progress == 0.75)
     #expect(event.current_step == "Analyzing files")
+    #expect(event.title == nil)
+  }
+
+  @Test("Decodes TaskProgressEvent with title")
+  func progressEventWithTitle() throws {
+    let json = "{\"progress\":0.5,\"current_step\":\"Building\",\"title\":\"Compiling project\"}"
+    let event = try #require(parseJSON(json, as: TaskProgressEvent.self))
+    #expect(event.progress == 0.5)
+    #expect(event.current_step == "Building")
+    #expect(event.title == "Compiling project")
   }
 
   @Test("Decodes TaskClarificationEvent")
@@ -217,6 +279,19 @@ struct TaskEventPayloadTests {
     #expect(event.kind == "tool_call")
     #expect(event.title == "Reading file")
     #expect(event.detail == "src/main.swift")
+    #expect(event.metadata == nil)
+  }
+
+  @Test("Decodes TaskActivityEvent with metadata")
+  func activityEventWithMetadata() throws {
+    let json = """
+      {"kind":"tool_call","title":"Running","metadata":{"tool":"sandbox_exec","duration":"2s"}}
+      """
+    let event = try #require(parseJSON(json, as: TaskActivityEvent.self))
+    #expect(event.kind == "tool_call")
+    #expect(event.title == "Running")
+    #expect(event.metadata?["tool"] == "sandbox_exec")
+    #expect(event.metadata?["duration"] == "2s")
   }
 
   @Test("Decodes TaskOutputEvent")
@@ -224,12 +299,57 @@ struct TaskEventPayloadTests {
     let json = "{\"text\":\"Here are the results:\\n\\n1. First item\"}"
     let event = try #require(parseJSON(json, as: TaskOutputEvent.self))
     #expect(event.text == "Here are the results:\n\n1. First item")
+    #expect(event.title == nil)
+  }
+
+  @Test("Decodes TaskOutputEvent with title")
+  func outputEventWithTitle() throws {
+    let json = "{\"text\":\"Result data\",\"title\":\"Search Results\"}"
+    let event = try #require(parseJSON(json, as: TaskOutputEvent.self))
+    #expect(event.text == "Result data")
+    #expect(event.title == "Search Results")
   }
 
   @Test("Decodes TaskOutputEvent with null text")
   func outputEventNullText() throws {
     let event = try #require(parseJSON("{}", as: TaskOutputEvent.self))
     #expect(event.text == nil)
+  }
+
+  @Test("Decodes TaskFailedEvent with title")
+  func failedEventWithTitle() throws {
+    let json = "{\"success\":false,\"summary\":\"Timeout\",\"title\":\"Build Task\"}"
+    let event = try #require(parseJSON(json, as: TaskFailedEvent.self))
+    #expect(event.success == false)
+    #expect(event.summary == "Timeout")
+    #expect(event.title == "Build Task")
+  }
+
+  @Test("Decodes TaskDraftEvent")
+  func draftEvent() throws {
+    let json =
+      "{\"text\":\"Here is a draft response...\",\"title\":\"Draft\",\"parse_mode\":\"HTML\"}"
+    let event = try #require(parseJSON(json, as: TaskDraftEvent.self))
+    #expect(event.text == "Here is a draft response...")
+    #expect(event.title == "Draft")
+    #expect(event.parse_mode == "HTML")
+  }
+
+  @Test("Decodes TaskDraftEvent with minimal fields")
+  func draftEventMinimal() throws {
+    let json = "{\"text\":\"Some draft text\"}"
+    let event = try #require(parseJSON(json, as: TaskDraftEvent.self))
+    #expect(event.text == "Some draft text")
+    #expect(event.title == nil)
+    #expect(event.parse_mode == nil)
+  }
+
+  @Test("Decodes empty TaskDraftEvent")
+  func draftEventEmpty() throws {
+    let event = try #require(parseJSON("{}", as: TaskDraftEvent.self))
+    #expect(event.text == nil)
+    #expect(event.title == nil)
+    #expect(event.parse_mode == nil)
   }
 
   @Test("Handles missing optional fields gracefully")

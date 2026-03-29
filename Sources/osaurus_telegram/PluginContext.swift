@@ -7,6 +7,15 @@ struct TaskStreamState {
   var lastEditTime: Date
 }
 
+struct TaskDraftState {
+  var chatId: String
+  var toolCallCount: Int = 0
+  var latestToolName: String?
+  var recentMessages: [String] = []
+  var outputOffset: Int = 0
+  var newSegment: Bool = true
+}
+
 // MARK: - Plugin Context
 
 final class PluginContext: @unchecked Sendable {
@@ -17,12 +26,38 @@ final class PluginContext: @unchecked Sendable {
   var tunnelURL: String?
 
   var taskOutputTexts: [String: String] = [:]
+  var taskDraftStates: [String: TaskDraftState] = [:]
   var taskStreamStates: [String: TaskStreamState] = [:]
-  var lastActiveChatId: String?
+
+  private var draftPingTimer: DispatchSourceTimer?
 
   let telegramSendTool = TelegramSendTool()
   let chatHistoryTool = TelegramGetChatHistoryTool()
   let sendFileTool = TelegramSendFileTool()
+
+  func startDraftPing() {
+    guard draftPingTimer == nil else { return }
+    let timer = DispatchSource.makeTimerSource(queue: .global())
+    timer.schedule(deadline: .now() + 5, repeating: 5)
+    timer.setEventHandler { [weak self] in
+      guard let ctx = self, let token = ctx.botToken else { return }
+      let drafts = ctx.taskDraftStates
+      if drafts.isEmpty {
+        ctx.stopDraftPing()
+        return
+      }
+      for (taskId, state) in drafts {
+        sendTaskDraft(ctx: ctx, token: token, chatId: state.chatId, taskId: taskId)
+      }
+    }
+    timer.resume()
+    draftPingTimer = timer
+  }
+
+  func stopDraftPing() {
+    draftPingTimer?.cancel()
+    draftPingTimer = nil
+  }
 }
 
 // MARK: - Lifecycle
@@ -36,7 +71,38 @@ func initPlugin(_ ctx: PluginContext) {
     logDebug("initPlugin: bot_token loaded from config (\(token.count) chars)")
   }
 
+  recoverActiveTasks(ctx: ctx)
+
   logInfo("initPlugin: ready, waiting for config delivery")
+}
+
+private func recoverActiveTasks(ctx: PluginContext) {
+  let dbTasks = DatabaseManager.getRunningTasks()
+  guard !dbTasks.isEmpty else { return }
+
+  guard let json = listActiveTasks(),
+    let data = json.data(using: .utf8),
+    let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+    let hostTasks = parsed["tasks"] as? [[String: Any]]
+  else {
+    logDebug("recoverActiveTasks: no active tasks from host")
+    return
+  }
+
+  let activeIds = Set(hostTasks.compactMap { $0["id"] as? String })
+
+  var recovered = 0
+  for task in dbTasks where activeIds.contains(task.taskId) {
+    if task.chatType == "private" {
+      ctx.taskDraftStates[task.taskId] = TaskDraftState(chatId: task.chatId)
+      recovered += 1
+    }
+  }
+
+  if recovered > 0 {
+    ctx.startDraftPing()
+    logInfo("recoverActiveTasks: recovered \(recovered) active task(s)")
+  }
 }
 
 func setupWebhook(ctx: PluginContext, token: String, tunnelURL: String) {
@@ -128,6 +194,7 @@ func onConfigChanged(ctx: PluginContext, key: String, value: String?) {
 }
 
 func destroyPlugin(_ ctx: PluginContext) {
+  ctx.stopDraftPing()
   if let token = ctx.botToken, !token.isEmpty {
     _ = telegramDeleteWebhook(token: token)
     logInfo("Webhook deleted on destroy")

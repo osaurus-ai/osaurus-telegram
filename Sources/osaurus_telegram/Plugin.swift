@@ -38,6 +38,15 @@ typealias osr_http_request_fn = @convention(c) (UnsafePointer<CChar>?) -> Unsafe
 // File I/O
 typealias osr_file_read_fn = @convention(c) (UnsafePointer<CChar>?) -> UnsafePointer<CChar>?
 
+// Extended Agent Dispatch (v2 trailing fields)
+typealias osr_list_active_tasks_fn = @convention(c) () -> UnsafePointer<CChar>?
+typealias osr_send_draft_fn =
+  @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Void
+typealias osr_dispatch_interrupt_fn =
+  @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Void
+typealias osr_dispatch_add_issue_fn =
+  @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> UnsafePointer<CChar>?
+
 struct osr_host_api {
   var version: UInt32 = 0
 
@@ -66,6 +75,12 @@ struct osr_host_api {
 
   // File I/O
   var file_read: osr_file_read_fn?
+
+  // Extended Agent Dispatch (v2 trailing fields)
+  var list_active_tasks: osr_list_active_tasks_fn?
+  var send_draft: osr_send_draft_fn?
+  var dispatch_interrupt: osr_dispatch_interrupt_fn?
+  var dispatch_add_issue: osr_dispatch_add_issue_fn?
 }
 
 private typealias osr_free_string_t = @convention(c) (UnsafePointer<CChar>?) -> Void
@@ -133,6 +148,8 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
       ("log", hostAPI?.pointee.log != nil),
       ("dispatch_clarify", hostAPI?.pointee.dispatch_clarify != nil),
       ("file_read", hostAPI?.pointee.file_read != nil),
+      ("dispatch_interrupt", hostAPI?.pointee.dispatch_interrupt != nil),
+      ("dispatch_add_issue", hostAPI?.pointee.dispatch_add_issue != nil),
     ]
     for (name, ok) in checks {
       if ok { available.append(name) } else { missing.append(name) }
@@ -356,12 +373,6 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
                     "type": "toggle",
                     "label": "Send typing indicator while agent works",
                     "default": true
-                  },
-                  {
-                    "key": "send_progress",
-                    "type": "toggle",
-                    "label": "Send progress updates as messages",
-                    "default": false
                   }
                 ]
               }

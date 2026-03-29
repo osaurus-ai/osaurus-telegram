@@ -355,3 +355,11 @@ func configSet(_ key: String, _ value: String) {
 func configDelete(_ key: String) {
   key.withCString { hostAPI?.pointee.config_delete?($0) }
 }
+
+func listActiveTasks() -> String? {
+  guard let fn = hostAPI?.pointee.list_active_tasks else { return nil }
+  guard let result = fn() else { return nil }
+  let str = String(cString: result)
+  free(UnsafeMutableRawPointer(mutating: result))
+  return str
+}

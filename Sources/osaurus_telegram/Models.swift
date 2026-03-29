@@ -19,6 +19,7 @@ struct TelegramMessage: Decodable {
   let photo: [TelegramPhotoSize]?
   let document: TelegramDocument?
   let voice: TelegramVoice?
+  let reply_to_message: TelegramReplyMessage?
 }
 
 struct TelegramChat: Decodable {
@@ -29,10 +30,15 @@ struct TelegramChat: Decodable {
   let first_name: String?
 }
 
+struct TelegramReplyMessage: Decodable {
+  let message_id: Int
+}
+
 struct TelegramUser: Decodable {
   let id: Int64
   let is_bot: Bool
   let first_name: String
+  let last_name: String?
   let username: String?
 }
 
@@ -93,11 +99,13 @@ struct TaskActivityEvent: Decodable {
   let title: String?
   let detail: String?
   let timestamp: String?
+  let metadata: [String: String]?
 }
 
 struct TaskProgressEvent: Decodable {
   let progress: Double?
   let current_step: String?
+  let title: String?
 }
 
 struct TaskClarificationEvent: Decodable {
@@ -109,15 +117,25 @@ struct TaskCompletedEvent: Decodable {
   let success: Bool?
   let summary: String?
   let session_id: String?
+  let output: String?
+  let title: String?
 }
 
 struct TaskFailedEvent: Decodable {
   let success: Bool?
   let summary: String?
+  let title: String?
 }
 
 struct TaskOutputEvent: Decodable {
   let text: String?
+  let title: String?
+}
+
+struct TaskDraftEvent: Decodable {
+  let text: String?
+  let title: String?
+  let parse_mode: String?
 }
 
 // MARK: - Artifact Payload
@@ -148,6 +166,7 @@ struct TaskRow {
   let summary: String?
   let chatType: String
   let clarificationOptions: String?
+  let userId: String?
 }
 
 // MARK: - Streaming Chunk (OpenAI-compatible, agentic)

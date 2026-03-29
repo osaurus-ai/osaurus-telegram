@@ -19,6 +19,16 @@ enum DatabaseManager {
       )
       """,
       """
+      CREATE TABLE IF NOT EXISTS users (
+        user_id       TEXT PRIMARY KEY,
+        username      TEXT,
+        first_name    TEXT,
+        last_name     TEXT,
+        created_at    INTEGER DEFAULT (unixepoch()),
+        last_active   INTEGER DEFAULT (unixepoch())
+      )
+      """,
+      """
       CREATE TABLE IF NOT EXISTS messages (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
         chat_id       TEXT NOT NULL,
@@ -44,6 +54,7 @@ enum DatabaseManager {
         status_msg_id INTEGER,
         summary       TEXT,
         clarification_options TEXT,
+        user_id       TEXT,
         created_at    INTEGER DEFAULT (unixepoch()),
         updated_at    INTEGER DEFAULT (unixepoch()),
         FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
@@ -55,11 +66,12 @@ enum DatabaseManager {
     ]
 
     for sql in statements {
-      self.dbExec(sql, params: "[]")
+      dbExec(sql, params: "[]")
     }
 
     let migrations = [
-      "ALTER TABLE tasks ADD COLUMN clarification_options TEXT"
+      "ALTER TABLE tasks ADD COLUMN clarification_options TEXT",
+      "ALTER TABLE tasks ADD COLUMN user_id TEXT",
     ]
     for sql in migrations {
       dbExecSilent(sql, params: "[]")
@@ -82,6 +94,28 @@ enum DatabaseManager {
       ON CONFLICT(chat_id) DO UPDATE SET
         title = ?3,
         username = ?4,
+        last_active = unixepoch()
+      """
+    dbExec(sql, params: params)
+  }
+
+  // MARK: - Users
+
+  static func upsertUser(userId: String, username: String?, firstName: String?, lastName: String?) {
+    let params = serializeParams([
+      userId,
+      username ?? NSNull(),
+      firstName ?? NSNull(),
+      lastName ?? NSNull(),
+    ])
+
+    let sql = """
+      INSERT INTO users (user_id, username, first_name, last_name)
+      VALUES (?1, ?2, ?3, ?4)
+      ON CONFLICT(user_id) DO UPDATE SET
+        username = ?2,
+        first_name = ?3,
+        last_name = ?4,
         last_active = unixepoch()
       """
     dbExec(sql, params: params)
@@ -122,11 +156,11 @@ enum DatabaseManager {
 
   // MARK: - Tasks
 
-  static func insertTask(taskId: String, chatId: String, messageId: Int?) {
-    let params = serializeParams([taskId, chatId, messageId as Any])
+  static func insertTask(taskId: String, chatId: String, messageId: Int?, userId: String? = nil) {
+    let params = serializeParams([taskId, chatId, messageId as Any, userId ?? NSNull()])
     let sql = """
-      INSERT INTO tasks (task_id, chat_id, message_id)
-      VALUES (?1, ?2, ?3)
+      INSERT INTO tasks (task_id, chat_id, message_id, user_id)
+      VALUES (?1, ?2, ?3, ?4)
       """
     dbExec(sql, params: params)
   }
@@ -174,26 +208,39 @@ enum DatabaseManager {
     dbExec(sql, params: serializeParams(values))
   }
 
-  static func getTask(taskId: String) -> TaskRow? {
-    let sql = """
-      SELECT t.task_id, t.chat_id, t.message_id, t.status, t.status_msg_id, t.summary, c.chat_type, t.clarification_options
-      FROM tasks t
-      LEFT JOIN chats c ON t.chat_id = c.chat_id
-      WHERE t.task_id = ?1
-      """
-    let params = serializeParams([taskId])
+  private static let taskSelectColumns = """
+    SELECT t.task_id, t.chat_id, t.message_id, t.status, t.status_msg_id, \
+    t.summary, c.chat_type, t.clarification_options, t.user_id
+    FROM tasks t
+    LEFT JOIN chats c ON t.chat_id = c.chat_id
+    """
 
-    guard let resultStr = dbQuery(sql, params: params) else { return nil }
+  static func getTask(taskId: String) -> TaskRow? {
+    let sql = "\(taskSelectColumns) WHERE t.task_id = ?1"
+    guard let resultStr = dbQuery(sql, params: serializeParams([taskId])) else { return nil }
     return parseTaskRow(resultStr)
+  }
+
+  static func getRunningTasks() -> [TaskRow] {
+    let sql =
+      "\(taskSelectColumns) WHERE t.status IN ('running', 'awaiting_clarification')"
+    guard let resultStr = dbQuery(sql, params: "[]"),
+      let rows = extractRows(resultStr)
+    else { return [] }
+    return rows.compactMap { taskRowFromArray($0) }
   }
 
   static func parseTaskRow(_ resultStr: String) -> TaskRow? {
     guard let rows = extractRows(resultStr),
-      let row = rows.first, row.count >= 7
+      let row = rows.first
     else {
       return nil
     }
+    return taskRowFromArray(row)
+  }
 
+  private static func taskRowFromArray(_ row: [Any]) -> TaskRow? {
+    guard row.count >= 7 else { return nil }
     return TaskRow(
       taskId: "\(row[0])",
       chatId: "\(row[1])",
@@ -202,41 +249,109 @@ enum DatabaseManager {
       statusMsgId: row[4] as? Int,
       summary: row[5] as? String,
       chatType: (row[6] as? String) ?? "private",
-      clarificationOptions: row.count > 7 ? row[7] as? String : nil
+      clarificationOptions: row.count > 7 ? row[7] as? String : nil,
+      userId: row.count > 8 ? row[8] as? String : nil
     )
   }
 
-  static func getAwaitingClarification(chatId: String) -> TaskRow? {
-    let sql = """
-      SELECT t.task_id, t.chat_id, t.message_id, t.status, t.status_msg_id, t.summary, c.chat_type, t.clarification_options
-      FROM tasks t
-      LEFT JOIN chats c ON t.chat_id = c.chat_id
-      WHERE t.chat_id = ?1 AND t.status = 'awaiting_clarification'
-      ORDER BY t.updated_at DESC
-      LIMIT 1
-      """
-    let params = serializeParams([chatId])
+  static func getTaskByMessageId(chatId: String, messageId: Int) -> TaskRow? {
+    let params = serializeParams([chatId, messageId])
 
-    guard let resultStr = dbQuery(sql, params: params) else { return nil }
+    let directSQL = """
+      \(taskSelectColumns)
+      WHERE t.chat_id = ?1 AND (t.message_id = ?2 OR t.status_msg_id = ?2)
+      ORDER BY t.updated_at DESC LIMIT 1
+      """
+    if let resultStr = dbQuery(directSQL, params: params),
+      let row = parseTaskRow(resultStr)
+    {
+      return row
+    }
+
+    let msgSQL = """
+      SELECT t.task_id, t.chat_id, t.message_id, t.status, t.status_msg_id, \
+      t.summary, c.chat_type, t.clarification_options, t.user_id
+      FROM messages m
+      JOIN tasks t ON m.task_id = t.task_id
+      LEFT JOIN chats c ON t.chat_id = c.chat_id
+      WHERE m.chat_id = ?1 AND m.message_id = ?2 AND m.task_id IS NOT NULL
+      ORDER BY t.updated_at DESC LIMIT 1
+      """
+    if let resultStr = dbQuery(msgSQL, params: params),
+      let row = parseTaskRow(resultStr)
+    {
+      return row
+    }
+
+    return nil
+  }
+
+  static func getAwaitingClarification(chatId: String, userId: String? = nil) -> TaskRow? {
+    var sql = "\(taskSelectColumns) WHERE t.chat_id = ?1 AND t.status = 'awaiting_clarification'"
+    var params: [Any] = [chatId]
+
+    if let userId {
+      sql += " AND t.user_id = ?2"
+      params.append(userId)
+    }
+
+    sql += " ORDER BY t.updated_at DESC LIMIT 1"
+    guard let resultStr = dbQuery(sql, params: serializeParams(params)) else { return nil }
     return parseTaskRow(resultStr)
   }
 
-  static func getChatType(chatId: String) -> String? {
-    let sql = "SELECT chat_type FROM chats WHERE chat_id = ?1"
-    let params = serializeParams([chatId])
-    guard let resultStr = dbQuery(sql, params: params) else { return nil }
-    guard let rows = extractRows(resultStr),
-      let row = rows.first, !row.isEmpty
+  static func getRecentTasks(chatId: String, limit: Int = 5) -> [TaskRow] {
+    let clampedLimit = min(max(limit, 1), 20)
+    let sql = "\(taskSelectColumns) WHERE t.chat_id = ?1 ORDER BY t.updated_at DESC LIMIT ?2"
+    let params = serializeParams([chatId, clampedLimit])
+    guard let resultStr = dbQuery(sql, params: params),
+      let rows = extractRows(resultStr)
     else {
-      return nil
+      return []
     }
-    return row[0] as? String
+    return rows.compactMap(taskRowFromArray)
+  }
+
+  static func getRunningTask(chatId: String, userId: String? = nil) -> TaskRow? {
+    var sql = "\(taskSelectColumns) WHERE t.chat_id = ?1 AND t.status = 'running'"
+    var params: [Any] = [chatId]
+
+    if let userId {
+      sql += " AND t.user_id = ?2"
+      params.append(userId)
+    }
+
+    sql += " ORDER BY t.updated_at DESC LIMIT 1"
+    guard let resultStr = dbQuery(sql, params: serializeParams(params)) else { return nil }
+    return parseTaskRow(resultStr)
   }
 
   static func clearChat(chatId: String) {
     let params = serializeParams([chatId])
     dbExec("DELETE FROM messages WHERE chat_id = ?1", params: params)
     dbExec("DELETE FROM tasks WHERE chat_id = ?1", params: params)
+  }
+
+  static func clearUserInChat(chatId: String, userId: String) {
+    let params = serializeParams([chatId, userId])
+    dbExec("DELETE FROM messages WHERE chat_id = ?1 AND sender_id = ?2", params: params)
+    dbExec("DELETE FROM tasks WHERE chat_id = ?1 AND user_id = ?2", params: params)
+  }
+
+  static func getLastActiveChatId() -> String? {
+    let sql = """
+      SELECT chat_id FROM tasks
+      WHERE status = 'running'
+      ORDER BY updated_at DESC
+      LIMIT 1
+      """
+    guard let resultStr = dbQuery(sql, params: "[]") else { return nil }
+    guard let rows = extractRows(resultStr),
+      let row = rows.first, !row.isEmpty
+    else {
+      return nil
+    }
+    return row[0] as? String
   }
 
   static func getMessages(chatId: String, limit: Int) -> String {

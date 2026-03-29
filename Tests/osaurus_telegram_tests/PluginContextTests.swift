@@ -85,7 +85,8 @@ struct TaskRowTests {
       statusMsgId: 99,
       summary: nil,
       chatType: "private",
-      clarificationOptions: nil
+      clarificationOptions: nil,
+      userId: "user-42"
     )
     #expect(row.taskId == "t1")
     #expect(row.chatId == "c1")
@@ -94,6 +95,7 @@ struct TaskRowTests {
     #expect(row.statusMsgId == 99)
     #expect(row.summary == nil)
     #expect(row.chatType == "private")
+    #expect(row.userId == "user-42")
   }
 
   @Test("TaskRow handles nil optional fields")
@@ -106,11 +108,13 @@ struct TaskRowTests {
       statusMsgId: nil,
       summary: "All done",
       chatType: "supergroup",
-      clarificationOptions: nil
+      clarificationOptions: nil,
+      userId: nil
     )
     #expect(row.messageId == nil)
     #expect(row.statusMsgId == nil)
     #expect(row.summary == "All done")
     #expect(row.chatType == "supergroup")
+    #expect(row.userId == nil)
   }
 }
