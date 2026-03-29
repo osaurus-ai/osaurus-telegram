@@ -14,6 +14,7 @@ final class PluginContext: @unchecked Sendable {
   var botId: String?
   var botUsername: String?
   var webhookSecret: String?
+  var tunnelURL: String?
 
   var taskOutputTexts: [String: String] = [:]
   var taskStreamStates: [String: TaskStreamState] = [:]
@@ -27,27 +28,16 @@ final class PluginContext: @unchecked Sendable {
 func initPlugin(_ ctx: PluginContext) {
   logDebug("initPlugin: starting")
   DatabaseManager.initSchema()
-  logDebug("initPlugin: schema initialized")
 
   if let token = configGet("bot_token"), !token.isEmpty {
     ctx.botToken = token
-    logDebug("initPlugin: bot_token found (\(token.count) chars)")
-
-    if let secret = configGet("webhook_secret"), !secret.isEmpty {
-      ctx.webhookSecret = secret
-      logDebug("initPlugin: restored cached webhook_secret")
-    } else {
-      logDebug("initPlugin: no cached webhook_secret")
-    }
-
-    setupWebhook(ctx: ctx, token: token)
-  } else {
-    logInfo("No bot_token configured — waiting for configuration")
+    logDebug("initPlugin: bot_token loaded from config (\(token.count) chars)")
   }
-  logDebug("initPlugin: complete")
+
+  logInfo("initPlugin: ready, waiting for config delivery")
 }
 
-func setupWebhook(ctx: PluginContext, token: String) {
+func setupWebhook(ctx: PluginContext, token: String, tunnelURL: String) {
   logDebug("setupWebhook: calling getMe to validate token")
   guard let botInfo = telegramGetMe(token: token) else {
     logError("Failed to validate bot token with getMe")
@@ -64,12 +54,7 @@ func setupWebhook(ctx: PluginContext, token: String) {
   logDebug("setupWebhook: generated new webhook secret")
 
   let pluginId = "osaurus.telegram"
-  guard let tunnelBase = configGet("tunnel_url") else {
-    logWarn("No tunnel_url in config, skipping webhook registration")
-    return
-  }
-
-  let webhookURL = "\(tunnelBase)/plugins/\(pluginId)/webhook"
+  let webhookURL = "\(tunnelURL)/plugins/\(pluginId)/webhook"
   logDebug("setupWebhook: registering webhook at \(webhookURL)")
 
   if telegramSetWebhook(token: token, url: webhookURL, secretToken: secret) {
@@ -86,30 +71,37 @@ func onConfigChanged(ctx: PluginContext, key: String, value: String?) {
   logDebug("onConfigChanged: key=\(key) hasValue=\(value != nil)")
 
   if key == "tunnel_url" {
-    guard let tunnelURL = value, !tunnelURL.isEmpty else {
-      logDebug("onConfigChanged: tunnel_url cleared, ignoring")
+    guard let newURL = value, !newURL.isEmpty else {
+      logDebug("onConfigChanged: tunnel_url cleared")
+      ctx.tunnelURL = nil
       return
     }
+    ctx.tunnelURL = newURL
     guard let token = ctx.botToken, !token.isEmpty else {
-      logDebug("onConfigChanged: tunnel_url set but no bot_token yet, ignoring")
+      logDebug("onConfigChanged: tunnel_url stored, waiting for bot_token")
       return
     }
-    logDebug("onConfigChanged: tunnel_url now available, registering webhook")
-    setupWebhook(ctx: ctx, token: token)
+    logDebug("onConfigChanged: tunnel_url + bot_token both available, registering webhook")
+    setupWebhook(ctx: ctx, token: token, tunnelURL: newURL)
     return
   }
 
   guard key == "bot_token" else {
-    logDebug("onConfigChanged: ignoring key '\(key)' (not bot_token or tunnel_url)")
+    logDebug("onConfigChanged: ignoring key '\(key)'")
+    return
+  }
+
+  let newToken = (value?.isEmpty == false) ? value : nil
+
+  if newToken == ctx.botToken {
+    logDebug("onConfigChanged: bot_token unchanged, skipping")
     return
   }
 
   if let oldToken = ctx.botToken, !oldToken.isEmpty {
-    logDebug("onConfigChanged: tearing down old webhook (had token)")
+    logDebug("onConfigChanged: tearing down old webhook")
     _ = telegramDeleteWebhook(token: oldToken)
     logInfo("Old webhook deleted")
-  } else {
-    logDebug("onConfigChanged: no old token to tear down")
   }
 
   ctx.botToken = nil
@@ -117,22 +109,20 @@ func onConfigChanged(ctx: PluginContext, key: String, value: String?) {
   ctx.botUsername = nil
   ctx.webhookSecret = nil
 
-  guard let newToken = value, !newToken.isEmpty else {
+  guard let newToken else {
     configSet("webhook_registered", "false")
-    configDelete("webhook_secret")
     logInfo("Bot token cleared")
     return
   }
 
-  logDebug("onConfigChanged: new token provided (\(newToken.count) chars), setting up webhook")
   ctx.botToken = newToken
-  setupWebhook(ctx: ctx, token: newToken)
-  if ctx.webhookSecret == nil,
-    let cached = configGet("webhook_secret"), !cached.isEmpty
-  {
-    ctx.webhookSecret = cached
-    logWarn("onConfigChanged: getMe failed, using cached webhook_secret as fallback")
+  logDebug("onConfigChanged: bot_token stored (\(newToken.count) chars)")
+
+  guard let tunnelURL = ctx.tunnelURL, !tunnelURL.isEmpty else {
+    logDebug("onConfigChanged: bot_token stored, waiting for tunnel_url")
+    return
   }
+  setupWebhook(ctx: ctx, token: newToken, tunnelURL: tunnelURL)
 }
 
 func destroyPlugin(_ ctx: PluginContext) {
