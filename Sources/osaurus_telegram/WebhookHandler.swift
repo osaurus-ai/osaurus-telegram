@@ -230,11 +230,13 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
     }
     DatabaseManager.updateTask(taskId: pendingTask.taskId, status: "running")
     _ = telegramSendMessage(
-      token: token, chatId: chatId, text: "\u{2705} Response sent, continuing...")
+      token: token, chatId: chatId, text: "Got it, continuing")
     return
   }
 
-  telegramSendChatAction(token: token, chatId: chatId)
+  if !isPrivateChat {
+    telegramSendChatAction(token: token, chatId: chatId)
+  }
 
   logDebug(
     "handleMessage: isPrivate=\(isPrivateChat) complete_stream=\(hostAPI?.pointee.complete_stream != nil)"
@@ -245,6 +247,7 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
     handleChatModeStreaming(
       token: token, chatId: chatId,
       prompt: prompt, messageId: message.message_id,
+      senderName: senderName,
       agentAddress: agentAddress
     )
     return
@@ -359,12 +362,12 @@ private let streamChunkCallback:
       } else if let name = toolInfo.name {
         state.currentToolName = name
         logDebug("streamChunkCallback: tool call \(name)")
-        let displayName = name.replacingOccurrences(of: "_", with: " ")
+        let displayName = friendlyToolName(name)
         _ = telegramSendMessageDraft(
           token: state.token,
           chatId: state.chatId,
           draftId: state.draftId,
-          text: "\u{1F6E0} Using \(displayName)..."
+          text: displayName
         )
       }
       return
@@ -424,6 +427,32 @@ func extractToolCallInfo(_ chunk: String) -> (name: String?, isToolResult: Bool)
   return nil
 }
 
+/// Maps raw tool names to natural-language status descriptions for draft messages.
+/// Users can override these via the `tool_status_messages` config key (JSON object).
+func friendlyToolName(_ name: String) -> String {
+  if let customJSON = configGet("tool_status_messages"),
+    let data = customJSON.data(using: .utf8),
+    let overrides = try? JSONSerialization.jsonObject(with: data) as? [String: String]
+  {
+    for (prefix, label) in overrides {
+      if name.hasPrefix(prefix) { return label }
+    }
+  }
+
+  if name.hasPrefix("sandbox_exec") { return "Running code" }
+  if name.hasPrefix("sandbox_install") { return "Installing packages" }
+  if name.hasPrefix("sandbox_read") { return "Reading files" }
+  if name.hasPrefix("sandbox_write") { return "Writing code" }
+  if name.hasPrefix("sandbox_list") { return "Browsing files" }
+  if name.hasPrefix("sandbox_search") { return "Searching files" }
+  if name.hasPrefix("sandbox") { return "Setting up environment" }
+  if name.hasPrefix("web_search") || name.hasPrefix("search") { return "Searching the web" }
+  if name.hasPrefix("web_browse") || name.hasPrefix("browse") { return "Reading a webpage" }
+  if name.hasPrefix("telegram_send") { return "Sending a message" }
+  if name.hasPrefix("telegram_get") { return "Checking chat history" }
+  return "Working on it"
+}
+
 /// Builds an OpenAI-compatible messages array from chat history + the current prompt.
 func buildCompletionMessages(historyJSON: String, currentPrompt: String) -> [[String: Any]] {
   var messages: [[String: Any]] = []
@@ -445,7 +474,8 @@ func buildCompletionMessages(historyJSON: String, currentPrompt: String) -> [[St
 }
 
 private func handleChatModeStreaming(
-  token: String, chatId: String, prompt: String, messageId: Int, agentAddress: String?
+  token: String, chatId: String, prompt: String, messageId: Int,
+  senderName: String?, agentAddress: String?
 ) {
   logDebug(
     "handleChatModeStreaming: chatId=\(chatId) prompt=\(prompt.count) chars msgId=\(messageId)")
@@ -454,7 +484,7 @@ private func handleChatModeStreaming(
 
   let draftOk = telegramSendMessageDraft(
     token: token, chatId: chatId,
-    draftId: chatDraftId, text: "Thinking..."
+    draftId: chatDraftId, text: "Thinking"
   )
   logDebug("handleChatModeStreaming: initial draft sent ok=\(draftOk)")
 
@@ -468,14 +498,26 @@ private func handleChatModeStreaming(
     let enablePreflight = configGet("enable_preflight") == "true"
     let maxIter = Int(configGet("max_iterations") ?? "") ?? 10
 
-    if enableTools && !enableSandbox {
-      messages.insert(
-        [
-          "role": "system",
-          "content":
-            "IMPORTANT: Do not use sandbox tools (sandbox_exec, sandbox_read_file, sandbox_write_file, sandbox_list_directory, sandbox_search_files, sandbox_install). Only use non-sandbox tools.",
-        ], at: 0)
+    var systemParts: [String] = []
+
+    let customPrompt = configGet("system_prompt")
+    if let customPrompt, !customPrompt.isEmpty {
+      systemParts.append(customPrompt)
     }
+
+    let displayName = senderName ?? "the user"
+    systemParts.append(
+      "You are a helpful assistant in a Telegram chat with \(displayName). Keep responses concise and conversational \u{2014} this is a chat, not an essay. Use short paragraphs. Only include code blocks when specifically asked. Avoid excessive markdown formatting."
+    )
+
+    if enableTools && !enableSandbox {
+      systemParts.append(
+        "IMPORTANT: Do not use sandbox tools (sandbox_exec, sandbox_read_file, sandbox_write_file, sandbox_list_directory, sandbox_search_files, sandbox_install). Only use non-sandbox tools."
+      )
+    }
+
+    messages.insert(
+      ["role": "system", "content": systemParts.joined(separator: "\n\n")], at: 0)
 
     var request: [String: Any] = [
       "model": "",

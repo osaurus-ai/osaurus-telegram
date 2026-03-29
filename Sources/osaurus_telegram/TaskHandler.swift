@@ -102,7 +102,7 @@ private func handleStarted(token: String, chatId: String, task: TaskRow, isPriva
     let ok = telegramSendMessageDraft(
       token: token, chatId: chatId,
       draftId: draftId(for: task.taskId),
-      text: "\u{23F3} Working on it..."
+      text: "\u{23F3} Working on it"
     )
     logDebug("handleStarted: sent draft ok=\(ok)")
   } else {
@@ -121,7 +121,7 @@ private func handleActivity(
       _ = telegramSendMessageDraft(
         token: token, chatId: chatId,
         draftId: draftId(for: task.taskId),
-        text: "\u{23F3} \(title)..."
+        text: "\u{23F3} \(title)"
       )
     } else {
       logDebug("handleActivity: task \(task.taskId) failed to parse activity event")
@@ -145,7 +145,7 @@ private func handleActivity(
         token: token,
         chatId: chatId,
         messageId: statusMsgId,
-        text: "\u{23F3} \(title)..."
+        text: "\u{23F3} \(title)"
       )
     } else {
       logDebug(
