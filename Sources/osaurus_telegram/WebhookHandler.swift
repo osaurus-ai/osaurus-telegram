@@ -751,12 +751,6 @@ private func handleChatModeStreaming(
 
   let chatDraftId = draftId(for: "chat-\(chatId)-\(messageId)")
 
-  let draftOk = telegramSendMessageDraft(
-    token: token, chatId: chatId,
-    draftId: chatDraftId, text: "Thinking"
-  )
-  logDebug("handleChatModeStreaming: initial draft sent ok=\(draftOk)")
-
   DispatchQueue.global(qos: .userInitiated).async {
     let historyJSON = DatabaseManager.getMessages(chatId: chatId, limit: 20)
     var messages = buildCompletionMessages(historyJSON: historyJSON, currentPrompt: prompt)
@@ -806,6 +800,11 @@ private func handleChatModeStreaming(
     }
 
     logDebug("handleChatModeStreaming: calling complete_stream (\(requestJSON.count) chars)")
+
+    _ = telegramSendMessageDraft(
+      token: token, chatId: chatId,
+      draftId: chatDraftId, text: "Thinking"
+    )
 
     let state = ChatStreamState(token: token, chatId: chatId, draftId: chatDraftId)
     let statePtr = Unmanaged.passRetained(state).toOpaque()
