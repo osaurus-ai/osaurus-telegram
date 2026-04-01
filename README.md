@@ -85,10 +85,11 @@ Bot:   Deploying to staging... done! Build v2.3.1 is live.
 
 ### 2. Configure
 
-1. Open Osaurus and go to **Tools** settings (Cmd+Shift+M)
-2. Find the **Telegram** plugin
-3. Paste your bot token into the **Bot Token** field
-4. The plugin will automatically validate the token and register a webhook with Telegram
+1. Open Osaurus and go to **Agents** settings (Cmd+Shift+M)
+2. Create or choose your Agent
+3. Find the **Telegram** plugin (make sure it's installed)
+4. Paste your bot token into the **Bot Token** field
+5. The plugin will automatically validate the token and register a webhook with Telegram
 
 ### 3. Start Chatting
 
@@ -96,10 +97,10 @@ Send a message to your bot in Telegram. In private chats, you get a streaming co
 
 ## Bot Commands
 
-| Command | Description |
-|---------|-------------|
-| `/start` | Start the bot and show a welcome message |
-| `/clear` | Clear conversation history and start fresh |
+| Command          | Description                                          |
+| ---------------- | ---------------------------------------------------- |
+| `/start`         | Start the bot and show a welcome message             |
+| `/clear`         | Clear conversation history and start fresh           |
 | `/work <prompt>` | Dispatch a background agent task for multi-step work |
 
 To make these appear in Telegram's command menu, send `/setcommands` to [@BotFather](https://t.me/BotFather) and enter:
@@ -114,26 +115,26 @@ work - Dispatch a background agent task
 
 The plugin exposes two tools that agents can call during task execution:
 
-| Tool | Description |
-|------|-------------|
-| `telegram_send` | Send a message to a Telegram chat. Supports reply threading and inline keyboard markup. |
+| Tool                        | Description                                                                                                                                        |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `telegram_send`             | Send a message to a Telegram chat. Supports reply threading and inline keyboard markup.                                                            |
 | `telegram_get_chat_history` | Retrieve recent messages from the local message log for a given chat. Returns up to 200 messages with sender info, timestamps, and media metadata. |
 
 ## Routes
 
-| Route | Method | Auth | Description |
-|-------|--------|------|-------------|
-| `/webhook` | POST | `verify` | Telegram Bot API webhook endpoint. Validates the secret token header on every request. |
-| `/health` | GET | `owner` | Health check. Returns webhook registration status and bot username as JSON. |
+| Route      | Method | Auth     | Description                                                                            |
+| ---------- | ------ | -------- | -------------------------------------------------------------------------------------- |
+| `/webhook` | POST   | `verify` | Telegram Bot API webhook endpoint. Validates the secret token header on every request. |
+| `/health`  | GET    | `owner`  | Health check. Returns webhook registration status and bot username as JSON.            |
 
 ## Configuration
 
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `bot_token` | secret | — | Telegram bot token from [@BotFather](https://t.me/BotFather). Required. |
-| `allowed_users` | text | (empty) | Comma-separated Telegram usernames (e.g. `@alice, @bob`). Leave blank to allow everyone. |
-| `send_typing` | toggle | on | Show a typing indicator while the agent works. Applies to work mode in group chats. |
-| `send_progress` | toggle | off | Edit the status message with activity/progress text. Only applies to work mode in group chats. |
+| Key             | Type   | Default | Description                                                                                    |
+| --------------- | ------ | ------- | ---------------------------------------------------------------------------------------------- |
+| `bot_token`     | secret | —       | Telegram bot token from [@BotFather](https://t.me/BotFather). Required.                        |
+| `allowed_users` | text   | (empty) | Comma-separated Telegram usernames (e.g. `@alice, @bob`). Leave blank to allow everyone.       |
+| `send_typing`   | toggle | on      | Show a typing indicator while the agent works. Applies to work mode in group chats.            |
+| `send_progress` | toggle | off     | Edit the status message with activity/progress text. Only applies to work mode in group chats. |
 
 ## License
 
