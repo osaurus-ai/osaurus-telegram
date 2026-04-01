@@ -125,17 +125,6 @@ private func withRetry<T>(
   return nil
 }
 
-private func withRetryBool(
-  maxAttempts: Int = 3,
-  initialDelay: TimeInterval = 1.0,
-  operation: String,
-  block: () -> Bool
-) -> Bool {
-  return withRetry(maxAttempts: maxAttempts, initialDelay: initialDelay, operation: operation) {
-    block() ? true : nil
-  } != nil
-}
-
 func setupWebhook(ctx: PluginContext, token: String, tunnelURL: String) {
   logDebug("setupWebhook: calling getMe to validate token")
   guard let botInfo = withRetry(operation: "getMe", block: { telegramGetMe(token: token) }) else {
@@ -156,9 +145,10 @@ func setupWebhook(ctx: PluginContext, token: String, tunnelURL: String) {
   let webhookURL = "\(tunnelURL)/plugins/\(pluginId)/webhook"
   logDebug("setupWebhook: registering webhook at \(webhookURL)")
 
-  let registered = withRetryBool(operation: "setWebhook") {
-    telegramSetWebhook(token: token, url: webhookURL, secretToken: secret)
-  }
+  let registered =
+    withRetry(operation: "setWebhook") {
+      telegramSetWebhook(token: token, url: webhookURL, secretToken: secret) ? true : nil
+    } != nil
   if registered {
     configSet("webhook_secret", secret)
     configSet("webhook_registered", "true")
