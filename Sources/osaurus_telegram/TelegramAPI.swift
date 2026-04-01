@@ -78,7 +78,7 @@ func telegramRequest(token: String, method: String, body: [String: Any]? = nil) 
   if !ok {
     if httpStatus == 401 {
       logError("Telegram \(method): unauthorized (bad token)")
-      configSet("webhook_registered", "false")
+      configDelete("webhook_registered")
     } else if httpStatus == 429, let retryAfter {
       logWarn("Telegram \(method): rate limited, retry after \(retryAfter)s")
     } else {

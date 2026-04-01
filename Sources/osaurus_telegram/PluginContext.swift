@@ -66,6 +66,7 @@ final class PluginContext: @unchecked Sendable {
 func initPlugin(_ ctx: PluginContext) {
   logDebug("initPlugin: starting")
   DatabaseManager.initSchema()
+  configDelete("webhook_registered")
 
   if let token = configGet("bot_token"), !token.isEmpty {
     ctx.botToken = token
@@ -106,11 +107,40 @@ private func recoverActiveTasks(ctx: PluginContext) {
   }
 }
 
+private func withRetry<T>(
+  maxAttempts: Int = 3,
+  initialDelay: TimeInterval = 1.0,
+  operation: String,
+  block: () -> T?
+) -> T? {
+  for attempt in 1...maxAttempts {
+    if let result = block() { return result }
+    if attempt < maxAttempts {
+      let delay = initialDelay * pow(2.0, Double(attempt - 1))
+      logWarn("\(operation) failed (attempt \(attempt)/\(maxAttempts)), retrying in \(delay)s")
+      Thread.sleep(forTimeInterval: delay)
+    }
+  }
+  logError("\(operation) failed after \(maxAttempts) attempts")
+  return nil
+}
+
+private func withRetryBool(
+  maxAttempts: Int = 3,
+  initialDelay: TimeInterval = 1.0,
+  operation: String,
+  block: () -> Bool
+) -> Bool {
+  return withRetry(maxAttempts: maxAttempts, initialDelay: initialDelay, operation: operation) {
+    block() ? true : nil
+  } != nil
+}
+
 func setupWebhook(ctx: PluginContext, token: String, tunnelURL: String) {
   logDebug("setupWebhook: calling getMe to validate token")
-  guard let botInfo = telegramGetMe(token: token) else {
+  guard let botInfo = withRetry(operation: "getMe", block: { telegramGetMe(token: token) }) else {
     logError("Failed to validate bot token with getMe")
-    configSet("webhook_registered", "false")
+    configDelete("webhook_registered")
     return
   }
 
@@ -126,12 +156,15 @@ func setupWebhook(ctx: PluginContext, token: String, tunnelURL: String) {
   let webhookURL = "\(tunnelURL)/plugins/\(pluginId)/webhook"
   logDebug("setupWebhook: registering webhook at \(webhookURL)")
 
-  if telegramSetWebhook(token: token, url: webhookURL, secretToken: secret) {
+  let registered = withRetryBool(operation: "setWebhook") {
+    telegramSetWebhook(token: token, url: webhookURL, secretToken: secret)
+  }
+  if registered {
     configSet("webhook_secret", secret)
     configSet("webhook_registered", "true")
     logInfo("Webhook registered at \(webhookURL)")
   } else {
-    configSet("webhook_registered", "false")
+    configDelete("webhook_registered")
     logError("Failed to register webhook at \(webhookURL)")
   }
 }
@@ -179,7 +212,7 @@ func onConfigChanged(ctx: PluginContext, key: String, value: String?) {
   ctx.webhookSecret = nil
 
   guard let newToken else {
-    configSet("webhook_registered", "false")
+    configDelete("webhook_registered")
     logInfo("Bot token cleared")
     return
   }
@@ -200,5 +233,5 @@ func destroyPlugin(_ ctx: PluginContext) {
     _ = telegramDeleteWebhook(token: token)
     logInfo("Webhook deleted on destroy")
   }
-  configSet("webhook_registered", "false")
+  configDelete("webhook_registered")
 }
