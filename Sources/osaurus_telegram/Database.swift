@@ -63,6 +63,19 @@ enum DatabaseManager {
       "CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, created_at DESC)",
       "CREATE INDEX IF NOT EXISTS idx_tasks_chat ON tasks(chat_id, created_at DESC)",
       "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
+      """
+      CREATE TABLE IF NOT EXISTS reactions (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id     TEXT NOT NULL,
+        message_id  INTEGER NOT NULL,
+        user_id     TEXT,
+        emoji       TEXT NOT NULL,
+        is_custom   INTEGER DEFAULT 0,
+        created_at  INTEGER DEFAULT (unixepoch()),
+        FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
+      )
+      """,
+      "CREATE INDEX IF NOT EXISTS idx_reactions_msg ON reactions(chat_id, message_id)",
     ]
 
     for sql in statements {
@@ -451,6 +464,58 @@ enum DatabaseManager {
       return "[]"
     }
     return jsonStr
+  }
+
+  // MARK: - Reactions
+
+  static func upsertReaction(
+    chatId: String, messageId: Int, userId: String?, emoji: String, isCustom: Bool
+  ) {
+    let userParam: Any = userId ?? NSNull()
+    let params = serializeParams([chatId, messageId, userParam, emoji, isCustom ? 1 : 0])
+
+    let sql = """
+      INSERT INTO reactions (chat_id, message_id, user_id, emoji, is_custom)
+      VALUES (?1, ?2, ?3, ?4, ?5)
+      ON CONFLICT(id) DO UPDATE SET emoji = ?4, is_custom = ?5, created_at = unixepoch()
+      """
+    if let userId {
+      let deleteOld = """
+        DELETE FROM reactions WHERE chat_id = ?1 AND message_id = ?2 AND user_id = ?3
+        """
+      dbExec(deleteOld, params: serializeParams([chatId, messageId, userId]))
+    }
+    dbExec(sql, params: params)
+  }
+
+  static func deleteReaction(chatId: String, messageId: Int, userId: String) {
+    let params = serializeParams([chatId, messageId, userId])
+    let sql = "DELETE FROM reactions WHERE chat_id = ?1 AND message_id = ?2 AND user_id = ?3"
+    dbExec(sql, params: params)
+  }
+
+  static func getReactions(chatId: String, messageId: Int) -> [[String: Any]] {
+    let params = serializeParams([chatId, messageId])
+    let sql = """
+      SELECT user_id, emoji, is_custom, created_at
+      FROM reactions
+      WHERE chat_id = ?1 AND message_id = ?2
+      ORDER BY created_at DESC
+      """
+    guard let resultStr = dbQuery(sql, params: params),
+      let rows = extractRows(resultStr)
+    else {
+      return []
+    }
+
+    return rows.map { row in
+      var r: [String: Any] = [:]
+      if row.count > 0, let uid = row[0] as? String { r["user_id"] = uid }
+      if row.count > 1, let e = row[1] as? String { r["emoji"] = e }
+      if row.count > 2 { r["is_custom"] = (row[2] as? Int) == 1 }
+      if row.count > 3, let ts = row[3] as? Int { r["created_at"] = ts }
+      return r
+    }
   }
 
   // MARK: - Helpers

@@ -107,7 +107,7 @@ func telegramSetWebhook(token: String, url: String, secretToken: String) -> Bool
   let body: [String: Any] = [
     "url": url,
     "secret_token": secretToken,
-    "allowed_updates": ["message", "callback_query"],
+    "allowed_updates": ["message", "callback_query", "message_reaction"],
     "drop_pending_updates": false,
   ]
   let (ok, _, _) = telegramRequest(token: token, method: "setWebhook", body: body)
@@ -213,6 +213,35 @@ func telegramAnswerCallbackQuery(token: String, callbackQueryId: String, text: S
   var body: [String: Any] = ["callback_query_id": callbackQueryId]
   if let text { body["text"] = text }
   _ = telegramRequest(token: token, method: "answerCallbackQuery", body: body)
+}
+
+/// Sets a reaction on a message. Pass nil emoji to remove the bot's reaction.
+func telegramSetMessageReaction(
+  token: String,
+  chatId: String,
+  messageId: Int,
+  emoji: String?,
+  isBig: Bool = false
+) -> Bool {
+  var body: [String: Any] = [
+    "chat_id": chatId,
+    "message_id": messageId,
+  ]
+
+  if let emoji {
+    let reaction: [[String: Any]] = [["type": "emoji", "emoji": emoji]]
+    body["reaction"] = reaction
+  } else {
+    body["reaction"] = [[String: Any]]()
+  }
+
+  if isBig { body["is_big"] = true }
+
+  let (ok, _, _) = telegramRequest(token: token, method: "setMessageReaction", body: body)
+  if !ok {
+    logDebug("setMessageReaction: failed for chat \(chatId) message \(messageId)")
+  }
+  return ok
 }
 
 /// Streams a partial message draft to a private chat (Bot API 9.0+).

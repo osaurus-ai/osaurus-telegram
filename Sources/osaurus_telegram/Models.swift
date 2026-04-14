@@ -7,6 +7,7 @@ struct TelegramUpdate: Decodable {
   let message: TelegramMessage?
   let edited_message: TelegramMessage?
   let callback_query: TelegramCallbackQuery?
+  let message_reaction: TelegramMessageReactionUpdated?
 }
 
 struct TelegramMessage: Decodable {
@@ -71,6 +72,22 @@ struct TelegramCallbackQuery: Decodable {
   let from: TelegramUser
   let message: TelegramMessage?
   let data: String?
+}
+
+struct TelegramReactionType: Decodable {
+  let type: String
+  let emoji: String?
+  let custom_emoji_id: String?
+}
+
+struct TelegramMessageReactionUpdated: Decodable {
+  let chat: TelegramChat
+  let message_id: Int
+  let user: TelegramUser?
+  let actor_chat: TelegramChat?
+  let date: Int
+  let old_reaction: [TelegramReactionType]
+  let new_reaction: [TelegramReactionType]
 }
 
 // MARK: - Route Request/Response

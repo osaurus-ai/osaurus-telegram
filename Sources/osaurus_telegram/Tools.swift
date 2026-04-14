@@ -187,6 +187,46 @@ struct TelegramSendFileTool {
   }
 }
 
+// MARK: - telegram_set_reaction Tool
+
+struct TelegramSetReactionTool {
+  let name = "telegram_set_reaction"
+
+  struct Args: Decodable {
+    let chat_id: String
+    let message_id: Int
+    let emoji: String?
+  }
+
+  func run(args: String) -> String {
+    logDebug("telegram_set_reaction: args=\(String(args.prefix(200)))")
+    guard let input = parseJSON(args, as: Args.self) else {
+      logWarn("telegram_set_reaction: failed to parse args")
+      return "{\"error\":\"Invalid arguments\"}"
+    }
+
+    guard let token = configGet("bot_token"), !token.isEmpty else {
+      logWarn("telegram_set_reaction: no bot token configured")
+      return "{\"error\":\"Bot token not configured\"}"
+    }
+
+    let ok = telegramSetMessageReaction(
+      token: token,
+      chatId: input.chat_id,
+      messageId: input.message_id,
+      emoji: input.emoji
+    )
+
+    if ok {
+      logDebug("telegram_set_reaction: set \(input.emoji ?? "none") on message \(input.message_id)")
+      return "{\"ok\":true}"
+    } else {
+      logWarn("telegram_set_reaction: failed for chat \(input.chat_id) message \(input.message_id)")
+      return "{\"error\":\"Failed to set reaction\"}"
+    }
+  }
+}
+
 // MARK: - AnyCodable Helper
 
 /// A type-erased Codable wrapper for handling arbitrary JSON (e.g. reply_markup).

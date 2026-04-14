@@ -58,15 +58,17 @@ private func handleWebhook(ctx: PluginContext, req: RouteRequest) -> String {
 
   let agentAddress = req.osaurus?.agent_address
   logDebug(
-    "handleWebhook: update_id=\(update.update_id) hasMessage=\(update.message != nil) hasCallback=\(update.callback_query != nil) agentAddress=\(agentAddress ?? "nil")"
+    "handleWebhook: update_id=\(update.update_id) hasMessage=\(update.message != nil) hasCallback=\(update.callback_query != nil) hasReaction=\(update.message_reaction != nil) agentAddress=\(agentAddress ?? "nil")"
   )
 
   if let message = update.message {
     handleMessage(ctx: ctx, message: message, agentAddress: agentAddress)
   } else if let callbackQuery = update.callback_query {
     handleCallback(ctx: ctx, query: callbackQuery)
+  } else if let reaction = update.message_reaction {
+    handleReaction(ctx: ctx, reaction: reaction)
   } else {
-    logDebug("handleWebhook: update has neither message nor callback_query, ignoring")
+    logDebug("handleWebhook: update has no message, callback_query, or reaction, ignoring")
   }
 
   return makeRouteResponse(status: 200, body: "ok")
@@ -588,19 +590,33 @@ private func handleCancelCommand(
 
 /// State accumulated during streaming inference, passed through the C callback via user_data.
 final class ChatStreamState {
-  var accumulated = ""
-  var lastFlushLength = 0
-  var receivedFirstChunk = false
-  var currentToolName: String?
   let token: String
   let chatId: String
+  let messageId: Int
   let draftId: Int
   static let flushThreshold = 100
 
-  init(token: String, chatId: String, draftId: Int) {
+  var accumulated = ""
+  var lastFlushLength = 0
+  var receivedFirstChunk = false
+  var hasSetWritingReaction = false
+  var currentToolName: String?
+
+  init(token: String, chatId: String, messageId: Int, draftId: Int) {
     self.token = token
     self.chatId = chatId
+    self.messageId = messageId
     self.draftId = draftId
+  }
+
+  func react(_ emoji: String) {
+    _ = telegramSetMessageReaction(
+      token: token, chatId: chatId, messageId: messageId, emoji: emoji)
+  }
+
+  func draft(_ text: String) {
+    _ = telegramSendMessageDraft(
+      token: token, chatId: chatId, draftId: draftId, text: text)
   }
 }
 
@@ -622,13 +638,8 @@ private let streamChunkCallback:
       } else if let name = toolInfo.name {
         state.currentToolName = name
         logDebug("streamChunkCallback: tool call \(name)")
-        let displayName = friendlyToolName(name)
-        _ = telegramSendMessageDraft(
-          token: state.token,
-          chatId: state.chatId,
-          draftId: state.draftId,
-          text: displayName
-        )
+        state.react("\u{2699}")
+        state.draft(friendlyToolName(name))
       }
       return
     }
@@ -636,17 +647,17 @@ private let streamChunkCallback:
     if let content = extractStreamContent(chunk) {
       state.currentToolName = nil
       state.accumulated += content
+
+      if !state.hasSetWritingReaction {
+        state.hasSetWritingReaction = true
+        state.react("\u{270D}")
+      }
     }
 
     let newChars = state.accumulated.count - state.lastFlushLength
     if newChars >= ChatStreamState.flushThreshold {
       logDebug("streamChunkCallback: flush at \(state.accumulated.count) chars")
-      _ = telegramSendMessageDraft(
-        token: state.token,
-        chatId: state.chatId,
-        draftId: state.draftId,
-        text: String(state.accumulated.prefix(4096))
-      )
+      state.draft(String(state.accumulated.prefix(4096)))
       state.lastFlushLength = state.accumulated.count
     }
   }
@@ -801,12 +812,9 @@ private func handleChatModeStreaming(
 
     logDebug("handleChatModeStreaming: calling complete_stream (\(requestJSON.count) chars)")
 
-    _ = telegramSendMessageDraft(
-      token: token, chatId: chatId,
-      draftId: chatDraftId, text: "Thinking"
-    )
-
-    let state = ChatStreamState(token: token, chatId: chatId, draftId: chatDraftId)
+    let state = ChatStreamState(
+      token: token, chatId: chatId, messageId: messageId, draftId: chatDraftId)
+    state.react("\u{1F440}")
     let statePtr = Unmanaged.passRetained(state).toOpaque()
 
     let result: UnsafePointer<CChar>? = requestJSON.withCString { ptr in
@@ -835,13 +843,17 @@ private func handleChatModeStreaming(
     )
 
     let finalText: String
+    let isError: Bool
     if let streamError, state.accumulated.isEmpty {
       finalText = "Error: \(streamError)"
+      isError = true
     } else if state.accumulated.isEmpty {
       logWarn("handleChatModeStreaming: no content accumulated and no error")
       finalText = "I couldn't generate a response."
+      isError = true
     } else {
       finalText = state.accumulated
+      isError = false
     }
 
     let htmlText = markdownToTelegramHTML(finalText)
@@ -849,6 +861,8 @@ private func handleChatModeStreaming(
       token: token, chatId: chatId, text: htmlText,
       parseMode: "HTML", replyTo: messageId)
     logDebug("handleChatModeStreaming: sent final message, msgId=\(msgId.map { "\($0)" } ?? "nil")")
+
+    state.react(isError ? "\u{274C}" : "\u{2705}")
 
     if let msgId {
       DatabaseManager.insertMessage(
@@ -937,6 +951,52 @@ private func handleCallback(ctx: PluginContext, query: TelegramCallbackQuery) {
 
   DatabaseManager.updateTask(taskId: taskId, status: "running", clarificationOptions: nil)
   logDebug("handleCallback: task \(taskId) updated to running")
+}
+
+// MARK: - Reaction Handler
+
+private func handleReaction(ctx: PluginContext, reaction: TelegramMessageReactionUpdated) {
+  let chatId = "\(reaction.chat.id)"
+  let messageId = reaction.message_id
+
+  let addedEmojis = reaction.new_reaction.compactMap { $0.emoji }
+  let removedEmojis = reaction.old_reaction.compactMap { $0.emoji }
+  let userId = reaction.user.map { "\($0.id)" }
+
+  logDebug(
+    "handleReaction: chatId=\(chatId) msgId=\(messageId) user=\(userId ?? "anon") added=\(addedEmojis) removed=\(removedEmojis)"
+  )
+
+  let chatTitle = reaction.chat.title ?? reaction.chat.first_name ?? reaction.chat.username
+  DatabaseManager.upsertChat(
+    chatId: chatId, chatType: reaction.chat.type,
+    title: chatTitle, username: reaction.chat.username)
+
+  if let user = reaction.user {
+    DatabaseManager.upsertUser(
+      userId: "\(user.id)", username: user.username,
+      firstName: user.first_name, lastName: user.last_name)
+  }
+
+  if let uid = userId, reaction.new_reaction.isEmpty {
+    DatabaseManager.deleteReaction(chatId: chatId, messageId: messageId, userId: uid)
+    logDebug("handleReaction: cleared reaction from user \(uid) on message \(messageId)")
+    return
+  }
+
+  for rt in reaction.new_reaction {
+    let emoji = rt.emoji ?? rt.custom_emoji_id ?? "paid"
+    let isCustom = rt.type == "custom_emoji"
+    DatabaseManager.upsertReaction(
+      chatId: chatId, messageId: messageId,
+      userId: userId, emoji: emoji, isCustom: isCustom)
+  }
+
+  if let task = DatabaseManager.getTaskByMessageId(chatId: chatId, messageId: messageId) {
+    logInfo(
+      "handleReaction: reaction on task \(task.taskId) (status=\(task.status)) emojis=\(addedEmojis)"
+    )
+  }
 }
 
 // MARK: - Health Endpoint

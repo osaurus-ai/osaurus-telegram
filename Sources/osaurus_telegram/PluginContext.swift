@@ -35,6 +35,7 @@ final class PluginContext: @unchecked Sendable {
   let chatHistoryTool = TelegramGetChatHistoryTool()
   let telegramSendTool = TelegramSendTool()
   let sendFileTool = TelegramSendFileTool()
+  let setReactionTool = TelegramSetReactionTool()
 
   func startDraftPing() {
     guard draftPingTimer == nil else { return }

@@ -231,6 +231,12 @@ private func handleStarted(
 ) {
   logDebug("handleStarted: task \(task.taskId) isPrivate=\(isPrivate)")
   DatabaseManager.updateTask(taskId: task.taskId, status: "running")
+
+  if let msgId = task.messageId {
+    _ = telegramSetMessageReaction(
+      token: token, chatId: chatId, messageId: msgId, emoji: "\u{1F440}")
+  }
+
   if isPrivate {
     ctx.taskDraftStates[task.taskId] = TaskDraftState(chatId: chatId)
     sendTaskDraft(ctx: ctx, token: token, chatId: chatId, taskId: task.taskId)
@@ -251,6 +257,10 @@ private func handleActivity(
   if isPrivate {
     switch kind {
     case "tool_call":
+      if let msgId = task.messageId {
+        _ = telegramSetMessageReaction(
+          token: token, chatId: chatId, messageId: msgId, emoji: "\u{2699}")
+      }
       ctx.taskDraftStates[task.taskId, default: TaskDraftState(chatId: chatId)].toolCallCount += 1
       ctx.taskDraftStates[task.taskId]?.latestToolName = label
       if let currentOutput = ctx.taskOutputTexts[task.taskId] {
@@ -265,10 +275,17 @@ private func handleActivity(
       }
       ctx.taskDraftStates[task.taskId]?.newSegment = true
 
-    case "thinking", "writing":
-      ctx.taskDraftStates[task.taskId, default: TaskDraftState(chatId: chatId)].latestToolName =
-        label
-      sendTaskDraft(ctx: ctx, token: token, chatId: chatId, taskId: task.taskId)
+    case "thinking":
+      if let msgId = task.messageId {
+        _ = telegramSetMessageReaction(
+          token: token, chatId: chatId, messageId: msgId, emoji: "\u{1F4AD}")
+      }
+
+    case "writing":
+      if let msgId = task.messageId {
+        _ = telegramSetMessageReaction(
+          token: token, chatId: chatId, messageId: msgId, emoji: "\u{270D}")
+      }
 
     default:
       break
@@ -444,6 +461,11 @@ private func handleCompleted(
     }
   }
 
+  if let msgId = task.messageId {
+    _ = telegramSetMessageReaction(
+      token: token, chatId: chatId, messageId: msgId, emoji: "\u{2705}")
+  }
+
   DatabaseManager.updateTask(taskId: task.taskId, status: "completed", summary: summary)
   logInfo("Task \(task.taskId) completed for chat \(chatId)")
 }
@@ -462,6 +484,11 @@ private func handleFailed(
     ctx: ctx, token: token, chatId: chatId, task: task, isPrivate: isPrivate,
     status: "\u{274C} Failed", summary: summary, draftState: draftState,
     groupIcon: "\u{274C}")
+
+  if let msgId = task.messageId {
+    _ = telegramSetMessageReaction(
+      token: token, chatId: chatId, messageId: msgId, emoji: "\u{274C}")
+  }
 
   DatabaseManager.updateTask(taskId: task.taskId, status: "failed", summary: summary)
   logWarn("Task \(task.taskId) failed for chat \(chatId): \(summary)")

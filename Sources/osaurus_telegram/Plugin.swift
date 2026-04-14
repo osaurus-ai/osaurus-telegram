@@ -277,6 +277,30 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
               },
               "requirements": [],
               "permission_policy": "auto"
+            },
+            {
+              "id": "telegram_set_reaction",
+              "description": "Set an emoji reaction on a Telegram message. Can also remove a reaction by omitting the emoji.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "chat_id": {
+                    "type": "string",
+                    "description": "Telegram chat ID"
+                  },
+                  "message_id": {
+                    "type": "integer",
+                    "description": "Message ID to react to"
+                  },
+                  "emoji": {
+                    "type": "string",
+                    "description": "Emoji to react with (e.g. \\ud83d\\udc4d, \\u2764, \\ud83d\\ude02). Omit to remove the reaction."
+                  }
+                },
+                "required": ["chat_id", "message_id"]
+              },
+              "requirements": [],
+              "permission_policy": "auto"
             }
           ],
           "artifact_handler": true,
@@ -446,6 +470,8 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
       result = ctx.telegramSendTool.run(args: payload)
     case ctx.sendFileTool.name:
       result = ctx.sendFileTool.run(args: payload)
+    case ctx.setReactionTool.name:
+      result = ctx.setReactionTool.run(args: payload)
     default:
       logWarn("invoke: unknown tool '\(id)'")
       return makeCString("{\"error\":\"Unknown tool: \(id)\"}")
