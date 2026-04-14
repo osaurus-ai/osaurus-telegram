@@ -287,7 +287,7 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
   if isPrivateChat && hostAPI?.pointee.complete_stream != nil {
     logDebug("handleMessage: -> chat mode streaming path")
     handleChatModeStreaming(
-      token: token, chatId: chatId,
+      ctx: ctx, token: token, chatId: chatId,
       prompt: prompt, messageId: message.message_id,
       senderName: senderName,
       agentAddress: agentAddress
@@ -754,7 +754,7 @@ func buildCompletionMessages(
 }
 
 private func handleChatModeStreaming(
-  token: String, chatId: String, prompt: String, messageId: Int,
+  ctx: PluginContext, token: String, chatId: String, prompt: String, messageId: Int,
   senderName: String?, agentAddress: String?
 ) {
   logDebug(
@@ -811,6 +811,9 @@ private func handleChatModeStreaming(
     }
 
     logDebug("handleChatModeStreaming: calling complete_stream (\(requestJSON.count) chars)")
+
+    ctx.activeStreamingChatId = chatId
+    defer { ctx.activeStreamingChatId = nil }
 
     let state = ChatStreamState(
       token: token, chatId: chatId, messageId: messageId, draftId: chatDraftId)
@@ -1060,7 +1063,7 @@ func handleArtifactShare(ctx: PluginContext, payload: String) -> String {
     return "{\"skipped\":true}"
   }
 
-  guard let chatId = DatabaseManager.getLastActiveChatId() else {
+  guard let chatId = DatabaseManager.getLastActiveChatId() ?? ctx.activeStreamingChatId else {
     logWarn("handleArtifactShare: no active chat to upload to")
     return "{\"error\":\"No active chat\"}"
   }

@@ -25,6 +25,7 @@ final class PluginContext: @unchecked Sendable {
   var webhookSecret: String?
   var tunnelURL: String?
 
+  var activeStreamingChatId: String?
   var taskOutputTexts: [String: String] = [:]
   var taskDraftStates: [String: TaskDraftState] = [:]
   var taskStreamStates: [String: TaskStreamState] = [:]
