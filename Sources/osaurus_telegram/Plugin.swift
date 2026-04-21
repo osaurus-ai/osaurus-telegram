@@ -146,10 +146,10 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
       ("db_query", hostAPI?.pointee.db_query != nil),
       ("config_get", hostAPI?.pointee.config_get != nil),
       ("log", hostAPI?.pointee.log != nil),
-      ("dispatch_clarify", hostAPI?.pointee.dispatch_clarify != nil),
       ("file_read", hostAPI?.pointee.file_read != nil),
       ("dispatch_interrupt", hostAPI?.pointee.dispatch_interrupt != nil),
-      ("dispatch_add_issue", hostAPI?.pointee.dispatch_add_issue != nil),
+      ("send_draft", hostAPI?.pointee.send_draft != nil),
+      ("list_active_tasks", hostAPI?.pointee.list_active_tasks != nil),
     ]
     for (name, ok) in checks {
       if ok { available.append(name) } else { missing.append(name) }
@@ -417,6 +417,25 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
                     "type": "toggle",
                     "label": "Send typing indicator while agent works",
                     "default": true
+                  }
+                ]
+              },
+              {
+                "title": "Prompt Customization",
+                "fields": [
+                  {
+                    "key": "system_prompt",
+                    "type": "text",
+                    "label": "Extra system prompt",
+                    "placeholder": "Optional. Prepended to the default Telegram chat instructions.",
+                    "description": "Additional system prompt text for streaming chat replies. Leave blank to use defaults."
+                  },
+                  {
+                    "key": "tool_status_messages",
+                    "type": "text",
+                    "label": "Tool status overrides (JSON)",
+                    "placeholder": "{\\"sandbox_exec\\": \\"Running code\\", \\"web_search\\": \\"Searching\\"}",
+                    "description": "JSON object mapping tool-name prefixes to friendly status labels shown in draft updates."
                   }
                 ]
               }

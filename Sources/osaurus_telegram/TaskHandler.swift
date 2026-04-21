@@ -340,6 +340,13 @@ private func handleProgress(
   }
 }
 
+/// Surfaces a clarification question as a plain reply.
+///
+/// The deprecated `dispatch_clarify` round-trip has been replaced by the
+/// unified chat agent loop: the user simply replies to the agent's message
+/// and `handleTaskThreadReply` redispatches the answer with the same
+/// `external_session_key`. We append the available options to the prompt as
+/// a hint instead of rendering a now-dead inline keyboard.
 private func handleClarification(
   token: String, chatId: String, task: TaskRow, eventJSON: String
 ) {
@@ -358,46 +365,21 @@ private func handleClarification(
     "handleClarification: task \(taskId) question=\"\(String(question.prefix(100)))\" options=\(options.count)"
   )
 
-  let questionText = "\u{2753} \(question)"
-
-  if options.isEmpty {
-    if let msgId = telegramSendMessage(
-      token: token, chatId: chatId, text: questionText,
-      replyTo: task.messageId)
-    {
-      DatabaseManager.insertMessage(
-        chatId: chatId, messageId: msgId, direction: "out",
-        senderId: nil, senderName: "Agent", text: questionText,
-        mediaType: nil, mediaFileId: nil, taskId: taskId)
-    }
-    DatabaseManager.updateTask(taskId: taskId, status: "awaiting_clarification")
-    return
+  var questionText = "\u{2753} \(question)"
+  if !options.isEmpty {
+    let bullets = options.map { "\u{2022} \($0)" }.joined(separator: "\n")
+    questionText += "\n\n\(bullets)"
   }
-
-  let keyboard: [[Any]] = options.enumerated().map { (idx, option) in
-    let callbackData = "clarify:\(taskId):\(idx)"
-    return [["text": String(option.prefix(128)), "callback_data": callbackData] as [String: Any]]
-  }
-
-  let replyMarkup: [String: Any] = ["inline_keyboard": keyboard]
-
-  let optionsJSON = (try? JSONSerialization.data(withJSONObject: options))
-    .flatMap { String(data: $0, encoding: .utf8) }
 
   if let msgId = telegramSendMessage(
     token: token, chatId: chatId, text: questionText,
-    replyTo: task.messageId, replyMarkup: replyMarkup)
+    replyTo: task.messageId)
   {
     DatabaseManager.insertMessage(
       chatId: chatId, messageId: msgId, direction: "out",
       senderId: nil, senderName: "Agent", text: questionText,
       mediaType: nil, mediaFileId: nil, taskId: taskId)
   }
-
-  DatabaseManager.updateTask(
-    taskId: taskId, status: "awaiting_clarification",
-    clarificationOptions: optionsJSON
-  )
 }
 
 private func handleCompleted(
@@ -563,7 +545,8 @@ private func handleDraft(
   eventJSON: String
 ) {
   guard let event = parseJSON(eventJSON, as: TaskDraftEvent.self),
-    let text = event.text, !text.isEmpty
+    let draft = event.draft,
+    let text = draft.text, !text.isEmpty
   else {
     logDebug("handleDraft: task \(task.taskId) failed to parse draft event or empty text")
     return
@@ -571,7 +554,7 @@ private func handleDraft(
 
   logDebug("handleDraft: task \(task.taskId) text=\(text.count) chars")
 
-  let parseMode = event.parse_mode
+  let parseMode = draft.parse_mode
   let htmlText = (parseMode == nil) ? markdownToTelegramHTML(text) : text
   let effectiveParseMode = parseMode ?? "HTML"
   let truncated = String(htmlText.prefix(4096))

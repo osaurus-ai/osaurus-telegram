@@ -40,9 +40,28 @@ compatibility with older Osaurus versions.
 - **Config**: `config_get(key)` / `config_set(key, value)` / `config_delete(key)` - Keychain-backed config
 - **Database**: `db_exec(sql, params_json)` / `db_query(sql, params_json)` - Per-plugin SQLite
 - **Logging**: `log(level, message)` - Structured logging (visible in Insights tab)
-- **Agent Dispatch**: `dispatch(request_json)` / `task_status(task_id)` / `dispatch_cancel(task_id)` / `dispatch_clarify(task_id, response)` - Background agent tasks
+- **Agent Dispatch**: `dispatch(request_json)` / `task_status(task_id)` / `dispatch_cancel(task_id)` / `dispatch_interrupt(task_id, message)` / `list_active_tasks()` / `send_draft(task_id, draft_json)` - Background agent tasks
 - **Inference**: `complete(request_json)` / `complete_stream(request_json, on_chunk, user_data)` / `embed(request_json)` / `list_models()` - LLM inference
 - **HTTP Client**: `http_request(request_json)` - Outbound HTTP with SSRF protection
+- **File I/O**: `file_read(request_json)` - Read shared artifact files from `~/.osaurus/artifacts/`
+
+**Deprecated host APIs (no-ops, do not call):**
+- `dispatch_clarify` — clarification questions now flow inline through the chat session; the user's reply is routed back via the unified message handler.
+- `dispatch_add_issue` — always returns `{"error":"not_supported"}`. Call `dispatch()` with the same `external_session_key` to add a turn to an existing session.
+
+**Conversation grouping:**
+
+When dispatching a task that's part of an ongoing conversation (e.g. a Telegram chat thread), pass `external_session_key` so repeated calls reattach to the same Osaurus session row instead of creating a new one each time:
+
+```json
+{
+  "prompt": "...",
+  "agent_address": "0x...",
+  "external_session_key": "telegram:chat-12345:user-67890"
+}
+```
+
+The host looks up `(plugin_id, external_session_key, agent_id)` and reattaches if a session already exists. Use a stable, unique scope (per-chat or per-user-in-chat) so the agent has continuous context.
 
 ## Adding HTTP Routes
 
@@ -113,9 +132,9 @@ if let log = hostAPI?.pointee.log {
 v2 plugins can dispatch background agent tasks and monitor their lifecycle:
 
 ```swift
-// Dispatch a background task
+// Dispatch a background task with a stable session key (find-or-create)
 if let dispatch = hostAPI?.pointee.dispatch {
-    let request = #"{"prompt":"Summarize the latest news","title":"News Summary"}"#
+    let request = #"{"prompt":"Summarize the latest news","title":"News Summary","external_session_key":"telegram:chat-12345:user-67890"}"#
     let result = dispatch(makeCString(request))
     // result is JSON: {"id":"<task-uuid>","status":"running"}
     if let result { defer { api.free_string?(result) } }
@@ -124,18 +143,30 @@ if let dispatch = hostAPI?.pointee.dispatch {
 // Poll task status
 if let taskStatus = hostAPI?.pointee.task_status {
     let status = taskStatus(makeCString("<task-uuid>"))
-    // JSON with status, progress, activity feed, clarification state
+    // JSON with status, progress, activity feed
     if let status { defer { api.free_string?(status) } }
 }
 
 // Cancel a task
 hostAPI?.pointee.dispatch_cancel?(makeCString("<task-uuid>"))
 
-// Submit clarification response
-hostAPI?.pointee.dispatch_clarify?(makeCString("<task-uuid>"), makeCString("Yes, proceed"))
+// Soft-stop with redirect — agent finishes the current step, then resumes with the new instruction
+hostAPI?.pointee.dispatch_interrupt?(makeCString("<task-uuid>"), makeCString("Focus on staging instead"))
+
+// Push a live draft update (e.g. for chat-bridge plugins editing a placeholder message)
+hostAPI?.pointee.send_draft?(makeCString("<task-uuid>"), makeCString(#"{"text":"Working on it...","parse_mode":"markdown"}"#))
+
+// Recover state on plugin restart — list tasks still running on the host
+if let listActive = hostAPI?.pointee.list_active_tasks {
+    let tasks = listActive()
+    // {"tasks":[<task_status objects>]}
+    if let tasks { defer { api.free_string?(tasks) } }
+}
 ```
 
 Rate limit: 10 dispatches per minute per plugin.
+
+**Note on deprecated calls:** `dispatch_clarify` and `dispatch_add_issue` are preserved in the ABI but are no-ops. Don't call them. To respond to a clarification, just dispatch a fresh turn with the same `external_session_key`. To "add work" to an existing session, do the same.
 
 ## Inference
 
@@ -187,15 +218,17 @@ Response fields: `status`, `headers`, `body`, `body_encoding`, `elapsed_ms`.
 
 v2 plugins can receive lifecycle events for tasks they dispatch by implementing `on_task_event`:
 
-| Event Type | Value | Payload |
-|------------|-------|---------|
-| `STARTED` | 0 | `{"status":"running","mode":"...","title":"..."}` |
-| `ACTIVITY` | 1 | `{"kind":"...","title":"...","detail":"...","timestamp":"..."}` |
-| `PROGRESS` | 2 | `{"progress":0.5,"current_step":"..."}` |
-| `CLARIFICATION` | 3 | `{"question":"...","options":[...]}` |
-| `COMPLETED` | 4 | `{"success":true,"summary":"...","session_id":"..."}` |
-| `FAILED` | 5 | `{"success":false,"summary":"..."}` |
-| `CANCELLED` | 6 | `{}` |
+| Event Type      | Value | Payload                                                                                                |
+| --------------- | ----- | ------------------------------------------------------------------------------------------------------ |
+| `STARTED`       | 0     | `{"status":"running","title":"..."}`                                                                   |
+| `ACTIVITY`      | 1     | `{"kind":"...","title":"...","detail":"...","timestamp":"...","metadata":{...}}`                       |
+| `PROGRESS`      | 2     | `{"progress":0.5,"current_step":"...","title":"..."}`                                                  |
+| `CLARIFICATION` | 3     | `{"question":"...","options":[...]}` — informational only; no `dispatch_clarify` round-trip            |
+| `COMPLETED`     | 4     | `{"success":true,"summary":"...","session_id":"...","title":"...","output":"..."}`                     |
+| `FAILED`        | 5     | `{"success":false,"summary":"...","title":"..."}`                                                      |
+| `CANCELLED`     | 6     | `{"title":"..."}`                                                                                      |
+| `OUTPUT`        | 7     | `{"text":"...","title":"..."}` — streaming agent output, throttled to 1/sec per task                   |
+| `DRAFT`         | 8     | `{"title":"...","draft":{"text":"...","parse_mode":"markdown"}}` — emitted by the plugin's `send_draft`|
 
 ```swift
 api.on_task_event = { ctxPtr, taskIdPtr, eventType, eventJsonPtr in
@@ -376,7 +409,7 @@ private struct MyAPITool {
 
 ## Using Folder Context (Working Directory)
 
-When a user has a working directory selected in Work Mode, Osaurus automatically injects the folder context into tool payloads. This allows your plugin to resolve relative file paths.
+When a user has a working directory selected for a chat, Osaurus automatically injects the folder context into tool payloads. This allows your plugin to resolve relative file paths.
 
 ### Automatic Injection
 

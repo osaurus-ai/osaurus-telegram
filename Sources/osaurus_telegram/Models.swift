@@ -149,10 +149,31 @@ struct TaskOutputEvent: Decodable {
   let title: String?
 }
 
-struct TaskDraftEvent: Decodable {
+/// Payload for `OSR_TASK_EVENT_DRAFT`. The host nests `text` and `parse_mode`
+/// under a `draft` object (see Osaurus PLUGIN_AUTHORING.md, Draft section).
+struct TaskDraftPayload: Decodable {
   let text: String?
-  let title: String?
   let parse_mode: String?
+}
+
+struct TaskDraftEvent: Decodable {
+  let title: String?
+  let draft: TaskDraftPayload?
+}
+
+/// Single artifact entry in `complete` / `complete_stream` `shared_artifacts` array.
+struct SharedArtifact: Decodable {
+  let filename: String
+  let host_path: String?
+  let mime_type: String?
+  let size: Int?
+  let is_directory: Bool?
+  let description: String?
+}
+
+struct CompletionResultEnvelope: Decodable {
+  let shared_artifacts: [SharedArtifact]?
+  let error: String?
 }
 
 // MARK: - Artifact Payload

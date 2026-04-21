@@ -211,24 +211,6 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
         isPrivateChat: isPrivateChat, userId: senderId)
       return
     }
-
-    if text.hasPrefix("/work") {
-      let workPrompt = String(text.dropFirst(5)).trimmingCharacters(in: .whitespaces)
-      guard !workPrompt.isEmpty else {
-        _ = telegramSendMessage(
-          token: token, chatId: chatId,
-          text: "Usage: /work <prompt>\nExample: /work find me new restaurants in Irvine",
-          replyTo: message.message_id)
-        return
-      }
-      logDebug("handleMessage: /work prompt=\"\(String(workPrompt.prefix(100)))\"")
-      telegramSendChatAction(token: token, chatId: chatId)
-      dispatchWorkTask(
-        token: token, chatId: chatId, prompt: workPrompt, message: message,
-        isPrivateChat: isPrivateChat, senderName: senderName,
-        userId: senderId, agentAddress: agentAddress)
-      return
-    }
   }
 
   let prompt = buildPrompt(from: message)
@@ -248,31 +230,10 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
   {
     logDebug(
       "handleMessage: reply to task thread \(task.taskId) status=\(task.status)")
-    handleWorkThreadReply(
+    handleTaskThreadReply(
       token: token, chatId: chatId, prompt: prompt, message: message,
       task: task, isPrivateChat: isPrivateChat, senderName: senderName,
       userId: senderId, agentAddress: agentAddress)
-    return
-  }
-
-  if let pendingTask = DatabaseManager.getAwaitingClarification(
-    chatId: chatId, userId: isPrivateChat ? nil : senderId)
-  {
-    logDebug("handleMessage: found pending clarification for task \(pendingTask.taskId)")
-    if let clarify = hostAPI?.pointee.dispatch_clarify {
-      pendingTask.taskId.withCString { tid in
-        prompt.withCString { p in
-          clarify(tid, p)
-        }
-      }
-      logDebug("handleMessage: sent clarification response for task \(pendingTask.taskId)")
-    } else {
-      logWarn("handleMessage: dispatch_clarify not available, cannot respond to clarification")
-    }
-    DatabaseManager.updateTask(taskId: pendingTask.taskId, status: "running")
-    _ = telegramSendMessage(
-      token: token, chatId: chatId, text: "Got it, continuing",
-      replyTo: message.message_id)
     return
   }
 
@@ -295,16 +256,24 @@ private func handleMessage(ctx: PluginContext, message: TelegramMessage, agentAd
     return
   }
 
-  logDebug("handleMessage: -> work mode dispatch path (group chat)")
-  dispatchWorkTask(
+  logDebug("handleMessage: -> dispatch path (group chat)")
+  dispatchAgentTask(
     token: token, chatId: chatId, prompt: prompt, message: message,
     isPrivateChat: isPrivateChat, senderName: senderName,
     userId: senderId, agentAddress: agentAddress)
 }
 
-// MARK: - Work Mode Dispatch
+// MARK: - Agent Dispatch
 
-private func dispatchWorkTask(
+/// Builds a stable external session key for `dispatch()` so repeated turns from the
+/// same Telegram conversation reattach to one Osaurus session row in the sidebar.
+/// In groups we scope per user, so each participant gets their own thread.
+func sessionKey(chatId: String, userId: String?) -> String {
+  if let userId { return "telegram:chat-\(chatId):user-\(userId)" }
+  return "telegram:chat-\(chatId)"
+}
+
+private func dispatchAgentTask(
   token: String, chatId: String, prompt: String, message: TelegramMessage,
   isPrivateChat: Bool, senderName: String?, userId: String?, agentAddress: String?
 ) {
@@ -324,8 +293,8 @@ private func dispatchWorkTask(
 
   var dispatchPayload: [String: Any] = [
     "prompt": enrichedPrompt,
-    "mode": "work",
     "title": "Telegram: \(firstLine)",
+    "external_session_key": sessionKey(chatId: chatId, userId: userId),
   ]
   if let agentAddress { dispatchPayload["agent_address"] = agentAddress }
   guard let dispatchJSON = makeJSONString(dispatchPayload) else {
@@ -333,7 +302,7 @@ private func dispatchWorkTask(
     return
   }
 
-  logDebug("dispatchWorkTask: payload=\(String(dispatchJSON.prefix(300)))")
+  logDebug("dispatchAgentTask: payload=\(String(dispatchJSON.prefix(300)))")
 
   let dispatchResultStr: String? = dispatchJSON.withCString { ptr in
     guard let resultPtr = dispatch(ptr) else { return nil }
@@ -345,7 +314,7 @@ private func dispatchWorkTask(
     return
   }
 
-  logDebug("dispatchWorkTask: result=\(String(resultStr.prefix(300)))")
+  logDebug("dispatchAgentTask: result=\(String(resultStr.prefix(300)))")
 
   guard let dispatchResult = parseJSON(resultStr, as: DispatchResponse.self),
     let taskId = dispatchResult.id
@@ -359,7 +328,7 @@ private func dispatchWorkTask(
 
   DatabaseManager.insertTask(
     taskId: taskId, chatId: chatId, messageId: message.message_id, userId: userId)
-  logDebug("dispatchWorkTask: inserted task \(taskId) for chat \(chatId) user \(userId ?? "nil")")
+  logDebug("dispatchAgentTask: inserted task \(taskId) for chat \(chatId) user \(userId ?? "nil")")
 
   let sendTypingEnabled = configGet("send_typing") != "false"
   if sendTypingEnabled && !isPrivateChat {
@@ -368,128 +337,48 @@ private func dispatchWorkTask(
       replyTo: message.message_id)
     {
       DatabaseManager.updateTask(taskId: taskId, statusMsgId: statusMsgId)
-      logDebug("dispatchWorkTask: created status message \(statusMsgId) for task \(taskId)")
+      logDebug("dispatchAgentTask: created status message \(statusMsgId) for task \(taskId)")
     } else {
-      logWarn("dispatchWorkTask: failed to send status message for task \(taskId)")
+      logWarn("dispatchAgentTask: failed to send status message for task \(taskId)")
     }
   }
 
   logInfo("Dispatched task \(taskId) for chat \(chatId)")
 }
 
-// MARK: - Work Thread Reply
+// MARK: - Task Thread Reply
 
-private func handleWorkThreadReply(
+/// Handles a Telegram reply addressed to a previous agent message.
+///
+/// - If the task is still `running`, soft-interrupt it with the new prompt so
+///   the agent reroutes mid-flight (`dispatch_interrupt` is still supported).
+/// - Otherwise (completed/failed/cancelled/awaiting_clarification), fire a
+///   fresh `dispatch()` with the same `external_session_key`. The host
+///   reattaches to the existing session row, preserving conversation context.
+///   This replaces the deprecated `dispatch_add_issue` and `dispatch_clarify`
+///   paths, which are now no-ops.
+private func handleTaskThreadReply(
   token: String, chatId: String, prompt: String, message: TelegramMessage,
   task: TaskRow, isPrivateChat: Bool, senderName: String?, userId: String?,
   agentAddress: String?
 ) {
-  switch task.status {
-  case "awaiting_clarification":
-    clarifyTask(taskId: task.taskId, response: prompt)
-    DatabaseManager.updateTask(taskId: task.taskId, status: "running")
-    _ = telegramSendMessage(
-      token: token, chatId: chatId, text: "Got it, continuing",
-      replyTo: message.message_id)
-
-  case "running":
-    interruptRunningTask(taskId: task.taskId, prompt: prompt)
-    DatabaseManager.updateTask(taskId: task.taskId, status: "running")
+  if task.status == "running", let interrupt = hostAPI?.pointee.dispatch_interrupt {
+    logDebug("handleTaskThreadReply: interrupting running task \(task.taskId)")
+    task.taskId.withCString { tid in
+      prompt.withCString { p in interrupt(tid, p) }
+    }
     _ = telegramSendMessage(
       token: token, chatId: chatId, text: "Got it, redirecting",
       replyTo: message.message_id)
-
-  default:
-    resumeEndedTask(
-      token: token, chatId: chatId, prompt: prompt, message: message,
-      task: task, isPrivateChat: isPrivateChat, senderName: senderName,
-      userId: userId, agentAddress: agentAddress)
-  }
-}
-
-private func clarifyTask(taskId: String, response: String) {
-  logDebug("clarifyTask: \(taskId)")
-  guard let clarify = hostAPI?.pointee.dispatch_clarify else {
-    logWarn("clarifyTask: dispatch_clarify not available")
-    return
-  }
-  taskId.withCString { tid in
-    response.withCString { r in clarify(tid, r) }
-  }
-}
-
-private func interruptRunningTask(taskId: String, prompt: String) {
-  logDebug("interruptRunningTask: \(taskId)")
-  if let interrupt = hostAPI?.pointee.dispatch_interrupt {
-    taskId.withCString { tid in
-      prompt.withCString { p in interrupt(tid, p) }
-    }
-  } else {
-    logDebug("interruptRunningTask: fallback to clarify")
-    clarifyTask(taskId: taskId, response: prompt)
-  }
-}
-
-private func resumeEndedTask(
-  token: String, chatId: String, prompt: String, message: TelegramMessage,
-  task: TaskRow, isPrivateChat: Bool, senderName: String?, userId: String?,
-  agentAddress: String?
-) {
-  logDebug("resumeEndedTask: adding issue to \(task.status) task \(task.taskId)")
-
-  guard let addIssue = hostAPI?.pointee.dispatch_add_issue else {
-    logWarn("resumeEndedTask: dispatch_add_issue not available, falling back")
-    fallbackToNewDispatch(
-      token: token, chatId: chatId, prompt: prompt, message: message,
-      task: task, isPrivateChat: isPrivateChat, senderName: senderName,
-      userId: userId, agentAddress: agentAddress)
     return
   }
 
-  let issuePayload: [String: Any] = [
-    "title": String(prompt.prefix(60)),
-    "description": prompt,
-  ]
-  guard let issueJSON = makeJSONString(issuePayload) else {
-    logError("resumeEndedTask: failed to build issue JSON")
-    return
-  }
-
-  let resultStr: String? = task.taskId.withCString { tid in
-    issueJSON.withCString { payload in
-      guard let resultPtr = addIssue(tid, payload) else { return nil }
-      return String(cString: resultPtr)
-    }
-  }
-
-  guard let resultStr else {
-    logWarn("resumeEndedTask: dispatch_add_issue returned nil, falling back")
-    fallbackToNewDispatch(
-      token: token, chatId: chatId, prompt: prompt, message: message,
-      task: task, isPrivateChat: isPrivateChat, senderName: senderName,
-      userId: userId, agentAddress: agentAddress)
-    return
-  }
-
-  logDebug("resumeEndedTask: result=\(String(resultStr.prefix(200)))")
-  _ = telegramSendMessage(
-    token: token, chatId: chatId, text: "\u{23F3} Resuming task...",
-    replyTo: message.message_id)
-  DatabaseManager.updateTask(taskId: task.taskId, status: "running")
-}
-
-private func fallbackToNewDispatch(
-  token: String, chatId: String, prompt: String, message: TelegramMessage,
-  task: TaskRow, isPrivateChat: Bool, senderName: String?, userId: String?,
-  agentAddress: String?
-) {
-  var enrichedPrompt = prompt
-  if let summary = task.summary, !summary.isEmpty {
-    enrichedPrompt = "Follow-up on previous task: \(summary)\n\nUser asked: \(prompt)"
-  }
+  logDebug(
+    "handleTaskThreadReply: redispatching as new turn in same session for task \(task.taskId) (status=\(task.status))"
+  )
   telegramSendChatAction(token: token, chatId: chatId)
-  dispatchWorkTask(
-    token: token, chatId: chatId, prompt: enrichedPrompt, message: message,
+  dispatchAgentTask(
+    token: token, chatId: chatId, prompt: prompt, message: message,
     isPrivateChat: isPrivateChat, senderName: senderName,
     userId: userId, agentAddress: agentAddress)
 }
@@ -825,17 +714,22 @@ private func handleChatModeStreaming(
     }
 
     var streamError: String?
+    var sharedArtifacts: [SharedArtifact] = []
     if let result {
       let resultStr = String(cString: result)
       free(UnsafeMutableRawPointer(mutating: result))
       logDebug(
         "handleChatModeStreaming: complete_stream returned: \(String(resultStr.prefix(300)))")
-      if let resultData = resultStr.data(using: .utf8),
-        let resultJSON = try? JSONSerialization.jsonObject(with: resultData) as? [String: Any],
-        let errorMsg = resultJSON["error"] as? String
-      {
-        logError("Streaming inference error: \(errorMsg)")
-        streamError = errorMsg
+      if let envelope = parseJSON(resultStr, as: CompletionResultEnvelope.self) {
+        if let errorMsg = envelope.error {
+          logError("Streaming inference error: \(errorMsg)")
+          streamError = errorMsg
+        }
+        if let artifacts = envelope.shared_artifacts, !artifacts.isEmpty {
+          sharedArtifacts = artifacts
+          logDebug(
+            "handleChatModeStreaming: response includes \(artifacts.count) shared artifact(s)")
+        }
       }
     } else {
       logDebug("handleChatModeStreaming: complete_stream returned nil (no error object)")
@@ -883,77 +777,99 @@ private func handleChatModeStreaming(
 
     Unmanaged<ChatStreamState>.fromOpaque(statePtr).release()
 
+    if !sharedArtifacts.isEmpty {
+      uploadSharedArtifacts(
+        ctx: ctx, token: token, chatId: chatId,
+        artifacts: sharedArtifacts, replyTo: messageId)
+    }
+
     logInfo("Chat mode streaming complete for chat \(chatId)")
+  }
+}
+
+/// Uploads artifacts surfaced by the inference response directly to the
+/// originating chat. Preferred over the `invoke(type: "artifact")` callback
+/// fallback because we know exactly which chat triggered the inference call,
+/// rather than relying on a "last active chat" heuristic.
+private func uploadSharedArtifacts(
+  ctx: PluginContext? = nil,
+  token: String, chatId: String, artifacts: [SharedArtifact], replyTo: Int?
+) {
+  guard configGet("auto_upload_artifacts") != "false" else {
+    logDebug("uploadSharedArtifacts: auto_upload_artifacts disabled, skipping")
+    return
+  }
+
+  for artifact in artifacts {
+    if artifact.is_directory == true {
+      logDebug("uploadSharedArtifacts: skipping directory \(artifact.filename)")
+      continue
+    }
+    guard let path = artifact.host_path, !path.isEmpty else {
+      logDebug("uploadSharedArtifacts: missing host_path for \(artifact.filename)")
+      continue
+    }
+    if let ctx, ctx.claimArtifactUpload(path) {
+      logDebug("uploadSharedArtifacts: \(artifact.filename) already uploaded, skipping")
+      continue
+    }
+
+    let file: HostFileResult
+    switch readHostFile(path: path) {
+    case .success(let f):
+      file = f
+    case .failure(let error):
+      logError("uploadSharedArtifacts: \(artifact.filename) read failed: \(error)")
+      continue
+    }
+
+    let mimeType = artifact.mime_type ?? file.mimeType
+    guard
+      let result = uploadFileToTelegram(
+        token: token, chatId: chatId,
+        fileData: file.data, filename: artifact.filename, mimeType: mimeType,
+        caption: artifact.description, replyTo: replyTo)
+    else {
+      logError("uploadSharedArtifacts: failed to upload \(artifact.filename)")
+      continue
+    }
+
+    DatabaseManager.insertMessage(
+      chatId: chatId,
+      messageId: result.messageId,
+      direction: "out",
+      senderId: nil,
+      senderName: "Agent",
+      text: artifact.description ?? artifact.filename,
+      mediaType: result.isPhoto ? "photo" : "document",
+      mediaFileId: nil,
+      taskId: nil
+    )
+    logInfo(
+      "uploadSharedArtifacts: \(artifact.filename) uploaded to chat \(chatId) as message \(result.messageId)"
+    )
   }
 }
 
 // MARK: - Callback Handler
 
+/// Acknowledges legacy clarify inline-keyboard taps from older messages.
+/// New clarification events no longer ship inline keyboards (the agent's
+/// `clarify` intercept surfaces the question inline; the user's reply is
+/// routed back via `handleTaskThreadReply`), but old chat history may still
+/// contain pre-deprecation buttons. Just ack them so Telegram clears the
+/// loading spinner.
 private func handleCallback(ctx: PluginContext, query: TelegramCallbackQuery) {
   logDebug("handleCallback: callbackId=\(query.id) data=\(query.data ?? "nil")")
 
-  guard let data = query.data, data.hasPrefix("clarify:") else {
-    logWarn("Callback query with unrecognized data: \(query.data ?? "nil")")
-    return
-  }
-
-  let parts = data.split(separator: ":", maxSplits: 2)
-  guard parts.count == 3,
-    let optionIndex = Int(parts[2])
-  else {
-    logWarn("Malformed clarify callback data: \(data)")
-    return
-  }
-
-  let taskId = String(parts[1])
-  logDebug("handleCallback: taskId=\(taskId) optionIndex=\(optionIndex)")
-
-  guard let task = DatabaseManager.getTask(taskId: taskId) else {
-    logWarn("Callback for unknown task: \(taskId)")
-    return
-  }
-
   guard let token = ctx.botToken else {
-    logWarn("handleCallback: no bot token, cannot process callback for task \(taskId)")
+    logWarn("handleCallback: no bot token, cannot ack callback")
     return
-  }
-
-  var selectedText = "Option \(optionIndex + 1)"
-  if let optionsJSON = task.clarificationOptions,
-    let optionsData = optionsJSON.data(using: .utf8),
-    let options = try? JSONSerialization.jsonObject(with: optionsData) as? [String],
-    optionIndex < options.count
-  {
-    selectedText = options[optionIndex]
-  }
-  logDebug("handleCallback: selectedText=\"\(selectedText)\"")
-
-  if let clarify = hostAPI?.pointee.dispatch_clarify {
-    taskId.withCString { tid in
-      selectedText.withCString { sel in
-        clarify(tid, sel)
-      }
-    }
-    logDebug("handleCallback: sent clarification response to host")
-  } else {
-    logWarn("handleCallback: dispatch_clarify not available, clarification not sent to host")
   }
 
   telegramAnswerCallbackQuery(
-    token: token, callbackQueryId: query.id, text: "Selected: \(selectedText)")
-
-  if let message = query.message {
-    let msgChatId = "\(message.chat.id)"
-    _ = telegramEditMessage(
-      token: token,
-      chatId: msgChatId,
-      messageId: message.message_id,
-      text: "\u{2705} \(selectedText)"
-    )
-  }
-
-  DatabaseManager.updateTask(taskId: taskId, status: "running", clarificationOptions: nil)
-  logDebug("handleCallback: task \(taskId) updated to running")
+    token: token, callbackQueryId: query.id,
+    text: "Reply to the agent's message to continue.")
 }
 
 // MARK: - Reaction Handler
@@ -1061,6 +977,12 @@ func handleArtifactShare(ctx: PluginContext, payload: String) -> String {
   if artifact.is_directory == true {
     logDebug("handleArtifactShare: skipping directory artifact \(artifact.filename)")
     return "{\"skipped\":true}"
+  }
+
+  if ctx.claimArtifactUpload(artifact.host_path) {
+    logDebug(
+      "handleArtifactShare: \(artifact.filename) already uploaded via shared_artifacts, skipping")
+    return "{\"skipped\":true,\"reason\":\"already_uploaded\"}"
   }
 
   guard let chatId = DatabaseManager.getLastActiveChatId() ?? ctx.activeStreamingChatId else {

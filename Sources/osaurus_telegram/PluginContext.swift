@@ -30,6 +30,27 @@ final class PluginContext: @unchecked Sendable {
   var taskDraftStates: [String: TaskDraftState] = [:]
   var taskStreamStates: [String: TaskStreamState] = [:]
 
+  /// Host paths already uploaded to Telegram. Prevents the artifact-handler
+  /// `invoke(type: "artifact")` callback from re-uploading files that were
+  /// also surfaced through `complete_stream`'s `shared_artifacts` array.
+  private var uploadedArtifactPaths = Set<String>()
+  private let uploadedArtifactPathsLock = NSLock()
+
+  func markArtifactUploaded(_ path: String) {
+    uploadedArtifactPathsLock.lock()
+    defer { uploadedArtifactPathsLock.unlock() }
+    uploadedArtifactPaths.insert(path)
+  }
+
+  /// Returns true if the artifact at `path` was already uploaded, otherwise
+  /// inserts and returns false. Atomic — safe to call from concurrent invoke
+  /// callbacks.
+  func claimArtifactUpload(_ path: String) -> Bool {
+    uploadedArtifactPathsLock.lock()
+    defer { uploadedArtifactPathsLock.unlock() }
+    return uploadedArtifactPaths.insert(path).inserted == false
+  }
+
   private var draftPingTimer: DispatchSourceTimer?
 
   let listChatsTool = TelegramListChatsTool()
