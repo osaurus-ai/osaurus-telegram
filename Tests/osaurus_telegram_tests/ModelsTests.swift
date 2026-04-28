@@ -328,28 +328,27 @@ struct TaskEventPayloadTests {
   @Test("Decodes TaskDraftEvent")
   func draftEvent() throws {
     let json =
-      "{\"text\":\"Here is a draft response...\",\"title\":\"Draft\",\"parse_mode\":\"HTML\"}"
+      "{\"title\":\"Draft\",\"draft\":{\"text\":\"Here is a draft response...\",\"parse_mode\":\"HTML\"}}"
     let event = try #require(parseJSON(json, as: TaskDraftEvent.self))
-    #expect(event.text == "Here is a draft response...")
     #expect(event.title == "Draft")
-    #expect(event.parse_mode == "HTML")
+    #expect(event.draft?.text == "Here is a draft response...")
+    #expect(event.draft?.parse_mode == "HTML")
   }
 
   @Test("Decodes TaskDraftEvent with minimal fields")
   func draftEventMinimal() throws {
-    let json = "{\"text\":\"Some draft text\"}"
+    let json = "{\"draft\":{\"text\":\"Some draft text\"}}"
     let event = try #require(parseJSON(json, as: TaskDraftEvent.self))
-    #expect(event.text == "Some draft text")
     #expect(event.title == nil)
-    #expect(event.parse_mode == nil)
+    #expect(event.draft?.text == "Some draft text")
+    #expect(event.draft?.parse_mode == nil)
   }
 
   @Test("Decodes empty TaskDraftEvent")
   func draftEventEmpty() throws {
     let event = try #require(parseJSON("{}", as: TaskDraftEvent.self))
-    #expect(event.text == nil)
     #expect(event.title == nil)
-    #expect(event.parse_mode == nil)
+    #expect(event.draft == nil)
   }
 
   @Test("Handles missing optional fields gracefully")
