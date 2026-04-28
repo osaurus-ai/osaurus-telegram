@@ -216,15 +216,16 @@ struct ChatStreamStateTests {
 
   @Test("Initializes with empty accumulated text and nil tool name")
   func initialState() {
-    let state = ChatStreamState(token: "tok", chatId: "123", draftId: 1)
+    let state = ChatStreamState(token: "tok", chatId: "123", messageId: 10, draftId: 1)
     #expect(state.accumulated == "")
     #expect(state.lastFlushLength == 0)
     #expect(state.currentToolName == nil)
+    #expect(state.messageId == 10)
   }
 
   @Test("Accumulates text")
   func accumulates() {
-    let state = ChatStreamState(token: "tok", chatId: "123", draftId: 1)
+    let state = ChatStreamState(token: "tok", chatId: "123", messageId: 10, draftId: 1)
     state.accumulated += "Hello"
     state.accumulated += " world"
     #expect(state.accumulated == "Hello world")
