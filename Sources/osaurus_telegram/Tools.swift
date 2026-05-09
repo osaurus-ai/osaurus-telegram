@@ -1,258 +1,228 @@
 import Foundation
 
-// MARK: - telegram_list_chats Tool
+// MARK: - Tool Handlers
+//
+// The agent owns user-visible content. These three tools are the primary
+// delivery path: every reply the user sees flows through here, gated by an
+// opaque `reply_token` so the agent never learns the chat_id (prompt
+// injection cannot redirect outbound messages).
+//
+// `invoke` is a synchronous C callback, but the Telegram POST goes through
+// `PerChatSendActor` to preserve send order across multiple `reply` calls
+// in one run. We bridge with a DispatchSemaphore so the synchronous
+// callback can block briefly until the network call returns.
 
-struct TelegramListChatsTool {
-  let name = "telegram_list_chats"
+// MARK: - Argument types
 
-  struct Args: Decodable {
-    let username: String?
-    let chat_type: String?
+private struct ReplyArgs: Decodable {
+  let reply_token: String
+  let text: String
+  let parse_mode: String?
+}
+
+private struct ReplyTypingArgs: Decodable {
+  let reply_token: String
+}
+
+private struct ReplyPhotoArgs: Decodable {
+  let reply_token: String
+  let photo_url: String
+  let caption: String?
+}
+
+// MARK: - reply
+
+func handleReply(ctx: PluginContext, payload: String) -> String {
+  runReplyTool(
+    ctx: ctx, payload: payload,
+    invalidArgsMessage: "reply requires reply_token and text"
+  ) { (args: ReplyArgs, token, binding) in
+    let clamped = String(args.text.prefix(4000))
+    let parseMode = args.parse_mode
+    return ReplyAction(
+      action: {
+        telegramSendMessage(
+          token: token, chatId: binding.chatId,
+          text: clamped, parseMode: parseMode)
+      },
+      successMarksReplied: true,
+      successSummary: "Sent message to user."
+    )
+  }
+}
+
+// MARK: - reply_typing
+
+func handleReplyTyping(ctx: PluginContext, payload: String) -> String {
+  runReplyTool(
+    ctx: ctx, payload: payload,
+    invalidArgsMessage: "reply_typing requires reply_token"
+  ) { (_: ReplyTypingArgs, token, binding) in
+    ReplyAction(
+      action: { telegramSendChatAction(token: token, chatId: binding.chatId) },
+      successMarksReplied: false,
+      successSummary: nil
+    )
+  }
+}
+
+// MARK: - reply_photo
+
+func handleReplyPhoto(ctx: PluginContext, payload: String) -> String {
+  runReplyTool(
+    ctx: ctx, payload: payload,
+    invalidArgsMessage: "reply_photo requires reply_token and photo_url"
+  ) { (args: ReplyPhotoArgs, token, binding) in
+    let photoURL = args.photo_url
+    let caption = args.caption
+    return ReplyAction(
+      action: {
+        telegramSendPhotoByURL(
+          token: token, chatId: binding.chatId,
+          photoURL: photoURL, caption: caption)
+      },
+      successMarksReplied: true,
+      successSummary: "Sent photo to user."
+    )
+  }
+}
+
+// MARK: - Shared reply pipeline
+//
+// All three tools share the same shape:
+//   1. parse args
+//   2. validate the binding (token expiry / blocked chat)
+//   3. require a configured bot token
+//   4. run the Telegram POST through the per-chat send actor
+//   5. on success, optionally mark the dispatch as having replied
+//   6. on failure, special-case "bot was blocked" so the agent stops trying
+// This helper captures that flow once.
+
+private struct ReplyAction {
+  /// Called inside the per-chat actor. Must be self-contained.
+  let action: @Sendable () -> (ok: Bool, description: String)
+  /// True when the action carries user-visible content (reply, reply_photo).
+  /// The typing-indicator does not flip the safety-net flag.
+  let successMarksReplied: Bool
+  /// Optional human-readable summary inserted into the success envelope.
+  let successSummary: String?
+}
+
+/// Tool name for envelope error context — anonymous "decode" otherwise.
+private func runReplyTool<Args: Decodable>(
+  ctx: PluginContext,
+  payload: String,
+  invalidArgsMessage: String,
+  build: (Args, _ botToken: String, _ binding: ActiveDispatchRow) -> ReplyAction
+) -> String {
+  guard let args = parseJSON(payload, as: Args.self) else {
+    return toolEnvelopeError("invalid_request", invalidArgsMessage)
   }
 
-  func run(args: String) -> String {
-    logDebug("telegram_list_chats: args=\(String(args.prefix(200)))")
-    let input = parseJSON(args, as: Args.self)
+  // Pull the reply_token off the args without forcing every caller to
+  // re-extract it. Decoded structs always carry it as `reply_token`.
+  guard let replyToken = readReplyToken(from: args) else {
+    return toolEnvelopeError("invalid_request", "missing reply_token")
+  }
 
-    let chats = DatabaseManager.getChats(
-      username: input?.username, chatType: input?.chat_type)
-    logDebug("telegram_list_chats: found \(chats.count) chats")
+  switch validateBinding(token: replyToken) {
+  case .failure(.staleToken):
+    return toolEnvelopeError(
+      "stale_token",
+      "Reply token expired or unknown. End the turn — a new token will arrive on the next user message."
+    )
+  case .failure(.chatBlocked):
+    return toolEnvelopeError("chat_blocked", "User has blocked the bot.")
+  case .success(let binding):
+    guard let token = ctx.botToken, !token.isEmpty else {
+      return toolEnvelopeError("not_configured", "Bot token not configured.")
+    }
 
-    var result: [String: Any] = ["chats": chats]
+    let plan = build(args, token, binding)
+    let response = runOnSendActor(chatId: binding.chatId, plan.action)
 
-    if chats.isEmpty, let username = input?.username, !username.isEmpty {
-      if let user = DatabaseManager.getUserByUsername(username) {
-        var resolved = user
-        resolved["note"] =
-          "No active chat found. You can try using this user_id as chat_id -- it will work if the user has previously started a conversation with the bot."
-        result["resolved_user"] = resolved
-        logDebug("telegram_list_chats: resolved user fallback for @\(username)")
+    if response.ok {
+      if plan.successMarksReplied {
+        DatabaseManager.markReplied(taskId: binding.taskId)
       }
+      return toolEnvelopeSuccess(["sent": true], summary: plan.successSummary)
     }
-
-    guard let data = try? JSONSerialization.data(withJSONObject: result),
-      let json = String(data: data, encoding: .utf8)
-    else {
-      return "{\"chats\":[]}"
-    }
-    return json
+    return mapTelegramFailure(response.description, binding: binding)
   }
 }
 
-// MARK: - telegram_get_chat_history Tool
+// MARK: - Validation + failure mapping
 
-struct TelegramGetChatHistoryTool {
-  let name = "telegram_get_chat_history"
-
-  struct Args: Decodable {
-    let chat_id: String
-    let limit: Int?
-  }
-
-  func run(args: String) -> String {
-    logDebug("telegram_get_chat_history: args=\(String(args.prefix(200)))")
-    guard let input = parseJSON(args, as: Args.self) else {
-      logWarn("telegram_get_chat_history: failed to parse args")
-      return "{\"error\":\"Invalid arguments\"}"
-    }
-
-    let limit = input.limit ?? 50
-    logDebug("telegram_get_chat_history: chat_id=\(input.chat_id) limit=\(limit)")
-    let result = DatabaseManager.getMessages(chatId: input.chat_id, limit: limit)
-    logDebug("telegram_get_chat_history: returned \(result.count) chars")
-    return result
-  }
+private enum BindingValidationFailure: Error {
+  case staleToken
+  case chatBlocked
 }
 
-// MARK: - telegram_send Tool
-
-struct TelegramSendTool {
-  let name = "telegram_send"
-
-  struct Args: Decodable {
-    let chat_id: String
-    let text: String
-    let reply_to_message_id: Int?
-    let reply_markup: AnyCodable?
+private func validateBinding(token: String) -> Result<ActiveDispatchRow, BindingValidationFailure> {
+  guard let binding = DatabaseManager.lookupBinding(token: token) else {
+    return .failure(.staleToken)
   }
-
-  func run(args: String) -> String {
-    logDebug("telegram_send: args=\(String(args.prefix(200)))")
-    guard let input = parseJSON(args, as: Args.self) else {
-      logWarn("telegram_send: failed to parse args")
-      return "{\"error\":\"Invalid arguments\"}"
-    }
-
-    logDebug(
-      "telegram_send: chat_id=\(input.chat_id) text=\(input.text.count) chars replyTo=\(input.reply_to_message_id.map { "\($0)" } ?? "nil")"
-    )
-
-    guard let token = configGet("bot_token"), !token.isEmpty else {
-      logWarn("telegram_send: no bot token configured")
-      return "{\"error\":\"Bot token not configured\"}"
-    }
-
-    guard
-      let msgId = telegramSendLongMessage(
-        token: token,
-        chatId: input.chat_id,
-        text: input.text,
-        replyTo: input.reply_to_message_id
-      )
-    else {
-      logError("telegram_send: failed to send message to chat \(input.chat_id)")
-      return "{\"error\":\"Failed to send message\"}"
-    }
-
-    DatabaseManager.insertMessage(
-      chatId: input.chat_id,
-      messageId: msgId,
-      direction: "out",
-      senderId: nil,
-      senderName: "Agent",
-      text: input.text,
-      mediaType: nil,
-      mediaFileId: nil,
-      taskId: nil
-    )
-
-    logDebug("telegram_send: sent message_id=\(msgId) to chat \(input.chat_id)")
-    return "{\"message_id\":\(msgId)}"
+  if binding.expiresAt <= Int(Date().timeIntervalSince1970) {
+    return .failure(.staleToken)
   }
+  if DatabaseManager.isChatBlocked(chatId: binding.chatId) {
+    return .failure(.chatBlocked)
+  }
+  return .success(binding)
 }
 
-// MARK: - telegram_send_file Tool
-
-struct TelegramSendFileTool {
-  let name = "telegram_send_file"
-
-  struct Args: Decodable {
-    let chat_id: String
-    let file_path: String
-    let caption: String?
-    let reply_to_message_id: Int?
+/// Translates a Telegram failure description into a tool envelope, with
+/// special handling for "bot was blocked by the user": flag the chat
+/// blocked, cancel the running task, and surface `chat_blocked` in-band so
+/// the agent stops trying.
+private func mapTelegramFailure(
+  _ description: String, binding: ActiveDispatchRow
+) -> String {
+  if description.lowercased().contains("bot was blocked") {
+    DatabaseManager.markChatBlocked(chatId: binding.chatId)
+    binding.taskId.withCString { hostAPI?.pointee.dispatch_cancel?($0) }
+    return toolEnvelopeError("chat_blocked", description)
   }
-
-  func run(args: String) -> String {
-    logDebug("telegram_send_file: args=\(String(args.prefix(200)))")
-    guard let input = parseJSON(args, as: Args.self) else {
-      logWarn("telegram_send_file: failed to parse args")
-      return "{\"error\":\"Invalid arguments\"}"
-    }
-
-    guard let token = configGet("bot_token"), !token.isEmpty else {
-      logWarn("telegram_send_file: no bot token configured")
-      return "{\"error\":\"Bot token not configured\"}"
-    }
-
-    let file: HostFileResult
-    switch readHostFile(path: input.file_path) {
-    case .success(let f):
-      file = f
-    case .failure(let error):
-      logError("telegram_send_file: \(error)")
-      return "{\"error\":\"Failed to read file\"}"
-    }
-
-    let filename = (input.file_path as NSString).lastPathComponent
-    logDebug(
-      "telegram_send_file: read \(file.data.count) bytes, mime=\(file.mimeType), filename=\(filename)"
-    )
-
-    guard
-      let result = uploadFileToTelegram(
-        token: token, chatId: input.chat_id,
-        fileData: file.data, filename: filename, mimeType: file.mimeType,
-        caption: input.caption, replyTo: input.reply_to_message_id)
-    else {
-      logError("telegram_send_file: failed to upload to chat \(input.chat_id)")
-      return "{\"error\":\"Failed to upload file\"}"
-    }
-
-    DatabaseManager.insertMessage(
-      chatId: input.chat_id,
-      messageId: result.messageId,
-      direction: "out",
-      senderId: nil,
-      senderName: "Agent",
-      text: input.caption,
-      mediaType: result.isPhoto ? "photo" : "document",
-      mediaFileId: nil,
-      taskId: nil
-    )
-
-    logDebug(
-      "telegram_send_file: uploaded message_id=\(result.messageId) to chat \(input.chat_id)")
-    return "{\"message_id\":\(result.messageId)}"
-  }
+  return toolEnvelopeError("telegram_api_error", description)
 }
 
-// MARK: - telegram_set_reaction Tool
-
-struct TelegramSetReactionTool {
-  let name = "telegram_set_reaction"
-
-  struct Args: Decodable {
-    let chat_id: String
-    let message_id: Int
-    let emoji: String?
+/// All tool arg structs name the field `reply_token`. Reflect once to pull
+/// it out so the generic `runReplyTool` doesn't need a protocol indirection.
+private func readReplyToken<Args>(from args: Args) -> String? {
+  let mirror = Mirror(reflecting: args)
+  for child in mirror.children where child.label == "reply_token" {
+    return child.value as? String
   }
-
-  func run(args: String) -> String {
-    logDebug("telegram_set_reaction: args=\(String(args.prefix(200)))")
-    guard let input = parseJSON(args, as: Args.self) else {
-      logWarn("telegram_set_reaction: failed to parse args")
-      return "{\"error\":\"Invalid arguments\"}"
-    }
-
-    guard let token = configGet("bot_token"), !token.isEmpty else {
-      logWarn("telegram_set_reaction: no bot token configured")
-      return "{\"error\":\"Bot token not configured\"}"
-    }
-
-    let ok = telegramSetMessageReaction(
-      token: token,
-      chatId: input.chat_id,
-      messageId: input.message_id,
-      emoji: input.emoji
-    )
-
-    if ok {
-      logDebug("telegram_set_reaction: set \(input.emoji ?? "none") on message \(input.message_id)")
-      return "{\"ok\":true}"
-    } else {
-      logWarn("telegram_set_reaction: failed for chat \(input.chat_id) message \(input.message_id)")
-      return "{\"error\":\"Failed to set reaction\"}"
-    }
-  }
+  return nil
 }
 
-// MARK: - AnyCodable Helper
+// MARK: - Sync ↔ async bridge
+//
+// The C `invoke` callback is synchronous, but `PerChatSendActor` enforces
+// send order via `await`. Bridge with a semaphore: spawn a Task that hits
+// the actor, signal back, and block until it completes. Network timeout
+// already caps total wait (telegramRequest uses 10s).
 
-/// A type-erased Codable wrapper for handling arbitrary JSON (e.g. reply_markup).
-struct AnyCodable: Decodable {
-  let value: Any
+private func runOnSendActor(
+  chatId: Int64,
+  _ work: @Sendable @escaping () -> (ok: Bool, description: String)
+) -> (ok: Bool, description: String) {
+  let semaphore = DispatchSemaphore(value: 0)
+  let box = ResultBox<(ok: Bool, description: String)>()
 
-  init(from decoder: Decoder) throws {
-    let container = try decoder.singleValueContainer()
-
-    if container.decodeNil() {
-      value = NSNull()
-    } else if let b = try? container.decode(Bool.self) {
-      value = b
-    } else if let i = try? container.decode(Int.self) {
-      value = i
-    } else if let d = try? container.decode(Double.self) {
-      value = d
-    } else if let s = try? container.decode(String.self) {
-      value = s
-    } else if let arr = try? container.decode([AnyCodable].self) {
-      value = arr.map { $0.value }
-    } else if let dict = try? container.decode([String: AnyCodable].self) {
-      value = dict.mapValues { $0.value }
-    } else {
-      throw DecodingError.dataCorruptedError(
-        in: container, debugDescription: "Unsupported JSON value")
-    }
+  Task {
+    box.value = await PerChatSendActor.shared.send(chatId: chatId, work)
+    semaphore.signal()
   }
+
+  semaphore.wait()
+  return box.value ?? (false, "internal: actor result missing")
+}
+
+/// One-shot value transfer across the Task ↔ semaphore boundary.
+/// Safety: the wait/signal pair on the semaphore establishes
+/// happens-before, so a single write before signal and a single read after
+/// wait are race-free without an additional lock.
+private final class ResultBox<T>: @unchecked Sendable {
+  var value: T?
 }

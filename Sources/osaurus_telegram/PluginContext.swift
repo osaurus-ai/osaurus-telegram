@@ -1,87 +1,16 @@
 import Foundation
 
-// MARK: - Types
-
-struct TaskStreamState {
-  var messageId: Int
-  var lastEditTime: Date
-}
-
-struct TaskDraftState {
-  var chatId: String
-  var toolCallCount: Int = 0
-  var latestToolName: String?
-  var recentMessages: [String] = []
-  var outputOffset: Int = 0
-  var newSegment: Bool = true
-}
-
 // MARK: - Plugin Context
 
+/// In-memory state cached from the host. Everything persistent lives in the
+/// per-plugin SQLite DB; this just avoids a `config_get` round-trip on the
+/// hot path.
 final class PluginContext: @unchecked Sendable {
   var botToken: String?
   var botId: String?
   var botUsername: String?
   var webhookSecret: String?
   var tunnelURL: String?
-
-  var activeStreamingChatId: String?
-  var taskOutputTexts: [String: String] = [:]
-  var taskDraftStates: [String: TaskDraftState] = [:]
-  var taskStreamStates: [String: TaskStreamState] = [:]
-
-  /// Host paths already uploaded to Telegram. Prevents the artifact-handler
-  /// `invoke(type: "artifact")` callback from re-uploading files that were
-  /// also surfaced through `complete_stream`'s `shared_artifacts` array.
-  private var uploadedArtifactPaths = Set<String>()
-  private let uploadedArtifactPathsLock = NSLock()
-
-  func markArtifactUploaded(_ path: String) {
-    uploadedArtifactPathsLock.lock()
-    defer { uploadedArtifactPathsLock.unlock() }
-    uploadedArtifactPaths.insert(path)
-  }
-
-  /// Returns true if the artifact at `path` was already uploaded, otherwise
-  /// inserts and returns false. Atomic — safe to call from concurrent invoke
-  /// callbacks.
-  func claimArtifactUpload(_ path: String) -> Bool {
-    uploadedArtifactPathsLock.lock()
-    defer { uploadedArtifactPathsLock.unlock() }
-    return uploadedArtifactPaths.insert(path).inserted == false
-  }
-
-  private var draftPingTimer: DispatchSourceTimer?
-
-  let listChatsTool = TelegramListChatsTool()
-  let chatHistoryTool = TelegramGetChatHistoryTool()
-  let telegramSendTool = TelegramSendTool()
-  let sendFileTool = TelegramSendFileTool()
-  let setReactionTool = TelegramSetReactionTool()
-
-  func startDraftPing() {
-    guard draftPingTimer == nil else { return }
-    let timer = DispatchSource.makeTimerSource(queue: .global())
-    timer.schedule(deadline: .now() + 5, repeating: 5)
-    timer.setEventHandler { [weak self] in
-      guard let ctx = self, let token = ctx.botToken else { return }
-      let drafts = ctx.taskDraftStates
-      if drafts.isEmpty {
-        ctx.stopDraftPing()
-        return
-      }
-      for (taskId, state) in drafts {
-        sendTaskDraft(ctx: ctx, token: token, chatId: state.chatId, taskId: taskId)
-      }
-    }
-    timer.resume()
-    draftPingTimer = timer
-  }
-
-  func stopDraftPing() {
-    draftPingTimer?.cancel()
-    draftPingTimer = nil
-  }
 }
 
 // MARK: - Lifecycle
@@ -89,46 +18,32 @@ final class PluginContext: @unchecked Sendable {
 func initPlugin(_ ctx: PluginContext) {
   logDebug("initPlugin: starting")
   DatabaseManager.initSchema()
-  configDelete("webhook_registered")
+  DatabaseManager.sweepExpiredDispatches()
+
+  if let secret = configGet("webhook_secret"), !secret.isEmpty {
+    ctx.webhookSecret = secret
+    logDebug("initPlugin: webhook_secret loaded from config")
+  } else {
+    let secret = randomHexString(bytes: 32)
+    configSet("webhook_secret", secret)
+    ctx.webhookSecret = secret
+    logInfo("initPlugin: generated new webhook_secret")
+  }
 
   if let token = configGet("bot_token"), !token.isEmpty {
     ctx.botToken = token
     logDebug("initPlugin: bot_token loaded from config (\(token.count) chars)")
   }
 
-  recoverActiveTasks(ctx: ctx)
+  if let tunnelURL = configGet("tunnel_url"), !tunnelURL.isEmpty {
+    ctx.tunnelURL = tunnelURL
+    logDebug("initPlugin: tunnel_url loaded from config")
+  }
 
   logInfo("initPlugin: ready, waiting for config delivery")
 }
 
-private func recoverActiveTasks(ctx: PluginContext) {
-  let dbTasks = DatabaseManager.getRunningTasks()
-  guard !dbTasks.isEmpty else { return }
-
-  guard let json = listActiveTasks(),
-    let data = json.data(using: .utf8),
-    let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-    let hostTasks = parsed["tasks"] as? [[String: Any]]
-  else {
-    logDebug("recoverActiveTasks: no active tasks from host")
-    return
-  }
-
-  let activeIds = Set(hostTasks.compactMap { $0["id"] as? String })
-
-  var recovered = 0
-  for task in dbTasks where activeIds.contains(task.taskId) {
-    if task.chatType == "private" {
-      ctx.taskDraftStates[task.taskId] = TaskDraftState(chatId: task.chatId)
-      recovered += 1
-    }
-  }
-
-  if recovered > 0 {
-    ctx.startDraftPing()
-    logInfo("recoverActiveTasks: recovered \(recovered) active task(s)")
-  }
-}
+// MARK: - Webhook Setup
 
 private func withRetry<T>(
   maxAttempts: Int = 3,
@@ -152,7 +67,6 @@ func setupWebhook(ctx: PluginContext, token: String, tunnelURL: String) {
   logDebug("setupWebhook: calling getMe to validate token")
   guard let botInfo = withRetry(operation: "getMe", block: { telegramGetMe(token: token) }) else {
     logError("Failed to validate bot token with getMe")
-    configDelete("webhook_registered")
     return
   }
 
@@ -160,12 +74,14 @@ func setupWebhook(ctx: PluginContext, token: String, tunnelURL: String) {
   ctx.botUsername = botInfo.username
   logInfo("Telegram bot @\(botInfo.username) (id: \(botInfo.botId)) validated")
 
-  let secret = randomHexString(bytes: 32)
-  ctx.webhookSecret = secret
-  logDebug("setupWebhook: generated new webhook secret")
+  guard let secret = ctx.webhookSecret, !secret.isEmpty else {
+    logError("setupWebhook: no webhook_secret available")
+    return
+  }
 
   let pluginId = "osaurus.telegram"
-  let webhookURL = "\(tunnelURL)/plugins/\(pluginId)/webhook"
+  let webhookURL =
+    tunnelURL.trimmingCharacters(in: .init(charactersIn: "/")) + "/plugins/\(pluginId)/webhook"
   logDebug("setupWebhook: registering webhook at \(webhookURL)")
 
   let registered =
@@ -173,11 +89,8 @@ func setupWebhook(ctx: PluginContext, token: String, tunnelURL: String) {
       telegramSetWebhook(token: token, url: webhookURL, secretToken: secret) ? true : nil
     } != nil
   if registered {
-    configSet("webhook_secret", secret)
-    configSet("webhook_registered", "true")
     logInfo("Webhook registered at \(webhookURL)")
   } else {
-    configDelete("webhook_registered")
     logError("Failed to register webhook at \(webhookURL)")
   }
 }
@@ -198,6 +111,14 @@ func onConfigChanged(ctx: PluginContext, key: String, value: String?) {
     }
     logDebug("onConfigChanged: tunnel_url + bot_token both available, registering webhook")
     setupWebhook(ctx: ctx, token: token, tunnelURL: newURL)
+    return
+  }
+
+  if key == "webhook_secret" {
+    if let v = value, !v.isEmpty {
+      ctx.webhookSecret = v
+      logDebug("onConfigChanged: webhook_secret refreshed")
+    }
     return
   }
 
@@ -222,10 +143,8 @@ func onConfigChanged(ctx: PluginContext, key: String, value: String?) {
   ctx.botToken = nil
   ctx.botId = nil
   ctx.botUsername = nil
-  ctx.webhookSecret = nil
 
   guard let newToken else {
-    configDelete("webhook_registered")
     logInfo("Bot token cleared")
     return
   }
@@ -241,10 +160,8 @@ func onConfigChanged(ctx: PluginContext, key: String, value: String?) {
 }
 
 func destroyPlugin(_ ctx: PluginContext) {
-  ctx.stopDraftPing()
   if let token = ctx.botToken, !token.isEmpty {
     _ = telegramDeleteWebhook(token: token)
     logInfo("Webhook deleted on destroy")
   }
-  configDelete("webhook_registered")
 }

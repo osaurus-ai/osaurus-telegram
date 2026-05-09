@@ -1,138 +1,246 @@
-import Foundation
-import Testing
+import XCTest
 
 @testable import osaurus_telegram
 
-// MARK: - AnyCodable
+final class ToolsTests: XCTestCase {
 
-@Suite("AnyCodable Decoding")
-struct AnyCodableTests {
+  private var ctx: PluginContext!
 
-  @Test("Decodes string value")
-  func decodesString() throws {
-    let json = "{\"value\":\"hello\"}"
-    struct Wrapper: Decodable { let value: AnyCodable }
-    let w = try #require(parseJSON(json, as: Wrapper.self))
-    #expect(w.value.value as? String == "hello")
+  override func setUp() {
+    super.setUp()
+    TestHost.install()
+    DatabaseManager.initSchema()
+    ctx = PluginContext()
+    ctx.botToken = "123:fake"
   }
 
-  @Test("Decodes integer value")
-  func decodesInt() throws {
-    let json = "{\"value\":42}"
-    struct Wrapper: Decodable { let value: AnyCodable }
-    let w = try #require(parseJSON(json, as: Wrapper.self))
-    #expect(w.value.value as? Int == 42)
+  override func tearDown() {
+    ctx = nil
+    TestHost.uninstall()
+    super.tearDown()
   }
 
-  @Test("Decodes boolean value")
-  func decodesBool() throws {
-    let json = "{\"value\":true}"
-    struct Wrapper: Decodable { let value: AnyCodable }
-    let w = try #require(parseJSON(json, as: Wrapper.self))
-    #expect(w.value.value as? Bool == true)
+  // MARK: helpers
+
+  private func parseEnvelope(_ s: String) -> [String: Any] {
+    let data = s.data(using: .utf8) ?? Data()
+    return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
   }
 
-  @Test("Decodes nested dictionary")
-  func decodesDict() throws {
-    let json = "{\"value\":{\"key\":\"val\",\"num\":1}}"
-    struct Wrapper: Decodable { let value: AnyCodable }
-    let w = try #require(parseJSON(json, as: Wrapper.self))
-    let dict = try #require(w.value.value as? [String: Any])
-    #expect(dict["key"] as? String == "val")
-    #expect(dict["num"] as? Int == 1)
+  /// Inserts an active dispatch row for a fresh chat and returns the token.
+  @discardableResult
+  private func makeBinding(
+    chatId: Int64 = 100,
+    taskId: String = "task-1",
+    expiresInSeconds: Int = 600
+  ) -> String {
+    _ = DatabaseManager.upsertChatSession(chatId: chatId)
+    let token = "TOKABC12"
+    DatabaseManager.insertActiveDispatch(
+      taskId: taskId, chatId: chatId, replyToken: token,
+      sessionId: "session-1",
+      expiresAt: Int(Date().timeIntervalSince1970) + expiresInSeconds)
+    return token
   }
 
-  @Test("Decodes array value")
-  func decodesArray() throws {
-    let json = "{\"value\":[1,2,3]}"
-    struct Wrapper: Decodable { let value: AnyCodable }
-    let w = try #require(parseJSON(json, as: Wrapper.self))
-    let arr = try #require(w.value.value as? [Any])
-    #expect(arr.count == 3)
+  private func setHTTPSuccess(messageId: Int = 1) {
+    TestHostGlobals.nextHttpResponse =
+      #"{"status":200,"body":"{\"ok\":true,\"result\":{\"message_id\":\#(messageId)}}"}"#
   }
 
-  @Test("Decodes null value")
-  func decodesNull() throws {
-    let json = "{\"value\":null}"
-    struct Wrapper: Decodable { let value: AnyCodable }
-    let w = try #require(parseJSON(json, as: Wrapper.self))
-    #expect(w.value.value is NSNull)
+  private func setHTTPBotWasBlocked() {
+    TestHostGlobals.nextHttpResponse =
+      #"{"status":403,"body":"{\"ok\":false,\"description\":\"Forbidden: bot was blocked by the user\"}"}"#
   }
 
-  @Test("Decodes inline keyboard reply_markup structure")
-  func decodesInlineKeyboard() throws {
-    let json = """
-      {
-        "chat_id": "123",
-        "text": "Pick one",
-        "reply_markup": {
-          "inline_keyboard": [
-            [{"text": "Option A", "callback_data": "a"}],
-            [{"text": "Option B", "callback_data": "b"}]
-          ]
-        }
-      }
-      """
-    let args = try #require(parseJSON(json, as: TelegramSendTool.Args.self))
-    #expect(args.chat_id == "123")
-    #expect(args.text == "Pick one")
-
-    let markup = try #require(args.reply_markup?.value as? [String: Any])
-    let keyboard = try #require(markup["inline_keyboard"] as? [[Any]])
-    #expect(keyboard.count == 2)
-  }
-}
-
-// MARK: - TelegramSendTool
-
-@Suite("TelegramSendTool")
-struct TelegramSendToolTests {
-
-  @Test("Returns error on invalid JSON args")
-  func invalidArgs() {
-    let tool = TelegramSendTool()
-    let result = tool.run(args: "not json")
-    #expect(result.contains("error"))
-    #expect(result.contains("Invalid arguments"))
+  private func setHTTPGenericError() {
+    TestHostGlobals.nextHttpResponse =
+      #"{"status":400,"body":"{\"ok\":false,\"description\":\"Bad Request: chat not found\"}"}"#
   }
 
-  @Test("Returns error when no bot token configured")
-  func noToken() {
-    // hostAPI is nil in tests, so configGet returns nil
-    let tool = TelegramSendTool()
-    let args = "{\"chat_id\":\"123\",\"text\":\"hello\"}"
-    let result = tool.run(args: args)
-    #expect(result.contains("error"))
-    #expect(result.contains("Bot token not configured"))
-  }
-}
+  // MARK: invalid args
 
-// MARK: - TelegramGetChatHistoryTool
-
-@Suite("TelegramGetChatHistoryTool")
-struct ChatHistoryToolTests {
-
-  @Test("Returns error on invalid args")
-  func invalidArgs() {
-    let tool = TelegramGetChatHistoryTool()
-    let result = tool.run(args: "bad")
-    #expect(result.contains("error"))
+  func testReplyRejectsInvalidJSON() {
+    let env = parseEnvelope(handleReply(ctx: ctx, payload: "not-json"))
+    XCTAssertEqual(env["ok"] as? Bool, false)
+    XCTAssertEqual(env["error"] as? String, "invalid_request")
   }
 
-  @Test("Returns empty array when no hostAPI")
-  func noHostAPI() {
-    // hostAPI is nil in tests, so db_query returns nil → "[]"
-    let tool = TelegramGetChatHistoryTool()
-    let args = "{\"chat_id\":\"123\"}"
-    let result = tool.run(args: args)
-    #expect(result == "[]")
+  func testReplyTypingRejectsMissingToken() {
+    let env = parseEnvelope(handleReplyTyping(ctx: ctx, payload: "{}"))
+    XCTAssertEqual(env["error"] as? String, "invalid_request")
   }
 
-  @Test("Respects default limit")
-  func defaultLimit() {
-    let tool = TelegramGetChatHistoryTool()
-    let args = "{\"chat_id\":\"123\"}"
-    // Just verify it parses and doesn't crash
-    _ = tool.run(args: args)
+  func testReplyPhotoRejectsMissingURL() {
+    let env = parseEnvelope(
+      handleReplyPhoto(ctx: ctx, payload: #"{"reply_token":"TOK"}"#))
+    XCTAssertEqual(env["error"] as? String, "invalid_request")
+  }
+
+  // MARK: stale token
+
+  func testReplyStaleTokenWhenUnknown() {
+    let env = parseEnvelope(
+      handleReply(
+        ctx: ctx,
+        payload: #"{"reply_token":"NOPE","text":"hi"}"#))
+    XCTAssertEqual(env["error"] as? String, "stale_token")
+  }
+
+  func testReplyStaleTokenWhenExpired() {
+    let token = makeBinding(expiresInSeconds: -10)
+    let env = parseEnvelope(
+      handleReply(
+        ctx: ctx,
+        payload: #"{"reply_token":"\#(token)","text":"hi"}"#))
+    XCTAssertEqual(env["error"] as? String, "stale_token")
+    XCTAssertTrue(TestHostGlobals.httpCalls.isEmpty, "no HTTP call on stale token")
+  }
+
+  // MARK: chat blocked (already flagged)
+
+  func testReplyChatBlockedWhenChatPreviouslyBlocked() {
+    let token = makeBinding(chatId: 200)
+    DatabaseManager.markChatBlocked(chatId: 200)
+    let env = parseEnvelope(
+      handleReply(
+        ctx: ctx,
+        payload: #"{"reply_token":"\#(token)","text":"hi"}"#))
+    XCTAssertEqual(env["error"] as? String, "chat_blocked")
+    XCTAssertTrue(TestHostGlobals.httpCalls.isEmpty)
+  }
+
+  // MARK: not configured
+
+  func testReplyFailsWhenBotTokenMissing() {
+    let token = makeBinding()
+    ctx.botToken = nil
+    let env = parseEnvelope(
+      handleReply(
+        ctx: ctx,
+        payload: #"{"reply_token":"\#(token)","text":"hi"}"#))
+    XCTAssertEqual(env["error"] as? String, "not_configured")
+  }
+
+  // MARK: success paths
+
+  func testReplySuccessSendsHTTPCallAndMarksReplied() {
+    let token = makeBinding(taskId: "task-success")
+    setHTTPSuccess()
+
+    let env = parseEnvelope(
+      handleReply(
+        ctx: ctx,
+        payload: #"{"reply_token":"\#(token)","text":"hello world"}"#))
+
+    XCTAssertEqual(env["ok"] as? Bool, true)
+    XCTAssertEqual((env["data"] as? [String: Any])?["sent"] as? Bool, true)
+    XCTAssertEqual(env["summary"] as? String, "Sent message to user.")
+    XCTAssertTrue(DatabaseManager.hasReplied(taskId: "task-success"))
+    XCTAssertEqual(TestHostGlobals.httpCalls.count, 1)
+    let call = TestHostGlobals.httpCalls[0]
+    XCTAssertEqual(call["method"] as? String, "POST")
+    XCTAssertTrue((call["url"] as? String ?? "").contains("/sendMessage"))
+  }
+
+  func testReplyTypingSuccessDoesNotMarkReplied() {
+    let token = makeBinding(taskId: "task-typing")
+    setHTTPSuccess()
+
+    let env = parseEnvelope(
+      handleReplyTyping(
+        ctx: ctx, payload: #"{"reply_token":"\#(token)"}"#))
+
+    XCTAssertEqual(env["ok"] as? Bool, true)
+    XCTAssertFalse(
+      DatabaseManager.hasReplied(taskId: "task-typing"),
+      "typing-only must not flip the safety-net flag")
+    XCTAssertEqual(TestHostGlobals.httpCalls.count, 1)
+    let call = TestHostGlobals.httpCalls[0]
+    XCTAssertTrue((call["url"] as? String ?? "").contains("/sendChatAction"))
+  }
+
+  func testReplyPhotoSuccess() {
+    let token = makeBinding(taskId: "task-photo")
+    setHTTPSuccess()
+
+    let env = parseEnvelope(
+      handleReplyPhoto(
+        ctx: ctx,
+        payload:
+          #"{"reply_token":"\#(token)","photo_url":"https://example.com/p.jpg","caption":"cap"}"#))
+
+    XCTAssertEqual(env["ok"] as? Bool, true)
+    XCTAssertTrue(DatabaseManager.hasReplied(taskId: "task-photo"))
+    let call = TestHostGlobals.httpCalls[0]
+    XCTAssertTrue((call["url"] as? String ?? "").contains("/sendPhoto"))
+  }
+
+  func testReplyClampsLongTextToFourThousandChars() {
+    let token = makeBinding(taskId: "task-long")
+    setHTTPSuccess()
+
+    let longText = String(repeating: "x", count: 5_000)
+    let payload: [String: Any] = ["reply_token": token, "text": longText]
+    let payloadJSON =
+      String(data: try! JSONSerialization.data(withJSONObject: payload), encoding: .utf8)!
+
+    _ = handleReply(ctx: ctx, payload: payloadJSON)
+
+    let body = TestHostGlobals.httpCalls[0]["body"] as? String ?? ""
+    let bodyObj = (try? JSONSerialization.jsonObject(with: Data(body.utf8))) as? [String: Any]
+    let sentText = bodyObj?["text"] as? String ?? ""
+    XCTAssertEqual(sentText.count, 4_000, "text must be clamped to 4000 chars")
+  }
+
+  // MARK: failure mapping
+
+  func testReplyMapsBotWasBlockedAndCancelsTask() {
+    let token = makeBinding(chatId: 300, taskId: "task-blocked")
+    setHTTPBotWasBlocked()
+
+    let env = parseEnvelope(
+      handleReply(
+        ctx: ctx,
+        payload: #"{"reply_token":"\#(token)","text":"hi"}"#))
+
+    XCTAssertEqual(env["error"] as? String, "chat_blocked")
+    XCTAssertTrue(DatabaseManager.isChatBlocked(chatId: 300))
+    XCTAssertEqual(TestHostGlobals.cancelCalls, ["task-blocked"])
+    XCTAssertFalse(
+      DatabaseManager.hasReplied(taskId: "task-blocked"),
+      "failed reply must not flip has_replied")
+  }
+
+  func testReplyMapsGenericTelegramError() {
+    let token = makeBinding(chatId: 400, taskId: "task-err")
+    setHTTPGenericError()
+
+    let env = parseEnvelope(
+      handleReply(
+        ctx: ctx,
+        payload: #"{"reply_token":"\#(token)","text":"hi"}"#))
+
+    XCTAssertEqual(env["error"] as? String, "telegram_api_error")
+    XCTAssertTrue(
+      (env["message"] as? String ?? "").contains("chat not found"),
+      "telegram description should propagate")
+    XCTAssertFalse(DatabaseManager.isChatBlocked(chatId: 400))
+    XCTAssertTrue(TestHostGlobals.cancelCalls.isEmpty)
+  }
+
+  // MARK: invoke dispatcher (smoke)
+
+  func testHandleReplyPassesParseModeThrough() {
+    let token = makeBinding(taskId: "task-pm")
+    setHTTPSuccess()
+
+    _ = handleReply(
+      ctx: ctx,
+      payload: #"{"reply_token":"\#(token)","text":"<b>hi</b>","parse_mode":"HTML"}"#)
+
+    let body = TestHostGlobals.httpCalls[0]["body"] as? String ?? ""
+    let bodyObj = (try? JSONSerialization.jsonObject(with: Data(body.utf8))) as? [String: Any]
+    XCTAssertEqual(bodyObj?["parse_mode"] as? String, "HTML")
   }
 }

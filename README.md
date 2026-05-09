@@ -1,161 +1,94 @@
 # Osaurus Telegram
 
-Connect Telegram chats to your Osaurus agents. Private chats stream conversational replies in real time using the host's unified agent loop (tools, sandbox, multi-step reasoning all included). Group chats dispatch each message as a background agent task that reattaches to a per-user session, so each participant has their own continuous thread.
+Conversational Telegram bot for Osaurus. Each Telegram chat becomes a continuous Osaurus session, and the agent talks to the user via reply tools — `handle_route` is just the entry point that mints a token and dispatches.
 
-## Features
-
-### Private chats — streaming agent loop
-
-Direct messages use the host's `complete_stream` inference API end-to-end.
-
-- **Token-by-token streaming** — Draft updates are pushed to Telegram so the user sees the response being typed out progressively.
-- **Tool calling + sandbox** — `tools: true` and `max_iterations` (default 10) are enabled, so the agent can run tools, write code, browse the web, etc., in the same chat turn.
-- **Conversation context** — The last 20 messages from the chat history are included.
-- **Immediate feedback** — A "Thinking..." draft appears instantly while the model generates its response, and reactions on the user's message track tool / writing / done states.
-
-### Group chats — dispatched per-user sessions
-
-In groups the plugin dispatches each message via `host->dispatch` with an `external_session_key` of `telegram:chat-<chatId>:user-<userId>`. Repeated messages from the same user reattach to one Osaurus session row in the sidebar, so each participant has a continuous thread the agent can reason over.
-
-- **Real-time progress** — The bot edits a status message ("⏳ Working on it...") with current activity and progress.
-- **Reply-to-thread interrupt** — Replying to an in-flight agent message soft-interrupts the running task with the new prompt (`dispatch_interrupt`). Replying to an ended agent message redispatches as the next turn in the same session.
-
-### Common features
-
-- **Unified clarification flow** — When the agent needs more info it just asks inline; the user replies normally and the answer is routed back as the next dispatch turn (the legacy inline-keyboard / `dispatch_clarify` round-trip has been removed in line with the deprecated host APIs).
-- **Artifact uploads** — Files produced by the agent during streaming are surfaced via the `complete_stream` response's `shared_artifacts` array and uploaded directly to the originating chat. Artifacts produced during dispatched tasks come through the artifact-handler invoke. Both paths dedupe so files aren't double-uploaded.
-- **User allowlisting** — Restrict which Telegram users can interact with your agent by configuring a comma-separated list of usernames (e.g. `@alice, @bob`). Leave blank to allow everyone.
-- **Message history** — Every inbound and outbound message is logged to a local SQLite database. Agents can query this history via the `telegram_get_chat_history` tool.
-- **Automatic webhook management** — The plugin registers and deregisters its Telegram webhook automatically when you configure or change the bot token.
-- **Secure webhook verification** — A random secret token is generated and verified on every incoming webhook request.
-
-## Conversation Examples
-
-### Streaming chat (private chat)
+## How it works
 
 ```
-You:   What's the difference between TCP and UDP?
-
-Bot:   TCP is a connection-oriented protocol that...  (streams in progressively)
-
-You:   Can you give me a simple analogy?
-
-Bot:   Think of TCP like a phone call — you dial,...   (streams in progressively)
+User → Telegram → /webhook  (verify secret, dedup update_id, mint reply_token, dispatch)
+                     ↓
+                  Agent (background dispatch with deterministic session_id)
+                     ↓
+                  reply / reply_typing / reply_photo  →  Telegram → User
 ```
 
-### Multi-step task in private chat
+The plugin is **agent-driven end-to-end**. Every user-visible message flows through tools the agent calls; `handle_route` only verifies the request and starts the run. Multi-message replies, status updates, and rich content all happen because the agent calls `reply` (or `reply_typing` / `reply_photo`) one or more times in a single run.
 
-The same streaming path runs the agent loop with tools enabled, so multi-step
-work happens in one chat turn:
+### Why reply tokens
 
-```
-You:   summarize the top 5 Hacker News stories today
+The agent never sees the real Telegram `chat_id`. The webhook handler mints a short opaque `reply_token` per turn, stores `(token → chat_id, task_id)` in a per-plugin SQLite row, and includes the token in the prompt header. The reply tool takes the token, the plugin's `invoke` looks up the chat. Tokens are unguessable, expire after 10 minutes, and are scoped to one chat — so prompt injection from web pages, RAG documents, or other untrusted input cannot redirect outbound messages.
 
-Bot:   👀 (reaction)
-Bot:   ⚙ (reaction — running web_search)
-Bot:   ✍ (reaction — writing)
-Bot:   Here are today's top 5 HN stories:
-       1. ...
-       2. ...
-Bot:   ✅ (reaction)
-```
+### Concurrency
 
-### Group chat — dispatched task
+If a new message arrives while a task is still running for the same chat, the plugin issues `dispatch_interrupt(prev_task, new_text)` (the host appends the user's text into the live session and stops the current stream) and dispatches a fresh turn against the same `session_id`. The agent reattaches with full context; the user gets one coherent answer with no races.
 
-```
-@alice in #general:  what time does the meeting start?
+## Tools (called by the agent)
 
-Bot (replying):  ⏳ Working on it...
-Bot (replying):  ⏳ Checking the calendar
-Bot (replying):  The kickoff meeting is at 3pm PT today.
-```
+| Tool | Description |
+| --- | --- |
+| `reply` | Send a text message. May be called multiple times per run. |
+| `reply_typing` | Show the Telegram "typing…" indicator (~5s). |
+| `reply_photo` | Send a photo by public URL with optional caption. |
 
-### Clarification — Agent asks a follow-up
-
-```
-You:   deploy the latest build
-
-Bot:   ❓ Which environment should I deploy to?
-       • Staging
-       • Production
-       • Dev
-
-You (reply): Staging
-
-Bot:   Deploying to staging... done! Build v2.3.1 is live.
-```
-
-## Setup
-
-### 1. Create a Telegram Bot
-
-1. Open Telegram and message [@BotFather](https://t.me/BotFather)
-2. Send `/newbot` and follow the prompts to choose a name and username
-3. Copy the **bot token** (e.g. `123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11`)
-
-### 2. Configure
-
-1. Open Osaurus and go to **Agents** settings (Cmd+Shift+M)
-2. Create or choose your Agent
-3. Find the **Telegram** plugin (make sure it's installed)
-4. Paste your bot token into the **Bot Token** field
-5. The plugin will automatically validate the token and register a webhook with Telegram
-
-### 3. Start Chatting
-
-Send a message to your bot in Telegram. In private chats you get a streaming conversational response with full tool access. In group chats, each message is dispatched as a per-user agent task that reattaches to the same Osaurus session on subsequent messages.
-
-## Bot Commands
-
-| Command   | Description                                                            |
-| --------- | ---------------------------------------------------------------------- |
-| `/start`  | Start the bot and show a welcome message                               |
-| `/clear`  | Clear conversation history and start fresh (per-user in group chats)   |
-| `/status` | Show the last 5 dispatched tasks for the current chat                  |
-| `/cancel` | Cancel the latest running task (or pass a task id: `/cancel <taskId>`) |
-
-To make these appear in Telegram's command menu, send `/setcommands` to [@BotFather](https://t.me/BotFather) and enter:
-
-```
-start - Start the bot
-clear - Clear conversation history
-status - Show recent agent tasks
-cancel - Cancel the latest running task
-```
-
-## Tools
-
-The plugin exposes the following tools that agents can call:
-
-| Tool                        | Description                                                                                                                                        |
-| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `telegram_list_chats`       | List known Telegram chats the bot has interacted with. Filter by username or chat type to discover chat IDs before sending.                        |
-| `telegram_get_chat_history` | Retrieve recent messages from the local message log for a given chat. Returns up to 200 messages with sender info, timestamps, and media metadata. |
-| `telegram_send`             | Send a message to a Telegram chat. Supports reply threading and inline keyboard markup.                                                            |
-| `telegram_send_file`        | Upload a photo or document from a `~/.osaurus/artifacts/` path to a chat, with optional caption.                                                   |
-| `telegram_set_reaction`     | Add or remove an emoji reaction on a Telegram message.                                                                                             |
+All three take a `reply_token` (passed verbatim from the user-message header) plus their own arguments.
 
 ## Routes
 
-| Route      | Method | Auth     | Description                                                                            |
-| ---------- | ------ | -------- | -------------------------------------------------------------------------------------- |
-| `/webhook` | POST   | `verify` | Telegram Bot API webhook endpoint. Validates the secret token header on every request. |
-| `/health`  | GET    | `owner`  | Health check. Returns webhook registration status and bot username as JSON.            |
+| Route | Method | Auth | Notes |
+| --- | --- | --- | --- |
+| `/webhook` | POST | `verify` | Telegram delivery endpoint. `tunnel_exposed: true` so it's reachable from Telegram. The plugin still verifies the `X-Telegram-Bot-Api-Secret-Token` header in constant time. |
+
+## Bot commands
+
+| Command | Description |
+| --- | --- |
+| `/reset` | Bumps the chat's session salt and cancels any in-flight task. The next message lands in a fresh transcript. |
+
+## Setup
+
+### 1. Create a Telegram bot
+
+1. Message [@BotFather](https://t.me/BotFather) and send `/newbot`.
+2. Copy the **bot token** (e.g. `123456:ABC-DEF…`).
+
+### 2. Configure
+
+1. Open Osaurus → Agents settings, choose your agent, and find the Telegram plugin.
+2. Paste the bot token into **Bot Token**.
+3. The plugin auto-generates a `webhook_secret` on first run and registers the webhook with Telegram as soon as both `bot_token` and the agent's `tunnel_url` are available.
+
+### 3. Chat
+
+Send a message to your bot. The agent receives it as the next turn in a continuous session and replies via the `reply` tool.
+
+## Storage
+
+The plugin keeps three tables in its per-plugin SQLite DB:
+
+- `chat_sessions` — one row per chat (session salt, blocked flag, timestamps).
+- `active_dispatches` — at most one row per chat (UNIQUE chat_id) bound to a `reply_token`. Cleared on COMPLETED/FAILED.
+- `seen_updates` — idempotency cache for Telegram retries, TTL-pruned to 24 hours.
+
+## Plugin-owned vs agent-owned messages
+
+| Message | Sent by |
+| --- | --- |
+| Conversational reply | Agent (`reply` tool) |
+| Typing indicator | Agent (`reply_typing` tool) |
+| Photo | Agent (`reply_photo` tool) |
+| Rate-limit apology | Plugin (`handle_route`) |
+| `/reset` confirmation | Plugin (`handle_route`) |
+| Safety-net "(done)" / "Sorry, something went wrong" | Plugin (`on_task_event`, only if the agent never called `reply`) |
+
+The agent owns content; the plugin owns meta-messages. Plugin-owned posts should be rare in healthy runs.
 
 ## Configuration
 
-| Key                    | Type   | Default | Description                                                                                                          |
-| ---------------------- | ------ | ------- | -------------------------------------------------------------------------------------------------------------------- |
-| `bot_token`            | secret | —       | Telegram bot token from [@BotFather](https://t.me/BotFather). Required.                                              |
-| `allowed_users`        | text   | (empty) | Comma-separated Telegram usernames (e.g. `@alice, @bob`). Leave blank to allow everyone.                             |
-| `send_typing`          | toggle | on      | Show a typing indicator while the agent works in group chats.                                                        |
-| `enable_tools`         | toggle | on      | Allow the agent to use tools during streaming chat.                                                                  |
-| `enable_sandbox`       | toggle | on      | Allow the agent to execute code and read/write files in the sandboxed environment.                                   |
-| `enable_preflight`     | toggle | off     | Run a preflight capability search before inference to auto-discover relevant tools.                                  |
-| `max_iterations`       | number | 10      | Maximum agentic loop iterations for streaming chat (1–30).                                                           |
-| `auto_upload_artifacts`| toggle | on      | Automatically upload files produced by the agent to the originating chat.                                            |
-| `system_prompt`        | text   | (empty) | Optional extra system prompt appended to the default Telegram chat instructions.                                     |
-| `tool_status_messages` | text   | (empty) | JSON object mapping tool-name prefixes to friendly status labels shown in draft updates.                             |
+| Key | Type | Notes |
+| --- | --- | --- |
+| `bot_token` | secret | Telegram bot token from [@BotFather](https://t.me/BotFather). Required. |
+| `webhook_secret` | secret | Generated automatically on first run. Sent back by Telegram in `X-Telegram-Bot-Api-Secret-Token`. |
+| `tunnel_url` | host-managed | Pushed to the plugin by Osaurus when a tunnel is active; webhook is registered automatically once `bot_token` and `tunnel_url` are both present. |
 
 ## License
 

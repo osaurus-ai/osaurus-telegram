@@ -1,317 +1,188 @@
-import Foundation
-import Testing
+import XCTest
 
 @testable import osaurus_telegram
 
-// MARK: - Mock Host API
+final class DatabaseTests: XCTestCase {
 
-nonisolated(unsafe) private var mockDB: [String: [[Any]]] = [:]
-nonisolated(unsafe) private var mockHostAPIStorage = osr_host_api()
-nonisolated(unsafe) private var mockLogMessages: [(Int32, String)] = []
-
-/// C-convention callbacks use globals since they can't capture Swift state.
-
-private let mockDbExec: osr_db_exec_fn = { sqlPtr, paramsPtr in
-  guard let sqlPtr, let paramsPtr else { return nil }
-  let sql = String(cString: sqlPtr)
-  let paramsStr = String(cString: paramsPtr)
-
-  guard let paramsData = paramsStr.data(using: .utf8),
-    let params = try? JSONSerialization.jsonObject(with: paramsData) as? [Any]
-  else {
-    return makeCString("{\"error\":\"invalid params\"}")
+  override func setUp() {
+    super.setUp()
+    TestHost.install()
+    DatabaseManager.initSchema()
   }
 
-  if sql.contains("INSERT INTO tasks"), params.count >= 3 {
-    mockDB["tasks", default: []].append([
-      "\(params[0])", "\(params[1])", params[2], "running", NSNull(), NSNull(),
-    ])
+  override func tearDown() {
+    TestHost.uninstall()
+    super.tearDown()
   }
 
-  if sql.contains("INSERT INTO chats"), params.count >= 2 {
-    mockDB["chats", default: []].append(["\(params[0])", "\(params[1])"])
+  // MARK: chat_sessions
+
+  func testUpsertChatSessionCreatesRowWithDefaults() {
+    let row = DatabaseManager.upsertChatSession(chatId: 100)
+    XCTAssertEqual(row.chatId, 100)
+    XCTAssertEqual(row.sessionSalt, 0)
+    XCTAssertEqual(row.blocked, 0)
   }
 
-  return makeCString("{\"changes\":1}")
-}
+  func testUpsertChatSessionPreservesSaltAndBlocked() {
+    _ = DatabaseManager.upsertChatSession(chatId: 100)
+    DatabaseManager.bumpSessionSalt(chatId: 100)
+    DatabaseManager.markChatBlocked(chatId: 100)
 
-private let mockDbQuery: osr_db_query_fn = { sqlPtr, paramsPtr in
-  guard let sqlPtr, let paramsPtr else { return nil }
-  let sql = String(cString: sqlPtr)
-  let paramsStr = String(cString: paramsPtr)
-
-  guard let paramsData = paramsStr.data(using: .utf8),
-    let params = try? JSONSerialization.jsonObject(with: paramsData) as? [Any]
-  else {
-    return makeCString("{\"rows\":[]}")
+    let row = DatabaseManager.upsertChatSession(chatId: 100)
+    XCTAssertEqual(row.sessionSalt, 1, "subsequent upsert must not reset salt")
+    XCTAssertEqual(row.blocked, 1, "subsequent upsert must not unblock")
   }
 
-  if sql.contains("FROM tasks"), !params.isEmpty {
-    let searchId = "\(params[0])"
-    var results: [[Any]] = []
-
-    for taskRow in mockDB["tasks"] ?? [] {
-      guard taskRow.count >= 3, "\(taskRow[0])" == searchId else { continue }
-      let chatId = "\(taskRow[1])"
-      let chatType = (mockDB["chats"] ?? [])
-        .first { "\($0[0])" == chatId }
-        .flatMap { $0.count > 1 ? "\($0[1])" : nil }
-
-      var fullRow = Array(taskRow.prefix(6))
-      while fullRow.count < 6 { fullRow.append(NSNull()) }
-      fullRow.append(chatType as Any? ?? NSNull())
-      results.append(fullRow)
-    }
-
-    guard let data = try? JSONSerialization.data(withJSONObject: ["rows": results]),
-      let str = String(data: data, encoding: .utf8)
-    else {
-      return makeCString("{\"rows\":[]}")
-    }
-    return makeCString(str)
+  func testBumpSessionSaltIncrementsMonotonically() {
+    _ = DatabaseManager.upsertChatSession(chatId: 200)
+    DatabaseManager.bumpSessionSalt(chatId: 200)
+    DatabaseManager.bumpSessionSalt(chatId: 200)
+    DatabaseManager.bumpSessionSalt(chatId: 200)
+    XCTAssertEqual(DatabaseManager.getChatSession(chatId: 200)?.sessionSalt, 3)
   }
 
-  return makeCString("{\"rows\":[]}")
-}
-
-private let mockLog: osr_log_fn = { level, msgPtr in
-  guard let msgPtr else { return }
-  mockLogMessages.append((level, String(cString: msgPtr)))
-}
-
-private func setupMockHost() {
-  mockDB = [:]
-  mockLogMessages = []
-  mockHostAPIStorage = osr_host_api()
-  mockHostAPIStorage.version = 2
-  mockHostAPIStorage.db_exec = mockDbExec
-  mockHostAPIStorage.db_query = mockDbQuery
-  mockHostAPIStorage.log = mockLog
-  hostAPI = withUnsafePointer(to: &mockHostAPIStorage) { $0 }
-}
-
-private func teardownMockHost() {
-  hostAPI = nil
-  mockDB = [:]
-  mockLogMessages = []
-}
-
-// MARK: - serializeParams
-
-@Suite("serializeParams")
-struct SerializeParamsTests {
-
-  @Test("Serializes string array")
-  func allStrings() {
-    let result = DatabaseManager.serializeParams(["abc", "def", "ghi"])
-    #expect(result == #"["abc","def","ghi"]"#)
+  func testIsChatBlockedReflectsState() {
+    _ = DatabaseManager.upsertChatSession(chatId: 300)
+    XCTAssertFalse(DatabaseManager.isChatBlocked(chatId: 300))
+    DatabaseManager.markChatBlocked(chatId: 300)
+    XCTAssertTrue(DatabaseManager.isChatBlocked(chatId: 300))
   }
 
-  @Test("Serializes non-optional Int")
-  func nonOptionalInt() {
-    let result = DatabaseManager.serializeParams(["task-id", "chat-id", 42 as Any])
-    #expect(result != "[]")
-    #expect(result.contains("42"))
+  func testGetChatSessionReturnsNilForUnknownChat() {
+    XCTAssertNil(DatabaseManager.getChatSession(chatId: 999_999))
   }
 
-  @Test("Serializes Optional<Int>.some via `as Any`")
-  func optionalSomeAsAny() {
-    let msgId: Int? = 42
-    let result = DatabaseManager.serializeParams(["task-id", "chat-id", msgId as Any])
-    #expect(result != "[]")
-    #expect(result.contains("42"))
+  // MARK: active_dispatches
+
+  func testInsertAndLookupBindingByToken() {
+    _ = DatabaseManager.upsertChatSession(chatId: 1)
+    DatabaseManager.insertActiveDispatch(
+      taskId: "task-1", chatId: 1, replyToken: "ABC123",
+      sessionId: "session-1", expiresAt: Int(Date().timeIntervalSince1970) + 600)
+
+    let binding = DatabaseManager.lookupBinding(token: "ABC123")
+    XCTAssertNotNil(binding)
+    XCTAssertEqual(binding?.taskId, "task-1")
+    XCTAssertEqual(binding?.chatId, 1)
+    XCTAssertEqual(binding?.sessionId, "session-1")
+    XCTAssertEqual(binding?.hasReplied, 0)
   }
 
-  @Test("Serializes Optional<Int>.none via `as Any`")
-  func optionalNoneAsAny() {
-    let msgId: Int? = nil
-    let result = DatabaseManager.serializeParams(["task-id", "chat-id", msgId as Any])
-    #expect(result != "[]")
+  func testLookupBindingReturnsNilForUnknownToken() {
+    XCTAssertNil(DatabaseManager.lookupBinding(token: "DOES_NOT_EXIST"))
   }
 
-  @Test("Serializes NSNull to JSON null")
-  func nsNull() {
-    let result = DatabaseManager.serializeParams(["task-id", "chat-id", NSNull()])
-    #expect(result != "[]")
-    #expect(result.contains("null"))
-  }
-}
-
-// MARK: - extractRows
-
-@Suite("extractRows")
-struct ExtractRowsTests {
-
-  @Test("Extracts from host format {\"rows\": [...]}")
-  func hostFormat() {
-    let rows = DatabaseManager.extractRows(#"{"rows":[["a","b",1],["c","d",2]]}"#)
-    #expect(rows?.count == 2)
-    #expect(rows?[0].count == 3)
+  func testActiveDispatchForChatReturnsLatest() {
+    _ = DatabaseManager.upsertChatSession(chatId: 2)
+    DatabaseManager.insertActiveDispatch(
+      taskId: "task-2", chatId: 2, replyToken: "TOKEN2",
+      sessionId: "s-2", expiresAt: Int(Date().timeIntervalSince1970) + 600)
+    let active = DatabaseManager.activeDispatch(forChat: 2)
+    XCTAssertEqual(active?.taskId, "task-2")
+    XCTAssertEqual(active?.replyToken, "TOKEN2")
   }
 
-  @Test("Extracts from bare array [[...]]")
-  func bareArray() {
-    let rows = DatabaseManager.extractRows(#"[["a","b",1]]"#)
-    #expect(rows?.count == 1)
+  func testActiveDispatchUniqueChatIdEnforced() {
+    _ = DatabaseManager.upsertChatSession(chatId: 3)
+    DatabaseManager.insertActiveDispatch(
+      taskId: "task-a", chatId: 3, replyToken: "TOK_A",
+      sessionId: "s", expiresAt: Int(Date().timeIntervalSince1970) + 600)
+    // Second insert for the same chat should be a no-op due to UNIQUE(chat_id).
+    DatabaseManager.insertActiveDispatch(
+      taskId: "task-b", chatId: 3, replyToken: "TOK_B",
+      sessionId: "s", expiresAt: Int(Date().timeIntervalSince1970) + 600)
+
+    XCTAssertEqual(
+      DatabaseManager.activeDispatch(forChat: 3)?.taskId, "task-a",
+      "UNIQUE(chat_id) should reject the second insert; first row stays")
+    XCTAssertNil(
+      DatabaseManager.lookupBinding(token: "TOK_B"),
+      "rejected insert must not appear under its token")
   }
 
-  @Test("Returns nil for invalid JSON")
-  func invalidJSON() {
-    #expect(DatabaseManager.extractRows("not json") == nil)
+  func testMarkRepliedAndHasReplied() {
+    _ = DatabaseManager.upsertChatSession(chatId: 4)
+    DatabaseManager.insertActiveDispatch(
+      taskId: "task-r", chatId: 4, replyToken: "TOK_R",
+      sessionId: "s", expiresAt: Int(Date().timeIntervalSince1970) + 600)
+
+    XCTAssertFalse(DatabaseManager.hasReplied(taskId: "task-r"))
+    DatabaseManager.markReplied(taskId: "task-r")
+    XCTAssertTrue(DatabaseManager.hasReplied(taskId: "task-r"))
+    XCTAssertEqual(DatabaseManager.lookupBindingByTask(taskId: "task-r")?.hasReplied, 1)
   }
 
-  @Test("Returns empty array for empty host result")
-  func emptyHost() {
-    let rows = DatabaseManager.extractRows(#"{"rows":[]}"#)
-    #expect(rows?.isEmpty == true)
+  func testHasRepliedFalseForUnknownTask() {
+    XCTAssertFalse(DatabaseManager.hasReplied(taskId: "ghost-task"))
   }
 
-  @Test("Returns empty array for empty bare result")
-  func emptyBare() {
-    let rows = DatabaseManager.extractRows("[]")
-    #expect(rows?.isEmpty == true)
-  }
-}
-
-// MARK: - parseTaskRow
-
-@Suite("parseTaskRow")
-struct ParseTaskRowTests {
-
-  @Test("Parses bare array format")
-  func bareArray() {
-    let row = DatabaseManager.parseTaskRow(
-      #"[["task-1","chat-1",42,"running",null,null,"private"]]"#)
-    #expect(row != nil)
-    #expect(row?.taskId == "task-1")
-    #expect(row?.chatId == "chat-1")
-    #expect(row?.messageId == 42)
-    #expect(row?.status == "running")
-    #expect(row?.chatType == "private")
+  func testDeleteActiveDispatchRemovesBinding() {
+    _ = DatabaseManager.upsertChatSession(chatId: 5)
+    DatabaseManager.insertActiveDispatch(
+      taskId: "task-d", chatId: 5, replyToken: "TOK_D",
+      sessionId: "s", expiresAt: Int(Date().timeIntervalSince1970) + 600)
+    XCTAssertNotNil(DatabaseManager.activeDispatch(forChat: 5))
+    DatabaseManager.deleteActiveDispatch(taskId: "task-d")
+    XCTAssertNil(DatabaseManager.activeDispatch(forChat: 5))
+    XCTAssertNil(DatabaseManager.lookupBinding(token: "TOK_D"))
   }
 
-  @Test("Parses host format with rows wrapper")
-  func hostFormat() {
-    let row = DatabaseManager.parseTaskRow(
-      #"{"rows":[["task-1","chat-1",19,"running",null,null,"private"]]}"#)
-    #expect(row != nil)
-    #expect(row?.taskId == "task-1")
-    #expect(row?.messageId == 19)
-    #expect(row?.chatType == "private")
+  func testSweepExpiredDispatchesDropsOnlyExpired() {
+    _ = DatabaseManager.upsertChatSession(chatId: 10)
+    _ = DatabaseManager.upsertChatSession(chatId: 11)
+    let now = Int(Date().timeIntervalSince1970)
+    DatabaseManager.insertActiveDispatch(
+      taskId: "old", chatId: 10, replyToken: "OLD_TOK",
+      sessionId: "s", expiresAt: now - 60)
+    DatabaseManager.insertActiveDispatch(
+      taskId: "fresh", chatId: 11, replyToken: "FRESH_TOK",
+      sessionId: "s", expiresAt: now + 600)
+
+    DatabaseManager.sweepExpiredDispatches()
+
+    XCTAssertNil(DatabaseManager.lookupBinding(token: "OLD_TOK"))
+    XCTAssertNotNil(DatabaseManager.lookupBinding(token: "FRESH_TOK"))
   }
 
-  @Test("Parses real host response format")
-  func realHostResponse() {
-    let row = DatabaseManager.parseTaskRow(
-      #"{"rows":[["2DB68CCC-1234-5678-AAAA-BBBBBBBBBBBB","1689414522",19,"running",null,null,"private"]]}"#
-    )
-    #expect(row != nil)
-    #expect(row?.messageId == 19)
-    #expect(row?.chatId == "1689414522")
+  // MARK: seen_updates (idempotency)
+
+  func testIsUpdateAlreadySeenAndMarkSeenRoundtrip() {
+    XCTAssertFalse(DatabaseManager.isUpdateAlreadySeen(updateId: 42))
+    DatabaseManager.markUpdateSeen(updateId: 42)
+    XCTAssertTrue(DatabaseManager.isUpdateAlreadySeen(updateId: 42))
   }
 
-  @Test("Defaults null chat_type to private")
-  func nullChatType() {
-    let row = DatabaseManager.parseTaskRow(
-      #"{"rows":[["t1","c1",42,"running",null,null,null]]}"#)
-    #expect(row != nil)
-    #expect(row?.chatType == "private")
+  func testMarkUpdateSeenIsIdempotent() {
+    DatabaseManager.markUpdateSeen(updateId: 7)
+    DatabaseManager.markUpdateSeen(updateId: 7)  // no error from ON CONFLICT
+    XCTAssertTrue(DatabaseManager.isUpdateAlreadySeen(updateId: 7))
   }
 
-  @Test("Parses all fields including status_msg_id and summary")
-  func fullRow() {
-    let row = DatabaseManager.parseTaskRow(
-      #"{"rows":[["t1","c1",42,"completed",99,"All done","supergroup"]]}"#)
-    #expect(row?.statusMsgId == 99)
-    #expect(row?.summary == "All done")
-    #expect(row?.chatType == "supergroup")
+  func testPruneOldSeenUpdatesDropsOnlyAged() {
+    // Insert one fresh + one synthetic-old row using the host stub directly.
+    DatabaseManager.markUpdateSeen(updateId: 100)  // fresh, ~now
+
+    // Force an ancient seen_at (>24h) by going through dbExec directly.
+    DatabaseManager.dbExec(
+      "INSERT INTO seen_updates (update_id, seen_at) VALUES (?1, ?2)",
+      params: DatabaseManager.serializeParams(
+        [101, Int(Date().timeIntervalSince1970) - 100_000]))
+
+    DatabaseManager.pruneOldSeenUpdates()
+
+    XCTAssertTrue(DatabaseManager.isUpdateAlreadySeen(updateId: 100))
+    XCTAssertFalse(DatabaseManager.isUpdateAlreadySeen(updateId: 101))
   }
 
-  @Test("Returns nil for empty results")
-  func emptyResults() {
-    #expect(DatabaseManager.parseTaskRow("[]") == nil)
-    #expect(DatabaseManager.parseTaskRow(#"{"rows":[]}"#) == nil)
-    #expect(DatabaseManager.parseTaskRow("") == nil)
-    #expect(DatabaseManager.parseTaskRow("not json") == nil)
-  }
+  // MARK: schema sanity
 
-  @Test("Returns nil when row has fewer than 7 elements")
-  func shortRow() {
-    #expect(DatabaseManager.parseTaskRow(#"[["t1","c1",42,"running"]]"#) == nil)
-  }
-}
-
-// MARK: - Round-trip integration (mock host)
-
-@Suite("Task insert/query round-trip", .serialized)
-struct TaskRoundTripTests {
-
-  @Test("insertTask then getTask returns the task")
-  func basicRoundTrip() {
-    setupMockHost()
-    defer { teardownMockHost() }
-
-    DatabaseManager.upsertChat(
-      chatId: "1689414522", chatType: "private", title: "Test", username: nil)
-    DatabaseManager.insertTask(
-      taskId: "8EF0458F-775F-45FD-99AF-C690AB4CB2EC", chatId: "1689414522", messageId: 42)
-
-    let task = DatabaseManager.getTask(taskId: "8EF0458F-775F-45FD-99AF-C690AB4CB2EC")
-    #expect(task != nil)
-    #expect(task?.taskId == "8EF0458F-775F-45FD-99AF-C690AB4CB2EC")
-    #expect(task?.chatId == "1689414522")
-    #expect(task?.messageId == 42)
-    #expect(task?.status == "running")
-    #expect(task?.chatType == "private")
-  }
-
-  @Test("getTask returns nil for non-existent task")
-  func nonExistent() {
-    setupMockHost()
-    defer { teardownMockHost() }
-
-    #expect(DatabaseManager.getTask(taskId: "does-not-exist") == nil)
-  }
-
-  @Test("insertTask without chat defaults chatType to private")
-  func noChat() {
-    setupMockHost()
-    defer { teardownMockHost() }
-
-    DatabaseManager.insertTask(taskId: "task-1", chatId: "unknown-chat", messageId: nil)
-
-    let task = DatabaseManager.getTask(taskId: "task-1")
-    #expect(task != nil)
-    #expect(task?.chatType == "private")
-  }
-
-  @Test("handleTaskEvent finds task after insertTask")
-  func taskEventAfterInsert() {
-    setupMockHost()
-    defer { teardownMockHost() }
-
-    let ctx = PluginContext()
-    ctx.botToken = "test-token"
-
-    DatabaseManager.upsertChat(chatId: "999", chatType: "private", title: nil, username: nil)
-    DatabaseManager.insertTask(taskId: "task-event-test", chatId: "999", messageId: 1)
-
-    mockLogMessages = []
-    handleTaskEvent(ctx: ctx, taskId: "task-event-test", eventType: 0, eventJSON: "{}")
-
-    let warnings = mockLogMessages.filter { $0.0 >= 2 && $0.1.contains("unknown task") }
-    #expect(warnings.isEmpty, "Should NOT log 'unknown task' after insertTask")
-  }
-
-  @Test("handleTaskEvent logs warning for missing task")
-  func taskEventMissing() {
-    setupMockHost()
-    defer { teardownMockHost() }
-
-    mockLogMessages = []
-    handleTaskEvent(ctx: PluginContext(), taskId: "nonexistent", eventType: 0, eventJSON: "{}")
-
-    let warnings = mockLogMessages.filter { $0.0 >= 2 && $0.1.contains("unknown task") }
-    #expect(!warnings.isEmpty)
+  func testInitSchemaIsIdempotent() {
+    // Calling initSchema twice should not fail. Already called in setUp.
+    DatabaseManager.initSchema()
+    DatabaseManager.initSchema()
+    // Sanity: still able to insert.
+    _ = DatabaseManager.upsertChatSession(chatId: 9_999)
+    XCTAssertNotNil(DatabaseManager.getChatSession(chatId: 9_999))
   }
 }

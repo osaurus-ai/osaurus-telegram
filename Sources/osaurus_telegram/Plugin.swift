@@ -1,131 +1,17 @@
 import Foundation
 
-// MARK: - C ABI Surface (v2)
+// MARK: - Plugin API table
+//
+// We assemble the function table once at module init and hand the same
+// pointer to the host on every entry. Closures here are thin trampolines:
+// validate inputs, look up the PluginContext, and call into the per-callback
+// implementations defined in WebhookHandler.swift / Tools.swift / etc.
 
-typealias osr_plugin_ctx_t = UnsafeMutableRawPointer
+private nonisolated(unsafe) var api: osr_plugin_api = makeAPI()
 
-// Config + Storage + Logging
-typealias osr_config_get_fn = @convention(c) (UnsafePointer<CChar>?) -> UnsafePointer<CChar>?
-typealias osr_config_set_fn = @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Void
-typealias osr_config_delete_fn = @convention(c) (UnsafePointer<CChar>?) -> Void
-typealias osr_db_exec_fn =
-  @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> UnsafePointer<CChar>?
-typealias osr_db_query_fn =
-  @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> UnsafePointer<CChar>?
-typealias osr_log_fn = @convention(c) (Int32, UnsafePointer<CChar>?) -> Void
-
-// Agent Dispatch
-typealias osr_dispatch_fn = @convention(c) (UnsafePointer<CChar>?) -> UnsafePointer<CChar>?
-typealias osr_task_status_fn = @convention(c) (UnsafePointer<CChar>?) -> UnsafePointer<CChar>?
-typealias osr_dispatch_cancel_fn = @convention(c) (UnsafePointer<CChar>?) -> Void
-typealias osr_dispatch_clarify_fn =
-  @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Void
-
-// Inference
-typealias osr_complete_fn = @convention(c) (UnsafePointer<CChar>?) -> UnsafePointer<CChar>?
-typealias osr_complete_stream_fn =
-  @convention(c) (
-    UnsafePointer<CChar>?,
-    (@convention(c) (UnsafePointer<CChar>?, UnsafeMutableRawPointer?) -> Void)?,
-    UnsafeMutableRawPointer?
-  ) -> UnsafePointer<CChar>?
-typealias osr_embed_fn = @convention(c) (UnsafePointer<CChar>?) -> UnsafePointer<CChar>?
-typealias osr_list_models_fn = @convention(c) () -> UnsafePointer<CChar>?
-
-// HTTP Client
-typealias osr_http_request_fn = @convention(c) (UnsafePointer<CChar>?) -> UnsafePointer<CChar>?
-
-// File I/O
-typealias osr_file_read_fn = @convention(c) (UnsafePointer<CChar>?) -> UnsafePointer<CChar>?
-
-// Extended Agent Dispatch (v2 trailing fields)
-typealias osr_list_active_tasks_fn = @convention(c) () -> UnsafePointer<CChar>?
-typealias osr_send_draft_fn =
-  @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Void
-typealias osr_dispatch_interrupt_fn =
-  @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Void
-typealias osr_dispatch_add_issue_fn =
-  @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> UnsafePointer<CChar>?
-
-struct osr_host_api {
-  var version: UInt32 = 0
-
-  // Config + Storage + Logging
-  var config_get: osr_config_get_fn?
-  var config_set: osr_config_set_fn?
-  var config_delete: osr_config_delete_fn?
-  var db_exec: osr_db_exec_fn?
-  var db_query: osr_db_query_fn?
-  var log: osr_log_fn?
-
-  // Agent Dispatch
-  var dispatch: osr_dispatch_fn?
-  var task_status: osr_task_status_fn?
-  var dispatch_cancel: osr_dispatch_cancel_fn?
-  var dispatch_clarify: osr_dispatch_clarify_fn?
-
-  // Inference
-  var complete: osr_complete_fn?
-  var complete_stream: osr_complete_stream_fn?
-  var embed: osr_embed_fn?
-  var list_models: osr_list_models_fn?
-
-  // HTTP Client
-  var http_request: osr_http_request_fn?
-
-  // File I/O
-  var file_read: osr_file_read_fn?
-
-  // Extended Agent Dispatch (v2 trailing fields)
-  var list_active_tasks: osr_list_active_tasks_fn?
-  var send_draft: osr_send_draft_fn?
-  var dispatch_interrupt: osr_dispatch_interrupt_fn?
-  var dispatch_add_issue: osr_dispatch_add_issue_fn?
-}
-
-private typealias osr_free_string_t = @convention(c) (UnsafePointer<CChar>?) -> Void
-private typealias osr_init_t = @convention(c) () -> osr_plugin_ctx_t?
-private typealias osr_destroy_t = @convention(c) (osr_plugin_ctx_t?) -> Void
-private typealias osr_get_manifest_t = @convention(c) (osr_plugin_ctx_t?) -> UnsafePointer<CChar>?
-private typealias osr_invoke_t =
-  @convention(c) (
-    osr_plugin_ctx_t?,
-    UnsafePointer<CChar>?,
-    UnsafePointer<CChar>?,
-    UnsafePointer<CChar>?
-  ) -> UnsafePointer<CChar>?
-private typealias osr_handle_route_t =
-  @convention(c) (osr_plugin_ctx_t?, UnsafePointer<CChar>?) -> UnsafePointer<CChar>?
-private typealias osr_on_config_changed_t =
-  @convention(c) (osr_plugin_ctx_t?, UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Void
-private typealias osr_on_task_event_t =
-  @convention(c) (osr_plugin_ctx_t?, UnsafePointer<CChar>?, Int32, UnsafePointer<CChar>?) -> Void
-
-private struct osr_plugin_api {
-  var free_string: osr_free_string_t?
-  var `init`: osr_init_t?
-  var destroy: osr_destroy_t?
-  var get_manifest: osr_get_manifest_t?
-  var invoke: osr_invoke_t?
-  var version: UInt32 = 0
-  var handle_route: osr_handle_route_t?
-  var on_config_changed: osr_on_config_changed_t?
-  var on_task_event: osr_on_task_event_t?
-}
-
-// MARK: - Global State
-
-nonisolated(unsafe) var hostAPI: UnsafePointer<osr_host_api>?
-
-func makeCString(_ s: String) -> UnsafePointer<CChar>? {
-  guard let ptr = strdup(s) else { return nil }
-  return UnsafePointer(ptr)
-}
-
-// MARK: - Plugin API Implementation
-
-private nonisolated(unsafe) var api: osr_plugin_api = {
+private func makeAPI() -> osr_plugin_api {
   var api = osr_plugin_api()
+  api.version = 2
 
   api.free_string = { ptr in
     if let p = ptr { free(UnsafeMutableRawPointer(mutating: p)) }
@@ -134,30 +20,7 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
   api.`init` = {
     let ctx = PluginContext()
     initPlugin(ctx)
-
-    var available: [String] = []
-    var missing: [String] = []
-    let checks: [(String, Bool)] = [
-      ("dispatch", hostAPI?.pointee.dispatch != nil),
-      ("complete_stream", hostAPI?.pointee.complete_stream != nil),
-      ("complete", hostAPI?.pointee.complete != nil),
-      ("http_request", hostAPI?.pointee.http_request != nil),
-      ("db_exec", hostAPI?.pointee.db_exec != nil),
-      ("db_query", hostAPI?.pointee.db_query != nil),
-      ("config_get", hostAPI?.pointee.config_get != nil),
-      ("log", hostAPI?.pointee.log != nil),
-      ("file_read", hostAPI?.pointee.file_read != nil),
-      ("dispatch_interrupt", hostAPI?.pointee.dispatch_interrupt != nil),
-      ("send_draft", hostAPI?.pointee.send_draft != nil),
-      ("list_active_tasks", hostAPI?.pointee.list_active_tasks != nil),
-    ]
-    for (name, ok) in checks {
-      if ok { available.append(name) } else { missing.append(name) }
-    }
-    logInfo(
-      "Plugin init complete. Host APIs available: [\(available.joined(separator: ", "))], missing: [\(missing.joined(separator: ", "))]"
-    )
-
+    logHostAPIAvailability()
     return Unmanaged.passRetained(ctx).toOpaque()
   }
 
@@ -168,339 +31,19 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
     Unmanaged<PluginContext>.fromOpaque(ctxPtr).release()
   }
 
-  api.get_manifest = { _ in
-    let manifest = """
-      {
-        "plugin_id": "osaurus.telegram",
-        "name": "Telegram",
-        "version": "0.1.0",
-        "description": "Connect Telegram chats to your Osaurus agents",
-        "instructions": "You are responding via Telegram. Format your responses for Telegram: use **bold** for emphasis and section titles instead of markdown headings (# ## etc). Keep responses concise with short paragraphs. Use - for bullet lists. Use backticks for code. Avoid markdown tables, horizontal rules, image syntax, and raw HTML tags.",
-        "license": "MIT",
-        "authors": [],
-        "min_macos": "15.0",
-        "min_osaurus": "0.5.0",
-        "capabilities": {
-          "tools": [
-            {
-              "id": "telegram_list_chats",
-              "description": "List known Telegram chats the bot has interacted with. Can filter by username or chat type. Use this to discover chat IDs before sending messages.",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "username": {
-                    "type": "string",
-                    "description": "Filter by Telegram username (with or without @)"
-                  },
-                  "chat_type": {
-                    "type": "string",
-                    "description": "Filter by chat type: private, group, supergroup, or channel"
-                  }
-                },
-                "required": []
-              },
-              "requirements": [],
-              "permission_policy": "auto"
-            },
-            {
-              "id": "telegram_get_chat_history",
-              "description": "Retrieve recent messages from the plugin's local message log for a given Telegram chat.",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "chat_id": {
-                    "type": "string",
-                    "description": "Telegram chat ID"
-                  },
-                  "limit": {
-                    "type": "integer",
-                    "description": "Max messages to return (default 50, max 200)"
-                  }
-                },
-                "required": ["chat_id"]
-              },
-              "requirements": [],
-              "permission_policy": "auto"
-            },
-            {
-              "id": "telegram_send",
-              "description": "Send a message to a Telegram chat. Supports text and reply_markup for inline keyboards.",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "chat_id": {
-                    "type": "string",
-                    "description": "Telegram chat ID to send to"
-                  },
-                  "text": {
-                    "type": "string",
-                    "description": "Message text to send"
-                  },
-                  "reply_to_message_id": {
-                    "type": "integer",
-                    "description": "Optional message ID to reply to"
-                  },
-                  "reply_markup": {
-                    "type": "object",
-                    "description": "Optional inline keyboard markup"
-                  }
-                },
-                "required": ["chat_id", "text"]
-              },
-              "requirements": [],
-              "permission_policy": "auto"
-            },
-            {
-              "id": "telegram_send_file",
-              "description": "Upload a file (photo or document) to a Telegram chat. Reads files from Osaurus artifact paths.",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "chat_id": {
-                    "type": "string",
-                    "description": "Telegram chat ID to send to"
-                  },
-                  "file_path": {
-                    "type": "string",
-                    "description": "Absolute path to the file (must be within ~/.osaurus/artifacts/)"
-                  },
-                  "caption": {
-                    "type": "string",
-                    "description": "Optional caption for the file"
-                  },
-                  "reply_to_message_id": {
-                    "type": "integer",
-                    "description": "Optional message ID to reply to"
-                  }
-                },
-                "required": ["chat_id", "file_path"]
-              },
-              "requirements": [],
-              "permission_policy": "auto"
-            },
-            {
-              "id": "telegram_set_reaction",
-              "description": "Set an emoji reaction on a Telegram message. Can also remove a reaction by omitting the emoji.",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "chat_id": {
-                    "type": "string",
-                    "description": "Telegram chat ID"
-                  },
-                  "message_id": {
-                    "type": "integer",
-                    "description": "Message ID to react to"
-                  },
-                  "emoji": {
-                    "type": "string",
-                    "description": "Emoji to react with (e.g. \\ud83d\\udc4d, \\u2764, \\ud83d\\ude02). Omit to remove the reaction."
-                  }
-                },
-                "required": ["chat_id", "message_id"]
-              },
-              "requirements": [],
-              "permission_policy": "auto"
-            }
-          ],
-          "artifact_handler": true,
-          "routes": [
-            {
-              "id": "webhook",
-              "path": "/webhook",
-              "methods": ["POST"],
-              "description": "Telegram Bot API webhook endpoint",
-              "auth": "verify"
-            },
-            {
-              "id": "health",
-              "path": "/health",
-              "methods": ["GET"],
-              "description": "Health check — returns webhook registration status",
-              "auth": "owner"
-            }
-          ],
-          "config": {
-            "title": "Telegram",
-            "sections": [
-              {
-                "title": "Bot Configuration",
-                "fields": [
-                  {
-                    "key": "bot_token",
-                    "type": "secret",
-                    "label": "Bot Token",
-                    "placeholder": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
-                    "description": "Get this from [@BotFather](https://t.me/BotFather)",
-                    "validation": {
-                      "required": true,
-                      "pattern": "^[0-9]+:[A-Za-z0-9_-]+$",
-                      "pattern_hint": "Must be a valid Telegram bot token (e.g. 123456:ABC...)"
-                    }
-                  },
-                  {
-                    "key": "webhook_url",
-                    "type": "readonly",
-                    "label": "Webhook URL",
-                    "value_template": "{{plugin_url}}/webhook",
-                    "copyable": true
-                  },
-                  {
-                    "key": "webhook_status",
-                    "type": "status",
-                    "label": "Webhook",
-                    "connected_when": "webhook_registered"
-                  }
-                ]
-              },
-              {
-                "title": "Agent Settings",
-                "fields": [
-                  {
-                    "key": "enable_preflight",
-                    "type": "toggle",
-                    "label": "Enable preflight capability search",
-                    "description": "Auto-discover relevant tools and context before inference",
-                    "default": false
-                  },
-                  {
-                    "key": "enable_tools",
-                    "type": "toggle",
-                    "label": "Enable tool calling",
-                    "description": "Allow the agent to use tools during chat mode. Disabling restricts to text-only responses.",
-                    "default": true
-                  },
-                  {
-                    "key": "enable_sandbox",
-                    "type": "toggle",
-                    "label": "Enable sandbox access",
-                    "description": "Allow the agent to execute code and read/write files in the sandboxed environment",
-                    "default": true
-                  },
-                  {
-                    "key": "max_iterations",
-                    "type": "number",
-                    "label": "Max iterations",
-                    "description": "Maximum agentic loop iterations for chat mode inference",
-                    "default": 10,
-                    "validation": {
-                      "min": 1,
-                      "max": 30
-                    }
-                  }
-                ]
-              },
-              {
-                "title": "File Upload",
-                "fields": [
-                  {
-                    "key": "auto_upload_artifacts",
-                    "type": "toggle",
-                    "label": "Auto-upload artifacts to chat",
-                    "description": "Automatically upload files produced by agent tasks to the originating Telegram chat",
-                    "default": true
-                  }
-                ]
-              },
-              {
-                "title": "Behavior",
-                "fields": [
-                  {
-                    "key": "allowed_users",
-                    "type": "text",
-                    "label": "Allowed Users",
-                    "placeholder": "@alice, @bob",
-                    "description": "Comma-separated Telegram usernames. Only these users can interact with the agent. Leave blank to allow everyone."
-                  },
-                  {
-                    "key": "send_typing",
-                    "type": "toggle",
-                    "label": "Send typing indicator while agent works",
-                    "default": true
-                  }
-                ]
-              },
-              {
-                "title": "Prompt Customization",
-                "fields": [
-                  {
-                    "key": "system_prompt",
-                    "type": "text",
-                    "label": "Extra system prompt",
-                    "placeholder": "Optional. Prepended to the default Telegram chat instructions.",
-                    "description": "Additional system prompt text for streaming chat replies. Leave blank to use defaults."
-                  },
-                  {
-                    "key": "tool_status_messages",
-                    "type": "text",
-                    "label": "Tool status overrides (JSON)",
-                    "placeholder": "{\\"sandbox_exec\\": \\"Running code\\", \\"web_search\\": \\"Searching\\"}",
-                    "description": "JSON object mapping tool-name prefixes to friendly status labels shown in draft updates."
-                  }
-                ]
-              }
-            ]
-          }
-        },
-        "docs": {
-          "readme": "README.md",
-          "changelog": "CHANGELOG.md",
-          "links": [
-            { "label": "Telegram Bot API", "url": "https://core.telegram.org/bots/api" },
-            { "label": "BotFather", "url": "https://t.me/BotFather" }
-          ]
-        }
-      }
-      """
-    return makeCString(manifest)
-  }
+  api.get_manifest = { _ in makeCString(pluginManifestJSON) }
 
   api.invoke = { ctxPtr, typePtr, idPtr, payloadPtr in
     guard let ctxPtr, let typePtr, let idPtr, let payloadPtr else {
       logWarn("invoke called with nil parameters")
       return nil
     }
-
     let ctx = Unmanaged<PluginContext>.fromOpaque(ctxPtr).takeUnretainedValue()
     let type = String(cString: typePtr)
     let id = String(cString: idPtr)
     let payload = String(cString: payloadPtr)
-
-    logDebug("invoke: type=\(type) id=\(id) payload=\(payload.count) chars")
-
-    if type == "artifact" && id == "share" {
-      let result = handleArtifactShare(ctx: ctx, payload: payload)
-      logDebug("invoke: artifact share returned \(result.count) chars")
-      return makeCString(result)
-    }
-
-    guard type == "tool" else {
-      logWarn("invoke: unknown capability type '\(type)'")
-      return makeCString("{\"error\":\"Unknown capability type\"}")
-    }
-
-    let result: String
-    switch id {
-    case ctx.listChatsTool.name:
-      result = ctx.listChatsTool.run(args: payload)
-    case ctx.chatHistoryTool.name:
-      result = ctx.chatHistoryTool.run(args: payload)
-    case ctx.telegramSendTool.name:
-      result = ctx.telegramSendTool.run(args: payload)
-    case ctx.sendFileTool.name:
-      result = ctx.sendFileTool.run(args: payload)
-    case ctx.setReactionTool.name:
-      result = ctx.setReactionTool.run(args: payload)
-    default:
-      logWarn("invoke: unknown tool '\(id)'")
-      return makeCString("{\"error\":\"Unknown tool: \(id)\"}")
-    }
-
-    logDebug("invoke: tool \(id) returned \(result.count) chars")
-    return makeCString(result)
+    return makeCString(handleInvoke(ctx: ctx, type: type, id: id, payload: payload))
   }
-
-  api.version = 2
 
   api.handle_route = { ctxPtr, requestJsonPtr in
     guard let ctxPtr, let requestJsonPtr else {
@@ -509,9 +52,7 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
     }
     let ctx = Unmanaged<PluginContext>.fromOpaque(ctxPtr).takeUnretainedValue()
     let requestJson = String(cString: requestJsonPtr)
-    logDebug("handle_route: received \(requestJson.count) chars")
-    let response = handleRoute(ctx: ctx, requestJSON: requestJson)
-    return makeCString(response)
+    return makeCString(handleRoute(ctx: ctx, requestJSON: requestJson))
   }
 
   api.on_config_changed = { ctxPtr, keyPtr, valuePtr in
@@ -522,7 +63,6 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
     let ctx = Unmanaged<PluginContext>.fromOpaque(ctxPtr).takeUnretainedValue()
     let key = String(cString: keyPtr)
     let value = valuePtr.map { String(cString: $0) }
-    logDebug("on_config_changed: key=\(key) hasValue=\(value != nil)")
     onConfigChanged(ctx: ctx, key: key, value: value)
   }
 
@@ -534,14 +74,57 @@ private nonisolated(unsafe) var api: osr_plugin_api = {
     let ctx = Unmanaged<PluginContext>.fromOpaque(ctxPtr).takeUnretainedValue()
     let taskId = String(cString: taskIdPtr)
     let eventJson = String(cString: eventJsonPtr)
-    logDebug(
-      "on_task_event: taskId=\(taskId) eventType=\(eventType) json=\(String(eventJson.prefix(200)))"
-    )
     handleTaskEvent(ctx: ctx, taskId: taskId, eventType: eventType, eventJSON: eventJson)
   }
 
   return api
-}()
+}
+
+// MARK: - Invoke dispatcher
+
+private func handleInvoke(
+  ctx: PluginContext, type: String, id: String, payload: String
+) -> String {
+  logDebug("invoke: type=\(type) id=\(id) payload=\(payload.count) chars")
+
+  guard type == "tool" else {
+    logWarn("invoke: unknown capability type '\(type)'")
+    return toolEnvelopeError("unknown_capability", "Type \(type) not supported")
+  }
+
+  switch id {
+  case "reply":
+    return handleReply(ctx: ctx, payload: payload)
+  case "reply_typing":
+    return handleReplyTyping(ctx: ctx, payload: payload)
+  case "reply_photo":
+    return handleReplyPhoto(ctx: ctx, payload: payload)
+  default:
+    logWarn("invoke: unknown tool '\(id)'")
+    return toolEnvelopeError("unknown_tool", "Unknown tool: \(id)")
+  }
+}
+
+// MARK: - Diagnostics
+
+private func logHostAPIAvailability() {
+  let checks: [(String, Bool)] = [
+    ("dispatch", hostAPI?.pointee.dispatch != nil),
+    ("dispatch_interrupt", hostAPI?.pointee.dispatch_interrupt != nil),
+    ("dispatch_cancel", hostAPI?.pointee.dispatch_cancel != nil),
+    ("http_request", hostAPI?.pointee.http_request != nil),
+    ("db_exec", hostAPI?.pointee.db_exec != nil),
+    ("db_query", hostAPI?.pointee.db_query != nil),
+    ("config_get", hostAPI?.pointee.config_get != nil),
+    ("log", hostAPI?.pointee.log != nil),
+    ("list_active_tasks", hostAPI?.pointee.list_active_tasks != nil),
+  ]
+  let available = checks.filter { $0.1 }.map { $0.0 }
+  let missing = checks.filter { !$0.1 }.map { $0.0 }
+  logInfo(
+    "Plugin init complete. Host APIs available: [\(available.joined(separator: ", "))], missing: [\(missing.joined(separator: ", "))]"
+  )
+}
 
 // MARK: - Entry Points
 
