@@ -160,25 +160,35 @@ private enum BindingResult {
   case reject(String)
 }
 
-/// Validates the reply_token can be acted on by `state`.
+/// Validates the reply_token can be acted on by `state`. Every rejection
+/// returns the same opaque `stale_token` envelope to the agent (so a
+/// malicious peer can't probe ours) but logs a distinguishable reason for
+/// operators reading Insights. Tokens are opaque 8-char randoms with no
+/// chat info encoded — safe to include in the log line.
 private func validateBinding(state: AgentState, token: String) -> BindingResult {
   guard let binding = DatabaseManager.lookupBinding(token: token) else {
-    return .reject(staleTokenEnvelope)
+    return rejectStale(state: state, token: token, reason: "no binding")
   }
-  // Reply tokens are globally unique but a malicious agent could in theory
-  // observe one. The binding's agent_id is the source of truth — reject any
-  // mismatch with the same envelope as expiry so the wrong agent learns
-  // nothing about the token's origin.
   if binding.agentId != state.agentId {
-    return .reject(staleTokenEnvelope)
+    return rejectStale(
+      state: state, token: token,
+      reason: "agent_id mismatch (binding=\(binding.agentId) caller=\(state.agentId))")
   }
-  if binding.expiresAt <= Int(Date().timeIntervalSince1970) {
-    return .reject(staleTokenEnvelope)
+  let now = Int(Date().timeIntervalSince1970)
+  if binding.expiresAt <= now {
+    return rejectStale(
+      state: state, token: token,
+      reason: "expired (expires_at=\(binding.expiresAt) now=\(now))")
   }
   if DatabaseManager.isChatBlocked(agentId: state.agentId, chatId: binding.chatId) {
     return .reject(toolEnvelopeError("chat_blocked", "User has blocked the bot."))
   }
   return .ok(binding)
+}
+
+private func rejectStale(state: AgentState, token: String, reason: String) -> BindingResult {
+  state.log(.warn, "reply rejected: stale_token (\(reason)) token=\(token)")
+  return .reject(staleTokenEnvelope)
 }
 
 private let staleTokenEnvelope = toolEnvelopeError(

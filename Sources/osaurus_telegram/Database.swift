@@ -2,21 +2,21 @@ import Foundation
 
 // MARK: - Database Manager
 //
-// The plugin keeps three tables in its per-plugin SQLite DB. As of schema v2
-// (ABI v4 migration) every table is partitioned by `agent_id` so two agents
-// loaded into the same plugin instance can't trample each other's rows.
-// Telegram chat_ids are NOT bot-scoped — the same Telegram user talking to
-// two different bots produces the same chat_id, which would otherwise
-// collide on the old PK / UNIQUE constraints.
+// Three tables in a per-plugin SQLite DB. All tables are partitioned by
+// `agent_id` (schema v2 / ABI v4) because Telegram chat_ids are user-
+// scoped, not bot-scoped — the same chat_id can mean different things to
+// two agents sharing the plugin.
 //
-//   * chat_sessions      \u2014 (agent_id, chat_id) PK; session_salt bumped on /reset
-//                          plus a blocked flag.
-//   * active_dispatches  \u2014 task_id PK; UNIQUE (agent_id, chat_id) so each
-//                          (agent, chat) has at most one in-flight dispatch.
-//                          reply_token stays globally unique because tokens
-//                          are random and the lookup is one-way.
-//   * seen_updates       \u2014 (agent_id, update_id) PK; idempotency cache for
-//                          Telegram retries, TTL-pruned to 24h.
+//   * chat_sessions      — (agent_id, chat_id) PK. session_salt + blocked.
+//   * active_dispatches  — reply_token PK (schema v3). Pre-inserted BEFORE
+//                          `dispatch` so a fast agent can't race past us
+//                          and hit `stale_token`. The placeholder task_id
+//                          is patched by `updateTaskId` once dispatch
+//                          returns. Multiple in-flight rows per
+//                          (agent_id, chat_id) coexist and age out under
+//                          the 10-minute TTL sweep.
+//   * seen_updates       — (agent_id, update_id) PK; Telegram-retry
+//                          idempotency cache, pruned to 24h.
 
 struct ChatSessionRow {
   let chatId: Int64
@@ -39,13 +39,13 @@ enum DatabaseManager {
   // MARK: - Schema
 
   static func initSchema() {
-    // Detect pre-v2 schema (no agent_id column on chat_sessions). If present,
-    // drop and recreate every table — the data is mostly transient (10-min
-    // dispatches, 24-hour seen_updates) and chat_sessions only carries a
-    // session salt that resets cleanly to zero.
+    // Migrations are drop-and-rebuild. Every table is short-lived
+    // (10-min dispatches, 24h dedup, salts default to zero) so losing
+    // rows is harmless.
+
+    // Pre-v2 (no agent_id column) — drop everything.
     if tableExists("chat_sessions"), !columnExists(table: "chat_sessions", column: "agent_id") {
-      logInfo(
-        "Database: detected pre-ABI-v4 schema (no agent_id column); dropping legacy tables")
+      logInfo("Database: detected pre-ABI-v4 schema; dropping legacy tables")
       for sql in [
         "DROP TABLE IF EXISTS chat_sessions",
         "DROP TABLE IF EXISTS active_dispatches",
@@ -53,6 +53,14 @@ enum DatabaseManager {
       ] {
         dbExec(sql, params: "[]")
       }
+    }
+
+    // v2 active_dispatches (task_id PK) → v3 (reply_token PK).
+    if tableExists("active_dispatches"),
+      primaryKeyColumn(table: "active_dispatches") != "reply_token"
+    {
+      logInfo("Database: detected v2 active_dispatches; rebuilding with reply_token PK")
+      dbExec("DROP TABLE IF EXISTS active_dispatches", params: "[]")
     }
 
     let statements = [
@@ -69,18 +77,19 @@ enum DatabaseManager {
       """,
       """
       CREATE TABLE IF NOT EXISTS active_dispatches (
-        task_id        TEXT PRIMARY KEY,
+        reply_token    TEXT PRIMARY KEY,
+        task_id        TEXT NOT NULL,
         agent_id       TEXT NOT NULL,
         chat_id        INTEGER NOT NULL,
-        reply_token    TEXT NOT NULL UNIQUE,
         session_id     TEXT NOT NULL,
         started_at     INTEGER NOT NULL,
         expires_at     INTEGER NOT NULL,
-        has_replied    INTEGER NOT NULL DEFAULT 0,
-        UNIQUE (agent_id, chat_id)
+        has_replied    INTEGER NOT NULL DEFAULT 0
       )
       """,
-      "CREATE INDEX IF NOT EXISTS idx_dispatches_token ON active_dispatches(reply_token)",
+      "CREATE INDEX IF NOT EXISTS idx_dispatches_task ON active_dispatches(task_id)",
+      "CREATE INDEX IF NOT EXISTS idx_dispatches_chat "
+        + "ON active_dispatches(agent_id, chat_id, started_at)",
       """
       CREATE TABLE IF NOT EXISTS seen_updates (
         agent_id       TEXT NOT NULL,
@@ -120,6 +129,26 @@ enum DatabaseManager {
       if let name = row[1] as? String, name == column { return true }
     }
     return false
+  }
+
+  /// Returns the name of the single-column primary key for `table`, or nil
+  /// if the table doesn't exist or has a composite / no PK. `PRAGMA
+  /// table_info` row layout is `(cid, name, type, notnull, dflt_value, pk)`
+  /// where `pk` is 0 for non-key columns and 1+ for key columns (the value
+  /// is the position within a composite PK). For a single-column PK,
+  /// exactly one row has pk=1.
+  private static func primaryKeyColumn(table: String) -> String? {
+    let sql = "PRAGMA table_info(\(table))"
+    guard let resultStr = dbQuery(sql, params: "[]"),
+      let rows = extractRows(resultStr)
+    else { return nil }
+    var pkColumns: [String] = []
+    for row in rows where row.count >= 6 {
+      if let pk = intFromAny(row[5]), pk > 0, let name = row[1] as? String {
+        pkColumns.append(name)
+      }
+    }
+    return pkColumns.count == 1 ? pkColumns.first : nil
   }
 
   // MARK: - chat_sessions
@@ -181,7 +210,10 @@ enum DatabaseManager {
     taskId: String, agentId: String, chatId: Int64, replyToken: String,
     sessionId: String, expiresAt: Int
   ) {
-    let now = Int(Date().timeIntervalSince1970)
+    // started_at is an ordering key (not a wall-clock); milliseconds give
+    // rapid-fire turns and unit tests strict ordering. expires_at stays
+    // in seconds — they're never compared.
+    let nowMillis = Int(Date().timeIntervalSince1970 * 1000)
     let sql = """
       INSERT INTO active_dispatches
         (task_id, agent_id, chat_id, reply_token, session_id, started_at, expires_at, has_replied)
@@ -189,21 +221,64 @@ enum DatabaseManager {
       """
     dbExec(
       sql,
-      params: serializeParams([taskId, agentId, chatId, replyToken, sessionId, now, expiresAt])
-    )
+      params: serializeParams(
+        [taskId, agentId, chatId, replyToken, sessionId, nowMillis, expiresAt]))
   }
 
+  /// Returns the most recently dispatched row for `(agentId, chatId)` or nil
+  /// if no dispatches are in flight. Multiple rows can coexist for the same
+  /// chat (each turn pre-inserts before `dispatch`); only the latest matters
+  /// for the soft-interrupt branch in `handleWebhook`.
   static func activeDispatch(agentId: String, forChat chatId: Int64) -> ActiveDispatchRow? {
     let sql = """
       SELECT task_id, agent_id, chat_id, reply_token, session_id, expires_at, has_replied
       FROM active_dispatches
       WHERE agent_id = ?1 AND chat_id = ?2
+      ORDER BY started_at DESC
       LIMIT 1
       """
     guard let resultStr = dbQuery(sql, params: serializeParams([agentId, chatId])) else {
       return nil
     }
     return parseDispatchRow(resultStr)
+  }
+
+  /// Like `activeDispatch`, but skips a specific `reply_token`. Used by the
+  /// soft-interrupt branch in `handleWebhook` AFTER it has pre-inserted the
+  /// current turn's row — we want the *prior* in-flight task to interrupt,
+  /// not ourselves.
+  static func priorActiveDispatch(
+    agentId: String, forChat chatId: Int64, excluding replyToken: String
+  ) -> ActiveDispatchRow? {
+    let sql = """
+      SELECT task_id, agent_id, chat_id, reply_token, session_id, expires_at, has_replied
+      FROM active_dispatches
+      WHERE agent_id = ?1 AND chat_id = ?2 AND reply_token != ?3
+      ORDER BY started_at DESC
+      LIMIT 1
+      """
+    guard
+      let resultStr = dbQuery(
+        sql, params: serializeParams([agentId, chatId, replyToken]))
+    else { return nil }
+    return parseDispatchRow(resultStr)
+  }
+
+  /// Returns every in-flight dispatch row for `(agentId, chatId)`. Used by
+  /// `/reset` so we can hard-cancel every concurrent turn for a chat in one
+  /// pass, not just the latest one.
+  static func allActiveDispatches(agentId: String, forChat chatId: Int64)
+    -> [ActiveDispatchRow]
+  {
+    let sql = """
+      SELECT task_id, agent_id, chat_id, reply_token, session_id, expires_at, has_replied
+      FROM active_dispatches
+      WHERE agent_id = ?1 AND chat_id = ?2
+      ORDER BY started_at DESC
+      """
+    guard let resultStr = dbQuery(sql, params: serializeParams([agentId, chatId]))
+    else { return [] }
+    return parseDispatchRows(resultStr)
   }
 
   /// Looks up a dispatch by reply_token. reply_token is globally unique so
@@ -235,6 +310,21 @@ enum DatabaseManager {
   static func deleteActiveDispatch(taskId: String) {
     let sql = "DELETE FROM active_dispatches WHERE task_id = ?1"
     dbExec(sql, params: serializeParams([taskId]))
+  }
+
+  /// Removes a row by reply_token. Used by the webhook handler to unwind
+  /// a pre-inserted binding when the subsequent `dispatch` call failed
+  /// (no real task_id to delete by yet).
+  static func deleteActiveDispatch(replyToken: String) {
+    let sql = "DELETE FROM active_dispatches WHERE reply_token = ?1"
+    dbExec(sql, params: serializeParams([replyToken]))
+  }
+
+  /// Patches the placeholder task_id on a pre-inserted row to the real
+  /// one returned by `dispatch`.
+  static func updateTaskId(replyToken: String, newTaskId: String) {
+    let sql = "UPDATE active_dispatches SET task_id = ?1 WHERE reply_token = ?2"
+    dbExec(sql, params: serializeParams([newTaskId, replyToken]))
   }
 
   static func markReplied(taskId: String) {
@@ -298,7 +388,22 @@ enum DatabaseManager {
     guard let rows = extractRows(resultStr),
       let row = rows.first, row.count >= 7
     else { return nil }
-    return ActiveDispatchRow(
+    return dispatchRow(from: row)
+  }
+
+  /// Multi-row variant for callers that want every match (e.g. `/reset`
+  /// cancels every in-flight turn for a chat). Skips malformed rows but
+  /// otherwise preserves the SELECT order.
+  private static func parseDispatchRows(_ resultStr: String) -> [ActiveDispatchRow] {
+    guard let rows = extractRows(resultStr) else { return [] }
+    return rows.compactMap { row -> ActiveDispatchRow? in
+      guard row.count >= 7 else { return nil }
+      return dispatchRow(from: row)
+    }
+  }
+
+  private static func dispatchRow(from row: [Any]) -> ActiveDispatchRow {
+    ActiveDispatchRow(
       taskId: "\(row[0])",
       agentId: "\(row[1])",
       chatId: int64FromAny(row[2]) ?? 0,

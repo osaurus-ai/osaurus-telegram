@@ -180,6 +180,12 @@ final class WebhookTests: XCTestCase {
     XCTAssertTrue(prompt.contains("[reply_token "))
     XCTAssertTrue(prompt.contains("from alice"))
     XCTAssertTrue(prompt.contains("hello"))
+    // Per-turn reminder: without this, models that lean on a generic
+    // "gather → complete" loop drop the reply step after a sandbox tool
+    // call. The directive must reach the model on every single turn.
+    XCTAssertTrue(
+      prompt.contains("respond by calling reply"),
+      "per-turn header must remind the model to call reply before ending the turn")
 
     let title = try XCTUnwrap(dispatch["title"] as? String)
     XCTAssertEqual(title, "Telegram alice")
@@ -190,10 +196,14 @@ final class WebhookTests: XCTestCase {
     let expected = sessionUUID(forChatId: 555, salt: chat.sessionSalt).uuidString
     XCTAssertEqual(sessionId, expected, "session id must be deterministic UUID5")
 
-    // The dispatch carries an agent-scoped external_session_key so the
-    // host's reattach lookup can't collide across agents.
-    let externalKey = try XCTUnwrap(dispatch["external_session_key"] as? String)
-    XCTAssertEqual(externalKey, "telegram:agent-\(agentId):chat-555")
+    // The dispatch must explicitly request our reply tools on the
+    // host's v3+ `tools` field. Without this, an agent with manual
+    // tool selection would receive the user's message but have no way
+    // to respond.
+    let tools = try XCTUnwrap(dispatch["tools"] as? [String])
+    XCTAssertEqual(
+      Set(tools), Set(["reply", "reply_typing", "reply_photo"]),
+      "dispatch must request the full reply surface")
 
     // Active dispatch row inserted for this chat.
     let active = try XCTUnwrap(
@@ -208,9 +218,9 @@ final class WebhookTests: XCTestCase {
       secret: secret, update: textUpdate(updateId: 200, chatId: 777, text: "first"))
     _ = route(firstReq)
 
-    // Need a fresh task id for the second one (UNIQUE (agent_id, chat_id)
-    // requires we remove the prior row first; the interrupt branch handles
-    // that).
+    // Second turn gets a different host task id. Schema v3 lets the new
+    // row coexist with the old one (no UNIQUE constraint to fight); both
+    // attach to the same session id so the agent sees a single thread.
     TestHostGlobals.nextDispatchResponse =
       #"{"id":"task-uuid-2","status":"running"}"#
 
@@ -259,7 +269,67 @@ final class WebhookTests: XCTestCase {
     XCTAssertTrue(TestHostGlobals.dispatchCalls.isEmpty)
   }
 
-  // MARK: - /reset
+  // MARK: - reset commands (/clear, /reset, aliases, @botname suffix)
+
+  func testIsResetCommandRecognizesAllAliasesAndCasings() {
+    // Documented verbs.
+    for verb in ["/clear", "/reset", "/new", "/restart"] {
+      XCTAssertTrue(isResetCommand(verb), "\(verb) must be recognised")
+      XCTAssertTrue(
+        isResetCommand(verb.uppercased()),
+        "case-insensitive match must accept \(verb.uppercased())")
+    }
+    // Telegram appends `@botname` in group chats — must be tolerated.
+    XCTAssertTrue(isResetCommand("/clear@MyBot"))
+    XCTAssertTrue(isResetCommand("/Reset@SomeBot_Test"))
+
+    // Non-matches.
+    XCTAssertFalse(isResetCommand(""))
+    XCTAssertFalse(isResetCommand("clear"), "must require leading slash")
+    XCTAssertFalse(isResetCommand("/cleared"))
+    XCTAssertFalse(
+      isResetCommand("/clear now"),
+      "embedded whitespace means it's a chat message, not a bare command")
+    XCTAssertFalse(isResetCommand("/start"))
+  }
+
+  func testClearCommandResetsTheConversation() {
+    // Same flow as /reset: bump salt, cancel active dispatch, post the
+    // confirmation, do NOT dispatch a fresh agent turn.
+    _ = DatabaseManager.upsertChatSession(agentId: agentId, chatId: 810)
+    DatabaseManager.insertActiveDispatch(
+      taskId: "running-task-clear", agentId: agentId, chatId: 810,
+      replyToken: "TOKCLEAR1", sessionId: "old-session",
+      expiresAt: Int(Date().timeIntervalSince1970) + 600)
+
+    let req = webhookRequest(
+      secret: secret, update: textUpdate(updateId: 710, chatId: 810, text: "/clear"))
+    let response = parseRouteResponse(route(req))
+    XCTAssertEqual(response.status, 200)
+
+    XCTAssertEqual(
+      DatabaseManager.getChatSession(agentId: agentId, chatId: 810)?.sessionSalt, 1,
+      "/clear must bump the session salt")
+    XCTAssertNil(DatabaseManager.activeDispatch(agentId: agentId, forChat: 810))
+    XCTAssertEqual(TestHostGlobals.cancelCalls, ["running-task-clear"])
+    XCTAssertTrue(
+      TestHostGlobals.dispatchCalls.isEmpty,
+      "/clear must NOT dispatch a fresh agent turn")
+  }
+
+  func testClearWithBotMentionInGroupChatStillResets() {
+    // Group chats deliver `/clear@BotName` instead of bare `/clear`.
+    _ = DatabaseManager.upsertChatSession(agentId: agentId, chatId: 820)
+    let req = webhookRequest(
+      secret: secret,
+      update: textUpdate(updateId: 720, chatId: 820, text: "/clear@MyTestBot"))
+    _ = route(req)
+
+    XCTAssertEqual(
+      DatabaseManager.getChatSession(agentId: agentId, chatId: 820)?.sessionSalt, 1,
+      "/clear@<bot> must be treated as /clear")
+    XCTAssertTrue(TestHostGlobals.dispatchCalls.isEmpty)
+  }
 
   func testResetBumpsSaltAndCancelsActiveDispatch() {
     // Seed an active dispatch for chat 800.
@@ -297,8 +367,7 @@ final class WebhookTests: XCTestCase {
     _ = route(first)
     XCTAssertEqual(TestHostGlobals.dispatchCalls.count, 1)
 
-    // Second message arrives mid-flight. Configure a new task id so the
-    // fresh insert succeeds after we delete the prior row.
+    // Second message arrives mid-flight with its own task id.
     TestHostGlobals.nextDispatchResponse =
       #"{"id":"task-second","status":"running"}"#
 
@@ -319,9 +388,97 @@ final class WebhookTests: XCTestCase {
       TestHostGlobals.dispatchCalls[0]["session_id"] as? String,
       TestHostGlobals.dispatchCalls[1]["session_id"] as? String)
 
-    // Active dispatch row now points at the new task.
-    let active = DatabaseManager.activeDispatch(agentId: agentId, forChat: 900)
-    XCTAssertEqual(active?.taskId, "task-second")
+    // Schema v3: BOTH rows coexist after the interrupt. The prior row is
+    // not deleted by the webhook handler — it's left to its own terminal
+    // event (or the TTL sweep) to clean up. activeDispatch returns the
+    // latest one.
+    let allActive = DatabaseManager.allActiveDispatches(
+      agentId: agentId, forChat: 900)
+    XCTAssertEqual(
+      Set(allActive.map { $0.taskId }), Set(["task-uuid", "task-second"]),
+      "schema v3 keeps the prior row until its terminal event arrives")
+    XCTAssertEqual(
+      DatabaseManager.activeDispatch(agentId: agentId, forChat: 900)?.taskId,
+      "task-second",
+      "activeDispatch returns the most recently dispatched row")
+  }
+
+  func testReplyTokenBoundBeforeDispatchReturns() throws {
+    // The whole point of the v3 redesign: the agent can never observe a
+    // "stale_token" for the current turn because the binding is in the DB
+    // before the host returns from `dispatch`. We assert that invariant by
+    // looking up the binding from the dispatch inspector, which fires
+    // synchronously inside `stub_dispatch` BEFORE the response is
+    // returned to the plugin.
+    var observedToken: String?
+    var observedTaskIdAtDispatch: String?
+    TestHostGlobals.dispatchInspector = { request in
+      let prompt = request["prompt"] as? String ?? ""
+      // Pull the token out of the per-turn header `[reply_token <token>
+      // from <name>]` exactly the way `Tools.reply` does in production.
+      guard let openBracket = prompt.firstIndex(of: "["),
+        let closeBracket = prompt.firstIndex(of: "]")
+      else { return }
+      let header = prompt[prompt.index(after: openBracket)..<closeBracket]
+      let parts = header.split(separator: " ")
+      guard parts.count >= 2, parts[0] == "reply_token" else { return }
+      let token = String(parts[1])
+      observedToken = token
+      observedTaskIdAtDispatch =
+        DatabaseManager.lookupBinding(token: token)?.taskId
+    }
+
+    let req = webhookRequest(
+      secret: secret, update: textUpdate(updateId: 1200, chatId: 1200, text: "hi"))
+    _ = route(req)
+
+    let token = try XCTUnwrap(
+      observedToken, "test inspector should have captured the minted token")
+    // Inside the dispatch call the row exists, but its task_id is still
+    // the pre-insert placeholder — proving the binding was pinned BEFORE
+    // the host returned `task_id` to the plugin.
+    let placeholder = try XCTUnwrap(
+      observedTaskIdAtDispatch,
+      "binding must exist in the DB before dispatch returns")
+    XCTAssertEqual(
+      placeholder, pendingTaskId(for: token),
+      "binding inside dispatch should still carry the pre-insert placeholder")
+
+    // After the webhook returns the placeholder must be patched to the
+    // real task_id that the host returned.
+    XCTAssertEqual(
+      DatabaseManager.lookupBinding(token: token)?.taskId, "task-uuid",
+      "placeholder task_id must be patched to the host-returned task_id")
+  }
+
+  // MARK: - dispatch error unwinds the pre-inserted row
+
+  func testRateLimitErrorUnwindsPreInsertedRow() {
+    TestHostGlobals.nextDispatchResponse = #"{"error":"rate_limit_exceeded"}"#
+    let req = webhookRequest(
+      secret: secret, update: textUpdate(updateId: 1300, chatId: 1300, text: "hi"))
+    _ = route(req)
+
+    // The webhook handler pre-inserts the binding BEFORE calling
+    // dispatch. Once dispatch returns an error, that pre-insert must be
+    // unwound — otherwise we'd leak a "phantom" row that only the TTL
+    // sweep would eventually reap.
+    XCTAssertNil(DatabaseManager.activeDispatch(agentId: agentId, forChat: 1300))
+    XCTAssertTrue(
+      DatabaseManager.allActiveDispatches(agentId: agentId, forChat: 1300).isEmpty,
+      "pre-inserted row must be unwound on rate-limit error")
+  }
+
+  func testDispatchMissingIdUnwindsPreInsertedRow() {
+    // Host returns a 200-OK shaped response but with no id and no error.
+    // The webhook handler can't possibly patch the placeholder task_id —
+    // unwinding the row keeps the DB clean.
+    TestHostGlobals.nextDispatchResponse = #"{"status":"running"}"#
+    let req = webhookRequest(
+      secret: secret, update: textUpdate(updateId: 1301, chatId: 1301, text: "hi"))
+    _ = route(req)
+
+    XCTAssertNil(DatabaseManager.activeDispatch(agentId: agentId, forChat: 1301))
   }
 
   // MARK: - dispatch error: rate_limit_exceeded posts a meta-message

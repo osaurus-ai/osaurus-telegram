@@ -46,6 +46,13 @@ enum TestHostGlobals {
   nonisolated(unsafe) static var interruptCalls: [(taskId: String, text: String)] = []
   nonisolated(unsafe) static var cancelCalls: [String] = []
   nonisolated(unsafe) static var httpCalls: [[String: Any]] = []
+
+  /// Optional callback fired BEFORE `stub_dispatch` returns. Lets tests
+  /// inspect the world (specifically the active_dispatches table) at the
+  /// instant the host would receive the dispatch — i.e. verify the
+  /// reply_token binding is already pinned in the DB before the agent has
+  /// any chance to call `reply`. Reset to nil on install/uninstall.
+  nonisolated(unsafe) static var dispatchInspector: (([String: Any]) -> Void)?
   nonisolated(unsafe) static var nextDispatchResponse: String =
     #"{"id":"task-uuid","status":"running"}"#
   nonisolated(unsafe) static var nextHttpResponse: String =
@@ -92,6 +99,7 @@ enum TestHost {
     TestHostGlobals.lastRegisteredURL = ""
     TestHostGlobals.simulatedWebhookErrorMessage = nil
     TestHostGlobals.simulatedWebhookErrorDate = 0
+    TestHostGlobals.dispatchInspector = nil
 
     if TestHostGlobals.db != nil {
       sqlite3_close(TestHostGlobals.db)
@@ -103,7 +111,7 @@ enum TestHost {
     TestHostGlobals.db = handle
 
     var api = osr_host_api()
-    api.version = 4
+    api.version = 6
     api.config_get = stub_config_get
     api.config_set = stub_config_set
     api.config_delete = stub_config_delete
@@ -116,6 +124,12 @@ enum TestHost {
     api.http_request = stub_http_request
     api.list_active_tasks = stub_list_active_tasks
     api.get_active_agent_id = stub_get_active_agent_id
+    // v5 / v6 slots — `log_structured` is unused by the plugin but
+    // wiring it ensures any future call lands on a known stub instead
+    // of NULL. `free_string` mirrors the host's allocator-stable free
+    // path so tests exercise the same code path as production.
+    api.log_structured = stub_log_structured
+    api.free_string = stub_host_free_string
 
     TestHostGlobals.apiTable = api
     withUnsafePointer(to: &TestHostGlobals.apiTable) { ptr in
@@ -136,6 +150,7 @@ enum TestHost {
     TestHostGlobals.interruptCalls = []
     TestHostGlobals.cancelCalls = []
     TestHostGlobals.httpCalls = []
+    TestHostGlobals.dispatchInspector = nil
   }
 
   // MARK: - Per-agent config helpers
@@ -194,9 +209,20 @@ private let stub_config_delete: osr_config_delete_fn = { keyPtr in
 
 private let stub_log: osr_log_fn = { _, _ in /* swallow */ }
 
+private let stub_log_structured: osr_log_structured_fn = { _, _, _ in /* swallow */ }
+
 private let stub_get_active_agent_id: osr_get_active_agent_id_fn = {
   guard let id = TestHostGlobals.activeAgentId else { return nil }
   return UnsafePointer(strdup(id))
+}
+
+/// Mirrors the real host's `free_string`: it's just `libc free` on the
+/// pointer the host allocated with `strdup`. Wiring this in tests means
+/// the production code path (which prefers `host->free_string` over a
+/// direct `libc free()`) is exercised end-to-end.
+private let stub_host_free_string: osr_host_free_string_fn = { ptr in
+  guard let ptr else { return }
+  free(UnsafeMutableRawPointer(mutating: ptr))
 }
 
 private let stub_db_exec: osr_db_exec_fn = { sqlPtr, paramsPtr in
@@ -271,6 +297,11 @@ private let stub_dispatch: osr_dispatch_fn = { reqPtr in
   let req = String(cString: reqPtr)
   if let parsed = parseJSONObject(req) {
     TestHostGlobals.dispatchCalls.append(parsed)
+    // Inspector runs after the call is recorded but before we return —
+    // i.e. at the instant the host would start scheduling the agent.
+    // The agent has NOT yet had any opportunity to call `reply`, so any
+    // pre-bound row must already be visible in the DB at this point.
+    TestHostGlobals.dispatchInspector?(parsed)
   }
   return UnsafePointer(strdup(TestHostGlobals.nextDispatchResponse))
 }

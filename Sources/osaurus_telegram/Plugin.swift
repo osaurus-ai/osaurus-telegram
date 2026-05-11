@@ -109,10 +109,23 @@ private func makeAPI() -> osr_plugin_api {
       logWarn("on_config_changed called with nil key")
       return
     }
+    let key = String(cString: keyPtr)
+    // Pre-flight ABI probe (v6+). The host fires this synthetic
+    // (key, UUID) pair through `on_config_changed` before any real
+    // per-agent push, specifically to trigger a misalignment crash if
+    // our `osr_host_api` mirror is wrong. Early-return here keeps the
+    // probe cheap and stops a synthetic agent_id from leaking into the
+    // registry (which would generate a webhook_secret for a
+    // non-existent agent). See docs/plugins/HOST_API.md → "Pre-flight
+    // ABI probe".
+    if key == "__osaurus_abi_probe__" {
+      logDebug("on_config_changed: ABI probe acknowledged")
+      return
+    }
     guard let frame = resolveAgentFrame(ctxPtr, caller: "on_config_changed") else { return }
     onConfigChanged(
       state: frame.state,
-      key: String(cString: keyPtr),
+      key: key,
       value: valuePtr.map { String(cString: $0) })
   }
 

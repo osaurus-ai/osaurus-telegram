@@ -2,11 +2,25 @@ import Foundation
 
 // MARK: - Task Event Handler
 //
-// In the agent-driven model `on_task_event` is observability + a safety net,
-// not the delivery mechanism. The agent owns user-visible UI via the reply
-// tools. We log lifecycle events at debug level and only post to Telegram
-// when a run terminated without ever calling reply (so the user isn't left
+// `on_task_event` is observability + a safety net, not the delivery
+// mechanism. The agent owns user-visible UI via the reply tools. We log
+// every lifecycle event at debug level and only post to Telegram when a
+// run terminated without ever calling reply (so the user isn't left
 // hanging) or hard-failed.
+
+/// Delay applied to the COMPLETED safety-net check.
+///
+/// The Osaurus host can emit COMPLETED more than once per task: first
+/// after the agent's initial streaming round (carrying interim text like
+/// `"No response needed."`), then again after the tool-call round finishes.
+/// Posting the safety-net text on the first COMPLETED would beat the
+/// agent's actual `reply` from the next round to the user — and the row
+/// would be gone by the time `reply` was invoked, producing `stale_token`.
+///
+/// The fix: defer the check. A late `reply` flips `has_replied` and the
+/// deferred handler short-circuits. Tests set this to 0 so behaviour
+/// stays synchronous; production keeps a few-second cushion.
+nonisolated(unsafe) var safetyNetDelaySeconds: TimeInterval = 5
 
 private enum TaskEventType {
   static let started: Int32 = 0
@@ -37,25 +51,30 @@ func handleTaskEvent(
 
   switch eventType {
   case TaskEventType.completed:
-    runTerminalSafetyNet(
-      state: state, taskId: taskId, caller: "handleCompleted",
-      logLevel: .info,
-      message: {
-        let summary = (parseJSONObject(eventJSON)?["summary"] as? String) ?? "(done)"
-        return String(summary.prefix(4000))
-      })
+    // See `safetyNetDelaySeconds` comment for the reason we defer.
+    scheduleSafetyNet(delay: safetyNetDelaySeconds) {
+      runTerminalSafetyNet(
+        state: state, taskId: taskId, caller: "handleCompleted",
+        logLevel: .info,
+        message: { safetyNetCompletedMessage(eventJSON: eventJSON) })
+    }
 
   case TaskEventType.failed:
+    // FAILED isn't fired prematurely between LLM rounds (unlike COMPLETED),
+    // so the apology can post synchronously without racing a late reply.
     runTerminalSafetyNet(
       state: state, taskId: taskId, caller: "handleFailed",
       logLevel: .warn,
       message: { "Sorry, something went wrong handling that." })
 
   case TaskEventType.cancelled:
-    // Cancellation happens either from /reset or because a new message
-    // arrived and we issued dispatch_interrupt — we already cleaned up the
-    // row in both paths. Belt-and-suspenders: delete again here.
-    DatabaseManager.deleteActiveDispatch(taskId: taskId)
+    // CANCELLED reaches us when /reset hard-cancels (already cleaned up in
+    // handleReset) or when `dispatch_interrupt` is treated as a cancel by
+    // some host versions. The current step at that moment can be the
+    // reply tool call we're waiting on, so deleting the row here would
+    // re-introduce exactly the stale_token race v3 was meant to fix.
+    // Leave it alone — TTL retires anything /reset didn't already clear.
+    logDebug("handleTaskEvent: CANCELLED for task \(taskId); leaving binding for trailing reply")
 
   case TaskEventType.started,
     TaskEventType.activity,
@@ -73,10 +92,10 @@ func handleTaskEvent(
 
 // MARK: - Terminal events
 //
-// COMPLETED and FAILED differ only in the safety-net message and log
-// severity. Everything else — binding lookup, agent-ownership check,
-// hasReplied gate, and row cleanup — is identical, so we share one
-// implementation.
+// COMPLETED and FAILED share this body — only the message text and log
+// level differ. The row is intentionally NOT deleted here; a late `reply`
+// from a subsequent LLM round still needs the binding. The 10-minute
+// TTL sweep retires anything that never gets replied to.
 
 private func runTerminalSafetyNet(
   state: AgentState,
@@ -89,23 +108,54 @@ private func runTerminalSafetyNet(
     logDebug("\(caller): no binding for task \(taskId), skipping")
     return
   }
-  // Defense-in-depth: a misrouted task event must never trigger a Telegram
-  // post on the wrong agent's bot.
+  // Defense-in-depth: a misrouted task event must never post on the
+  // wrong agent's bot.
   guard binding.agentId == state.agentId else {
     logWarn(
       "\(caller): task \(taskId) belongs to agent \(binding.agentId), "
-        + "not the active agent \(state.agentId); ignoring")
+        + "not active agent \(state.agentId); ignoring")
     return
   }
+  guard !DatabaseManager.hasReplied(taskId: taskId) else { return }
 
-  if !DatabaseManager.hasReplied(taskId: taskId) {
-    state.log(
-      logLevel, "\(caller): safety-net post for task \(taskId) chat \(binding.chatId)")
-    if let token = state.botToken {
-      _ = telegramSendMessage(
-        token: token, chatId: binding.chatId,
-        text: message())
-    }
+  state.log(logLevel, "\(caller): safety-net post for task \(taskId) chat \(binding.chatId)")
+  if let token = state.botToken {
+    _ = telegramSendMessage(token: token, chatId: binding.chatId, text: message())
   }
-  DatabaseManager.deleteActiveDispatch(taskId: taskId)
+  // Flip has_replied so a duplicate COMPLETED can't double-post.
+  DatabaseManager.markReplied(taskId: taskId)
+}
+
+/// Runs `work` after `delay` seconds on a utility queue, or inline when
+/// `delay <= 0` (tests, or any caller that wants synchronous semantics).
+private func scheduleSafetyNet(
+  delay: TimeInterval, _ work: @escaping @Sendable () -> Void
+) {
+  guard delay > 0 else { return work() }
+  DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay, execute: work)
+}
+
+// MARK: - Safety-net message extraction
+//
+// When a task COMPLETEs without the agent ever calling `reply`, we need to
+// surface *something* to the user. The host's COMPLETED event carries both
+// `output` (the agent's final generated prose) and `summary` (a short
+// title-like description, e.g. "Chat completed"). Prefer `output` because
+// "Chat completed" is not an answer; only fall back to `summary` when the
+// agent produced no final prose at all.
+func safetyNetCompletedMessage(eventJSON: String) -> String {
+  let obj = parseJSONObject(eventJSON)
+  let whitespace = CharacterSet.whitespacesAndNewlines
+  let output = (obj?["output"] as? String)?.trimmingCharacters(in: whitespace)
+  let summary = (obj?["summary"] as? String)?.trimmingCharacters(in: whitespace)
+
+  let pick: String
+  if let output, !output.isEmpty {
+    pick = output
+  } else if let summary, !summary.isEmpty {
+    pick = summary
+  } else {
+    pick = "(done)"
+  }
+  return String(pick.prefix(4000))
 }

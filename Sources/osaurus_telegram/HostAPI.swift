@@ -1,10 +1,24 @@
 import Foundation
 
-// MARK: - C ABI Surface (v2)
+// MARK: - C ABI Surface
 //
-// Frozen layout. The host loads us via dlopen and reads `osr_host_api` /
-// `osr_plugin_api` byte-for-byte; reordering or removing fields would
-// silently corrupt callbacks. Add new entries only at the end.
+// Mirrors `osr_host_api` from the Osaurus plugin SDK
+// (`Packages/OsaurusCore/Tools/PluginABI/osaurus_plugin.h`). The struct
+// layout is FROZEN — every slot's offset is pinned. Host versions append
+// new callbacks at the end; mirrors that drop or reorder a single slot
+// dispatch every later callback into the wrong host function and
+// typically crash inside `libc free()` on a non-malloc pointer.
+//
+// Pinned offsets (Apple Silicon, default C alignment) at the time of
+// writing — these MUST match what the host writes:
+//   version              0
+//   get_active_agent_id  176
+//   log_structured       184
+//   free_string          192
+//   (struct stride)      200
+//
+// `Tests/.../HostAPILayoutTests.swift` asserts these offsets at test
+// time so a future skipped slot fails CI before it ships.
 
 typealias osr_plugin_ctx_t = UnsafeMutableRawPointer
 
@@ -42,7 +56,7 @@ typealias osr_http_request_fn = @convention(c) (UnsafePointer<CChar>?) -> Unsafe
 // File I/O
 typealias osr_file_read_fn = @convention(c) (UnsafePointer<CChar>?) -> UnsafePointer<CChar>?
 
-// Extended Agent Dispatch (v2 trailing fields)
+// Extended Agent Dispatch (added in v2; preserved through v6)
 typealias osr_list_active_tasks_fn = @convention(c) () -> UnsafePointer<CChar>?
 typealias osr_send_draft_fn =
   @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Void
@@ -51,13 +65,31 @@ typealias osr_dispatch_interrupt_fn =
 typealias osr_dispatch_add_issue_fn =
   @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> UnsafePointer<CChar>?
 
-// ABI v4: agent context resolution
+// ABI v3: streaming control. Cancels an in-flight `complete_stream` by
+// the `stream_id` UUID the plugin passed in the request body.
+typealias osr_complete_cancel_fn = @convention(c) (UnsafePointer<CChar>?) -> Void
+
+// ABI v4: agent context resolution.
 //
-// Returns the UUID of the agent whose frame we're currently inside (handle_route,
-// invoke, on_config_changed, on_task_event), or NULL outside any per-agent frame
-// (e.g. plugin init or a background thread the plugin spawned). Callers must
-// release the returned C string with `free_string`.
+// Returns the UUID of the agent whose frame we're currently inside
+// (handle_route, invoke, on_config_changed, on_task_event), or NULL
+// outside any per-agent frame (e.g. plugin init or a background thread
+// the plugin spawned). Callers must release the returned C string with
+// `host->free_string` (v6+) or `libc free()` on older hosts.
 typealias osr_get_active_agent_id_fn = @convention(c) () -> UnsafePointer<CChar>?
+
+// ABI v5: structured logging companion to `osr_log_fn`. `payload` is a
+// JSON object string surfaced as searchable fields in Insights. Pass
+// nil to log a message with no fields.
+typealias osr_log_structured_fn =
+  @convention(c) (Int32, UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Void
+
+// ABI v6: host-side `free_string`. Pairs with the `strdup` every host
+// trampoline uses for its return value. NULL is a no-op. Plugins MUST
+// use this for host-returned strings instead of the plugin's own
+// `free_string` (which is the *opposite* direction). Older hosts leave
+// this slot NULL and the plugin should fall back to `libc free()`.
+typealias osr_host_free_string_fn = @convention(c) (UnsafePointer<CChar>?) -> Void
 
 struct osr_host_api {
   var version: UInt32 = 0
@@ -88,15 +120,28 @@ struct osr_host_api {
   // File I/O
   var file_read: osr_file_read_fn?
 
-  // Extended Agent Dispatch (v2 trailing fields)
+  // Extended Agent Dispatch (added in v2; preserved through v6)
   var list_active_tasks: osr_list_active_tasks_fn?
   var send_draft: osr_send_draft_fn?
   var dispatch_interrupt: osr_dispatch_interrupt_fn?
   var dispatch_add_issue: osr_dispatch_add_issue_fn?
 
-  // ABI v4: agent context resolution. NULL on older hosts and outside per-agent
-  // frames. Always guard reads with `version >= 4` AND a nil-check on the slot.
+  // Streaming control (added in v3). NULL on v2 hosts.
+  var complete_cancel: osr_complete_cancel_fn?
+
+  // Agent context introspection (added in v4). NULL on v3 and earlier
+  // hosts. Always guard with `version >= 4` before invoking.
   var get_active_agent_id: osr_get_active_agent_id_fn?
+
+  // Structured logging (added in v5). NULL on v4 and earlier hosts.
+  // The slot's presence is what makes `free_string` (v6) land at the
+  // right offset, so it MUST appear here even if we never call it.
+  var log_structured: osr_log_structured_fn?
+
+  // Host-side free for strings the host returned (added in v6). When
+  // available, prefer this over `libc free()` so a future allocator
+  // change on the host stays transparent.
+  var free_string: osr_host_free_string_fn?
 }
 
 // MARK: - Plugin API table (returned to host)

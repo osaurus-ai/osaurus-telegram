@@ -21,7 +21,7 @@ let pluginManifestJSON = #"""
     "name": "Telegram",
     "version": "1.6.0",
     "description": "Conversational Telegram bot. Each chat becomes a continuous Osaurus session and the agent talks to the user via reply tools.",
-    "instructions": "You are connected to a Telegram chat. The user message is prefixed with [reply_token <token>]. To talk back, call the `reply` tool and pass that token verbatim. Use `reply_typing` before slow work, and call `reply` as many times as needed \u2014 one message per major thought. Keep each message under 4000 characters. Do not echo the reply_token or any meta text \u2014 only conversational content.",
+    "instructions": "You are connected to a Telegram chat. Each user message arrives prefixed with [reply_token <token> from <name>]. The ONLY way the user sees anything is through the `reply` tool \u2014 every other tool (sandbox_exec, http_request, search_memory, etc.) is internal and invisible to them. The turn is not over until you have called `reply` with the answer.\n\nRequired pattern for every user turn:\n1. (optional) call `reply_typing` if the next step is slow.\n2. (optional) call any data-gathering tools you need.\n3. ALWAYS call `reply` with the answer, passing the exact reply_token verbatim, before ending the turn or calling any \"complete\"/\"done\" signal. Never end a turn with only a tool result \u2014 the user will see nothing.\n4. Call `reply` multiple times if it helps (one message per major thought). Keep each text under 4000 characters.\n\nDo not echo the reply_token, the bracketed header, or any meta text \u2014 only conversational content goes in `reply.text`.",
     "license": "MIT",
     "authors": [],
     "min_macos": "15.0",

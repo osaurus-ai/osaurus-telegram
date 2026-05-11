@@ -1,5 +1,19 @@
 import Foundation
 
+// MARK: - Dispatch tool surface
+//
+// Names of the tools the agent is allowed (and expected) to use to talk
+// back to Telegram. We pass these on every dispatch via the v3+ `tools`
+// field so an agent with manual / restrictive tool selection still has
+// the reply surface loaded — without it, the agent would receive the
+// user's message but have no way to respond.
+//
+// MUST stay in sync with the manifest's `capabilities.tools[].id`
+// values. `ManifestTests.testToolsListIsExactlyReplyReplyTypingReplyPhoto`
+// pins the manifest side; `WebhookTests.testWebhookDispatchesValidTextMessage`
+// pins this set on the dispatch payload.
+let dispatchToolNames: [String] = ["reply", "reply_typing", "reply_photo"]
+
 // MARK: - Route Handler
 
 func handleRoute(state: AgentState, agentId: String, requestJSON: String) -> String {
@@ -67,6 +81,9 @@ private func handleWebhook(state: AgentState, agentId: String, req: RouteRequest
   }
   DatabaseManager.markUpdateSeen(agentId: agentId, updateId: update.update_id)
   DatabaseManager.pruneOldSeenUpdates()
+  // active_dispatches rows outlive COMPLETED (see runTerminalSafetyNet),
+  // so piggy-back a TTL sweep here instead of running a background timer.
+  DatabaseManager.sweepExpiredDispatches()
 
   // 4. Resolve / create chat row. Skip if blocked.
   let chat = DatabaseManager.upsertChatSession(agentId: agentId, chatId: chatId)
@@ -75,9 +92,12 @@ private func handleWebhook(state: AgentState, agentId: String, req: RouteRequest
     return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
   }
 
-  // 5. Handle /reset inline before dispatching.
+  // 5. Handle reset commands inline before dispatching. Telegram appends
+  //    `@botname` to commands sent in group chats — `/clear@MyBot` should
+  //    behave identically to `/clear`. We also accept `/reset` as a
+  //    historical alias.
   let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-  if trimmed == "/reset" {
+  if isResetCommand(trimmed) {
     handleReset(state: state, agentId: agentId, chatId: chatId)
     return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
   }
@@ -88,38 +108,61 @@ private func handleWebhook(state: AgentState, agentId: String, req: RouteRequest
 
   let displayName =
     message.from?.username ?? message.from?.first_name ?? "user"
-  let prompt = "[reply_token \(replyToken) from \(displayName)]\n\(text)"
+  // The per-turn header is the highest-recency place to remind the model of
+  // the reply contract. Without this, models that lean on a generic
+  // "gather → complete" agent loop sometimes finish a turn after a
+  // data-gathering tool without ever calling `reply`, leaving the user
+  // staring at our safety-net fallback instead of the actual answer.
+  let prompt =
+    "[reply_token \(replyToken) from \(displayName)] "
+    + "respond by calling reply(reply_token=\"\(replyToken)\", text=...) "
+    + "before ending the turn.\n\(text)"
 
-  // 7. If a task is already running for this chat, interrupt it (host
-  //    appends our text into the live session and cancels the stream),
-  //    then dispatch a fresh turn against the same session_id. Naturally
-  //    handles rapid-fire messages without queues.
-  if let active = DatabaseManager.activeDispatch(agentId: agentId, forChat: chatId) {
-    logDebug(
-      "handleWebhook: interrupting active task \(active.taskId) for chat \(chatId)")
+  // 7. Pre-bind reply_token BEFORE calling `dispatch`. The host can
+  //    schedule the agent the instant dispatch returns, and a fast agent
+  //    can call `reply` before our INSERT lands if we don't get ahead of
+  //    it. The placeholder task_id is patched to the real one once
+  //    dispatch returns; reply lookups key on reply_token (the PK).
+  let expiresAt = Int(Date().timeIntervalSince1970) + 600  // 10 minutes
+  DatabaseManager.insertActiveDispatch(
+    taskId: pendingTaskId(for: replyToken),
+    agentId: agentId, chatId: chatId,
+    replyToken: replyToken, sessionId: session.uuidString,
+    expiresAt: expiresAt)
+
+  // 8. Soft-stop the previous in-flight task for this chat (if any) so
+  //    the host doesn't keep burning tokens on an answer the user has
+  //    already moved past. We DO NOT delete its row — its own terminal
+  //    event handles that. `priorActiveDispatch` filters out our just-
+  //    inserted row so we never interrupt ourselves.
+  if let prior = DatabaseManager.priorActiveDispatch(
+    agentId: agentId, forChat: chatId, excluding: replyToken)
+  {
+    logDebug("handleWebhook: interrupting prior task \(prior.taskId) for chat \(chatId)")
     if let interrupt = hostAPI?.pointee.dispatch_interrupt {
-      active.taskId.withCString { tid in
+      prior.taskId.withCString { tid in
         text.withCString { p in interrupt(tid, p) }
       }
     } else if let cancel = hostAPI?.pointee.dispatch_cancel {
       logWarn("handleWebhook: dispatch_interrupt unavailable; cancelling instead")
-      active.taskId.withCString { tid in cancel(tid) }
+      prior.taskId.withCString { tid in cancel(tid) }
     }
-    DatabaseManager.deleteActiveDispatch(taskId: active.taskId)
   }
 
-  // 8. Dispatch. Fire and forget. The agent will call our reply tool.
-  //    `external_session_key` keeps the host's session-reattach logic
-  //    agent-scoped as defense-in-depth alongside the new (agent_id,
-  //    chat_id) DB partitioning.
+  // 9. Dispatch. Fire and forget — the agent will call our reply tools.
+  //    `tools` (v3+) explicitly requests the reply surface so an agent
+  //    with manual tool selection still has it loaded. `session_id` is
+  //    a deterministic UUID5 per chat; the host uses it as the external
+  //    grouping key so repeated turns reattach to the same session row.
   let dispatchPayload: [String: Any] = [
     "prompt": prompt,
     "title": "Telegram \(displayName)",
     "session_id": session.uuidString,
-    "external_session_key": "telegram:agent-\(agentId):chat-\(chatId)",
+    "tools": dispatchToolNames,
   ]
   guard let dispatchJSON = makeJSONString(dispatchPayload) else {
     logError("handleWebhook: failed to serialize dispatch payload")
+    DatabaseManager.deleteActiveDispatch(replyToken: replyToken)
     return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
   }
 
@@ -127,10 +170,12 @@ private func handleWebhook(state: AgentState, agentId: String, req: RouteRequest
     let parsed = parseJSON(resultStr, as: DispatchResponse.self)
   else {
     logError("handleWebhook: dispatch unavailable or returned malformed result")
+    DatabaseManager.deleteActiveDispatch(replyToken: replyToken)
     return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
   }
 
   if let errCode = parsed.error {
+    DatabaseManager.deleteActiveDispatch(replyToken: replyToken)
     if errCode == "rate_limit_exceeded" {
       // Plugin-owned meta-message: the user must hear *something*.
       if let token = state.botToken {
@@ -146,25 +191,56 @@ private func handleWebhook(state: AgentState, agentId: String, req: RouteRequest
 
   guard let taskId = parsed.id else {
     logError("handleWebhook: dispatch result missing id: \(String(resultStr.prefix(200)))")
+    DatabaseManager.deleteActiveDispatch(replyToken: replyToken)
     return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
   }
 
-  let expiresAt = Int(Date().timeIntervalSince1970) + 600  // 10 minutes
-  DatabaseManager.insertActiveDispatch(
-    taskId: taskId, agentId: agentId, chatId: chatId,
-    replyToken: replyToken, sessionId: session.uuidString, expiresAt: expiresAt)
+  // 10. Patch the placeholder task_id so terminal events can resolve back
+  //     to the binding via lookupBindingByTask.
+  DatabaseManager.updateTaskId(replyToken: replyToken, newTaskId: taskId)
   logInfo("Dispatched task \(taskId) for chat \(chatId) (token=\(replyToken))")
 
   return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
 }
 
-// MARK: - /reset
+/// Placeholder task_id stamped on the pre-inserted row before `dispatch`
+/// returns the real one. Unique because reply_tokens are; the `_pending_`
+/// prefix is a debugging marker for rows that lost the dispatch race.
+func pendingTaskId(for replyToken: String) -> String {
+  "_pending_\(replyToken)"
+}
+
+// MARK: - reset commands
+
+/// Verbs the user can send to bump the chat's session salt. Compared
+/// case-insensitively after stripping the `/` prefix and any
+/// `@botname` suffix Telegram appends in group chats.
+private let resetCommandVerbs: Set<String> = ["reset", "clear", "new", "restart"]
+
+/// True when `text` (already trimmed of surrounding whitespace) is one
+/// of the documented reset commands. Handles `/clear`, `/clear@MyBot`,
+/// `/CLEAR`, etc. uniformly.
+func isResetCommand(_ text: String) -> Bool {
+  guard text.hasPrefix("/") else { return false }
+  // Drop the leading slash, then lop off Telegram's `@botname` suffix
+  // (only present in group chats; harmless to strip in DMs since `@`
+  // isn't valid inside a command verb).
+  var verb = Substring(text.dropFirst())
+  if let at = verb.firstIndex(of: "@") { verb = verb[..<at] }
+  // Reject anything with embedded whitespace ("/clear now" is a chat
+  // message, not a command).
+  guard !verb.contains(where: { $0.isWhitespace }) else { return false }
+  return resetCommandVerbs.contains(verb.lowercased())
+}
 
 private func handleReset(state: AgentState, agentId: String, chatId: Int64) {
   logDebug("handleReset: chat \(chatId)")
   DatabaseManager.bumpSessionSalt(agentId: agentId, chatId: chatId)
 
-  if let active = DatabaseManager.activeDispatch(agentId: agentId, forChat: chatId) {
+  // v3 allows multiple in-flight rows per chat; /reset means "wipe
+  // everything for this chat", so cancel and delete each one. Any
+  // terminal events that fire afterwards no-op (binding lookup misses).
+  for active in DatabaseManager.allActiveDispatches(agentId: agentId, forChat: chatId) {
     active.taskId.withCString { tid in
       hostAPI?.pointee.dispatch_cancel?(tid)
     }
@@ -172,8 +248,7 @@ private func handleReset(state: AgentState, agentId: String, chatId: Int64) {
   }
 
   if let token = state.botToken {
-    _ = telegramSendMessage(
-      token: token, chatId: chatId, text: "Conversation reset.")
+    _ = telegramSendMessage(token: token, chatId: chatId, text: "Conversation reset.")
   }
 }
 

@@ -89,23 +89,131 @@ final class DatabaseTests: XCTestCase {
     XCTAssertEqual(active?.replyToken, "TOKEN2")
   }
 
-  func testActiveDispatchUniqueChatIdEnforced() {
+  /// Schema v3 allows multiple in-flight rows per (agent, chat). The
+  /// previous v2 schema enforced `UNIQUE(agent_id, chat_id)` and silently
+  /// rejected the second insert — this test pins the new behaviour so a
+  /// regression that reintroduces the constraint is caught immediately.
+  func testActiveDispatchAllowsMultipleRowsPerChat() {
     _ = DatabaseManager.upsertChatSession(agentId: agentId, chatId: 3)
+    let now = Int(Date().timeIntervalSince1970)
     DatabaseManager.insertActiveDispatch(
       taskId: "task-a", agentId: agentId, chatId: 3, replyToken: "TOK_A",
-      sessionId: "s", expiresAt: Int(Date().timeIntervalSince1970) + 600)
-    // Second insert for the same (agent, chat) should be a no-op due to
-    // UNIQUE(agent_id, chat_id).
+      sessionId: "s", expiresAt: now + 600)
+    // started_at is stored in milliseconds, so a 2ms sleep is enough to
+    // guarantee strict ordering between two back-to-back inserts.
+    Thread.sleep(forTimeInterval: 0.002)
     DatabaseManager.insertActiveDispatch(
       taskId: "task-b", agentId: agentId, chatId: 3, replyToken: "TOK_B",
-      sessionId: "s", expiresAt: Int(Date().timeIntervalSince1970) + 600)
+      sessionId: "s", expiresAt: now + 600)
 
-    XCTAssertEqual(
-      DatabaseManager.activeDispatch(agentId: agentId, forChat: 3)?.taskId, "task-a",
-      "UNIQUE(agent_id, chat_id) should reject the second insert; first row stays")
-    XCTAssertNil(
+    XCTAssertNotNil(
+      DatabaseManager.lookupBinding(token: "TOK_A"),
+      "first dispatch must survive the second insert")
+    XCTAssertNotNil(
       DatabaseManager.lookupBinding(token: "TOK_B"),
-      "rejected insert must not appear under its token")
+      "second concurrent dispatch must be insertable")
+    XCTAssertEqual(
+      DatabaseManager.activeDispatch(agentId: agentId, forChat: 3)?.taskId, "task-b",
+      "activeDispatch must return the latest row by started_at")
+  }
+
+  func testPriorActiveDispatchSkipsCurrentToken() {
+    _ = DatabaseManager.upsertChatSession(agentId: agentId, chatId: 31)
+    let now = Int(Date().timeIntervalSince1970)
+    DatabaseManager.insertActiveDispatch(
+      taskId: "task-old", agentId: agentId, chatId: 31, replyToken: "TOK_OLD",
+      sessionId: "s", expiresAt: now + 600)
+    Thread.sleep(forTimeInterval: 0.002)
+    DatabaseManager.insertActiveDispatch(
+      taskId: "task-new", agentId: agentId, chatId: 31, replyToken: "TOK_NEW",
+      sessionId: "s", expiresAt: now + 600)
+
+    // Soft-interrupt branch in handleWebhook just inserted the new row and
+    // now asks for "the previous in-flight row, not me".
+    let prior = DatabaseManager.priorActiveDispatch(
+      agentId: agentId, forChat: 31, excluding: "TOK_NEW")
+    XCTAssertEqual(prior?.taskId, "task-old")
+    XCTAssertEqual(prior?.replyToken, "TOK_OLD")
+
+    // When only the current row exists, prior must be nil — otherwise
+    // handleWebhook would interrupt itself.
+    DatabaseManager.deleteActiveDispatch(taskId: "task-old")
+    XCTAssertNil(
+      DatabaseManager.priorActiveDispatch(
+        agentId: agentId, forChat: 31, excluding: "TOK_NEW"))
+  }
+
+  func testUpdateTaskIdPatchesPlaceholderRow() {
+    _ = DatabaseManager.upsertChatSession(agentId: agentId, chatId: 32)
+    let token = "TOK_PRE"
+    DatabaseManager.insertActiveDispatch(
+      taskId: pendingTaskId(for: token), agentId: agentId, chatId: 32,
+      replyToken: token, sessionId: "s",
+      expiresAt: Int(Date().timeIntervalSince1970) + 600)
+
+    // Pre-patch state: the placeholder row is the binding under the token,
+    // but the lookup by real task_id should miss.
+    XCTAssertEqual(
+      DatabaseManager.lookupBinding(token: token)?.taskId,
+      pendingTaskId(for: token))
+    XCTAssertNil(DatabaseManager.lookupBindingByTask(taskId: "real-task"))
+
+    DatabaseManager.updateTaskId(replyToken: token, newTaskId: "real-task")
+
+    // Post-patch: the row is the same (PK didn't move), but its task_id is
+    // now the real one; both directions of lookup agree.
+    XCTAssertEqual(DatabaseManager.lookupBinding(token: token)?.taskId, "real-task")
+    XCTAssertEqual(
+      DatabaseManager.lookupBindingByTask(taskId: "real-task")?.replyToken, token)
+  }
+
+  func testUpdateTaskIdNoOpForUnknownToken() {
+    // Patching a row that isn't there must not invent one — keeps the
+    // dispatch-error unwind path simple.
+    DatabaseManager.updateTaskId(replyToken: "GHOST", newTaskId: "x")
+    XCTAssertNil(DatabaseManager.lookupBinding(token: "GHOST"))
+  }
+
+  func testDeleteActiveDispatchByReplyTokenRemovesPlaceholderOnly() {
+    _ = DatabaseManager.upsertChatSession(agentId: agentId, chatId: 33)
+    let now = Int(Date().timeIntervalSince1970)
+    DatabaseManager.insertActiveDispatch(
+      taskId: "task-keep", agentId: agentId, chatId: 33, replyToken: "TOK_KEEP",
+      sessionId: "s", expiresAt: now + 600)
+    DatabaseManager.insertActiveDispatch(
+      taskId: pendingTaskId(for: "TOK_UNDO"), agentId: agentId, chatId: 33,
+      replyToken: "TOK_UNDO", sessionId: "s", expiresAt: now + 600)
+
+    // Unwind the placeholder row only.
+    DatabaseManager.deleteActiveDispatch(replyToken: "TOK_UNDO")
+
+    XCTAssertNil(DatabaseManager.lookupBinding(token: "TOK_UNDO"))
+    XCTAssertNotNil(
+      DatabaseManager.lookupBinding(token: "TOK_KEEP"),
+      "sibling rows for the same chat must be unaffected")
+  }
+
+  func testAllActiveDispatchesReturnsEveryRowForChat() {
+    _ = DatabaseManager.upsertChatSession(agentId: agentId, chatId: 34)
+    let now = Int(Date().timeIntervalSince1970)
+    DatabaseManager.insertActiveDispatch(
+      taskId: "t-a", agentId: agentId, chatId: 34, replyToken: "TOK_AA",
+      sessionId: "s", expiresAt: now + 600)
+    Thread.sleep(forTimeInterval: 0.002)
+    DatabaseManager.insertActiveDispatch(
+      taskId: "t-b", agentId: agentId, chatId: 34, replyToken: "TOK_BB",
+      sessionId: "s", expiresAt: now + 600)
+    // Row for a different chat must be excluded.
+    _ = DatabaseManager.upsertChatSession(agentId: agentId, chatId: 35)
+    DatabaseManager.insertActiveDispatch(
+      taskId: "t-other", agentId: agentId, chatId: 35, replyToken: "TOK_OTHER",
+      sessionId: "s", expiresAt: now + 600)
+
+    let rows = DatabaseManager.allActiveDispatches(agentId: agentId, forChat: 34)
+    XCTAssertEqual(rows.count, 2)
+    XCTAssertEqual(
+      rows.map { $0.taskId }, ["t-b", "t-a"],
+      "rows must come back in started_at DESC order")
   }
 
   func testMarkRepliedAndHasReplied() {
@@ -195,6 +303,59 @@ final class DatabaseTests: XCTestCase {
   }
 
   // MARK: schema migration
+
+  func testInitSchemaMigratesV2ActiveDispatchesToReplyTokenPK() {
+    // Stand up the v2 active_dispatches table (task_id PK + UNIQUE(agent_id,
+    // chat_id)) directly so we can assert that initSchema() detects the
+    // outdated PK and rebuilds the table.
+    DatabaseManager.dbExec("DROP TABLE IF EXISTS active_dispatches", params: "[]")
+    DatabaseManager.dbExec(
+      """
+      CREATE TABLE active_dispatches (
+        task_id        TEXT PRIMARY KEY,
+        agent_id       TEXT NOT NULL,
+        chat_id        INTEGER NOT NULL,
+        reply_token    TEXT NOT NULL UNIQUE,
+        session_id     TEXT NOT NULL,
+        started_at     INTEGER NOT NULL,
+        expires_at     INTEGER NOT NULL,
+        has_replied    INTEGER NOT NULL DEFAULT 0,
+        UNIQUE (agent_id, chat_id)
+      )
+      """, params: "[]")
+    // Seed a row in the legacy schema; after migration it should be gone.
+    DatabaseManager.dbExec(
+      """
+      INSERT INTO active_dispatches
+        (task_id, agent_id, chat_id, reply_token, session_id, started_at, expires_at)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+      """,
+      params: DatabaseManager.serializeParams(
+        [
+          "legacy-task", agentId, 8_888, "LEGACY_TOK", "s",
+          Int(Date().timeIntervalSince1970),
+          Int(Date().timeIntervalSince1970) + 600,
+        ]))
+    XCTAssertNotNil(DatabaseManager.lookupBinding(token: "LEGACY_TOK"))
+
+    // Run the migration.
+    DatabaseManager.initSchema()
+
+    // Legacy row is gone — we rebuilt the table.
+    XCTAssertNil(DatabaseManager.lookupBinding(token: "LEGACY_TOK"))
+
+    // Post-migration: schema now allows two in-flight rows for the same
+    // (agent, chat), which the v2 UNIQUE constraint would have rejected.
+    let now = Int(Date().timeIntervalSince1970)
+    DatabaseManager.insertActiveDispatch(
+      taskId: "post-a", agentId: agentId, chatId: 8_889,
+      replyToken: "POST_A", sessionId: "s", expiresAt: now + 600)
+    DatabaseManager.insertActiveDispatch(
+      taskId: "post-b", agentId: agentId, chatId: 8_889,
+      replyToken: "POST_B", sessionId: "s", expiresAt: now + 600)
+    XCTAssertNotNil(DatabaseManager.lookupBinding(token: "POST_A"))
+    XCTAssertNotNil(DatabaseManager.lookupBinding(token: "POST_B"))
+  }
 
   func testInitSchemaMigratesPreV4SchemaByDropping() {
     // Stand up the legacy schema (no agent_id column) directly so we can

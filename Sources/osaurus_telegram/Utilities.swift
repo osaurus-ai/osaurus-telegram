@@ -98,12 +98,25 @@ func sessionUUID(forChatId chatId: Int64, salt: Int) -> UUID {
 
 // MARK: - Host string ownership
 
-/// Frees a string allocated by the host on our behalf. The host's
-/// allocator pairs with `free`/`strdup` on the plugin side, matching the
-/// convention documented in HOST_API.
+/// Frees a string allocated by the host on our behalf.
+///
+/// On v6+ hosts we MUST go through `host->free_string` — calling
+/// `libc free()` directly is documented to keep working today, but a
+/// future host allocator change would silently corrupt the heap. On
+/// older hosts the v6 slot is NULL and we fall back to `libc free()`,
+/// which is what every host's `free_string` does internally.
+///
+/// The host's `free_string` is the *opposite* direction from the
+/// plugin's own `free_string`. NEVER pass a host-returned pointer to
+/// `osr_plugin_api.free_string` — that one is only for strings the
+/// host received from us.
 func freeHostString(_ ptr: UnsafePointer<CChar>?) {
   guard let ptr else { return }
-  free(UnsafeMutableRawPointer(mutating: ptr))
+  if let host = hostAPI?.pointee, host.version >= 6, let hostFree = host.free_string {
+    hostFree(ptr)
+  } else {
+    free(UnsafeMutableRawPointer(mutating: ptr))
+  }
 }
 
 /// Calls a `(C-string in) -> C-string out` host function with a Swift

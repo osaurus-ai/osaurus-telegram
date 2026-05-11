@@ -20,7 +20,9 @@ The agent never sees the real Telegram `chat_id`. The webhook handler mints a sh
 
 ### Concurrency
 
-If a new message arrives while a task is still running for the same chat, the plugin issues `dispatch_interrupt(prev_task, new_text)` (the host appends the user's text into the live session and stops the current stream) and dispatches a fresh turn against the same `session_id`. The agent reattaches with full context; the user gets one coherent answer with no races.
+Each user turn gets its own `reply_token` and its own row in `active_dispatches`. When a new message arrives while a previous task is still running for the same chat, the plugin soft-stops the prior task (`dispatch_interrupt(prev_task, new_text)` — the host appends the user's text into the live session and stops the current stream) and dispatches a fresh turn against the same `session_id`. The prior row is **not** deleted; it lives until its own terminal event (`COMPLETED`/`CANCELLED`) fires or the 10-minute TTL sweep reaps it. Multiple in-flight rows per chat are normal and expected — they only matter to the agent loop, never to the user's view.
+
+To make the reply contract race-free, the plugin pre-inserts the row in `active_dispatches` **before** calling `dispatch`. That way the agent can never beat us to `reply` and observe a `stale_token`: by the time the host has scheduled the agent, the `reply_token` binding is already pinned. The row carries a placeholder `task_id` until `dispatch` returns the real one.
 
 ## Tools (called by the agent)
 
@@ -42,7 +44,7 @@ All three take a `reply_token` (passed verbatim from the user-message header) pl
 
 | Command | Description |
 | --- | --- |
-| `/reset` | Bumps the chat's session salt and cancels any in-flight task. The next message lands in a fresh transcript. |
+| `/clear`, `/reset`, `/new`, `/restart` | All aliases for the same action: bump the chat's session salt and cancel any in-flight task. The next message lands in a fresh transcript. Match is case-insensitive and tolerates Telegram's `@botname` suffix in group chats (e.g. `/clear@MyBot`). |
 
 ## Setup
 
@@ -72,7 +74,7 @@ Send a message to your bot. The agent receives it as the next turn in a continuo
 The plugin keeps three tables in its per-plugin SQLite DB:
 
 - `chat_sessions` — one row per `(agent_id, chat_id)` (session salt, blocked flag, timestamps).
-- `active_dispatches` — at most one row per `(agent_id, chat_id)` bound to a `reply_token`. Cleared on COMPLETED/FAILED.
+- `active_dispatches` — one row per in-flight turn, keyed on `reply_token`. Multiple concurrent rows per `(agent_id, chat_id)` are allowed: each is created when the webhook handler dispatches that turn and cleared by its own terminal event (COMPLETED/FAILED/CANCELLED) or the 10-minute TTL sweep.
 - `seen_updates` — idempotency cache for Telegram retries, keyed `(agent_id, update_id)`, TTL-pruned to 24 hours.
 
 ### Multi-agent isolation (ABI v4)
@@ -81,10 +83,11 @@ A single plugin instance is loaded once but can be wired into many agents. The h
 
 - Hold per-agent in-memory state (`AgentState`) in a registry keyed by agent UUID — bot token, webhook secret, tunnel URL, and bot identity never bleed across agents.
 - Partition all SQLite tables by `agent_id`, so two agents whose Telegram bots happen to see the same `chat_id` (very common — chat_id is per Telegram user, not per bot) cannot trample each other's rows.
-- Tag each `dispatch()` with `external_session_key: "telegram:agent-<id>:chat-<id>"` so the host's session reattach is also agent-scoped.
+- Use a deterministic per-chat `session_id` (UUID5 of `(salt, chat_id)`) so repeated deliveries reattach to the same Osaurus session. The host treats `session_id` as the external grouping key as of v3.
 - Reject reply tokens minted by a different agent's binding (`stale_token`).
+- Pass `tools: ["reply", "reply_typing", "reply_photo"]` on every `dispatch()` so the agent's loop has the reply surface loaded regardless of its own auto/manual tool-selection mode.
 
-On first launch after the ABI v4 upgrade, the plugin detects the legacy schema (no `agent_id` column) and rebuilds the three tables. Existing rows are dropped — the data is transient (10-minute dispatch TTL, 24-hour dedup TTL, chat session salts default back to zero), so nothing user-facing is lost.
+On first launch after the ABI v4 upgrade, the plugin detects the legacy schema (no `agent_id` column) and rebuilds the three tables. Existing rows are dropped — the data is transient (10-minute dispatch TTL, 24-hour dedup TTL, chat session salts default back to zero), so nothing user-facing is lost. The same drop-and-rebuild path also runs when the plugin detects the v2 `active_dispatches` schema (where `task_id` was the primary key); the v3 schema keys on `reply_token` instead so multiple in-flight turns per chat can coexist.
 
 If the host is older than ABI v4 (`get_active_agent_id` unavailable), per-agent callbacks are refused (`handle_route` returns 503; `invoke` returns a `no_agent_context` error envelope). Upgrade Osaurus.
 
@@ -96,7 +99,7 @@ If the host is older than ABI v4 (`get_active_agent_id` unavailable), per-agent 
 | Typing indicator | Agent (`reply_typing` tool) |
 | Photo | Agent (`reply_photo` tool) |
 | Rate-limit apology | Plugin (`handle_route`) |
-| `/reset` confirmation | Plugin (`handle_route`) |
+| `/clear` (and aliases) confirmation | Plugin (`handle_route`) |
 | Safety-net "(done)" / "Sorry, something went wrong" | Plugin (`on_task_event`, only if the agent never called `reply`) |
 
 The agent owns content; the plugin owns meta-messages. Plugin-owned posts should be rare in healthy runs.
