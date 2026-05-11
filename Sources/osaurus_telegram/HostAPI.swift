@@ -51,6 +51,14 @@ typealias osr_dispatch_interrupt_fn =
 typealias osr_dispatch_add_issue_fn =
   @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> UnsafePointer<CChar>?
 
+// ABI v4: agent context resolution
+//
+// Returns the UUID of the agent whose frame we're currently inside (handle_route,
+// invoke, on_config_changed, on_task_event), or NULL outside any per-agent frame
+// (e.g. plugin init or a background thread the plugin spawned). Callers must
+// release the returned C string with `free_string`.
+typealias osr_get_active_agent_id_fn = @convention(c) () -> UnsafePointer<CChar>?
+
 struct osr_host_api {
   var version: UInt32 = 0
 
@@ -85,6 +93,10 @@ struct osr_host_api {
   var send_draft: osr_send_draft_fn?
   var dispatch_interrupt: osr_dispatch_interrupt_fn?
   var dispatch_add_issue: osr_dispatch_add_issue_fn?
+
+  // ABI v4: agent context resolution. NULL on older hosts and outside per-agent
+  // frames. Always guard reads with `version >= 4` AND a nil-check on the slot.
+  var get_active_agent_id: osr_get_active_agent_id_fn?
 }
 
 // MARK: - Plugin API table (returned to host)

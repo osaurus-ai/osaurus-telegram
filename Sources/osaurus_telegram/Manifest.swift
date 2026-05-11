@@ -3,36 +3,29 @@ import Foundation
 // MARK: - Plugin Manifest
 //
 // The manifest is what Osaurus reads to discover the plugin's id, version,
-// secrets, routes, and tools. Keep it as a static JSON literal so the host's
+// routes, tools, and config. Keep it as a static JSON literal so the host's
 // `osaurus manifest extract` can pull it directly out of the dylib symbol
 // table without instantiating the plugin.
+//
+// Why `capabilities.config` (instead of a top-level `secrets:` array):
+// the `webhook_url` field with `value_template: "{{plugin_url}}/webhook"`
+// is what tells Osaurus "this plugin is reachable through the tunnel and
+// needs the resolved tunnel URL pushed to it". When `tunnel_url` becomes
+// available the host calls `on_config_changed("tunnel_url", ...)` and the
+// plugin can register the webhook with Telegram. Without that field the
+// per-agent autoconfig flow does not fire.
 
 let pluginManifestJSON = #"""
   {
     "plugin_id": "osaurus.telegram",
     "name": "Telegram",
-    "version": "1.5.0",
+    "version": "1.6.0",
     "description": "Conversational Telegram bot. Each chat becomes a continuous Osaurus session and the agent talks to the user via reply tools.",
     "instructions": "You are connected to a Telegram chat. The user message is prefixed with [reply_token <token>]. To talk back, call the `reply` tool and pass that token verbatim. Use `reply_typing` before slow work, and call `reply` as many times as needed \u2014 one message per major thought. Keep each message under 4000 characters. Do not echo the reply_token or any meta text \u2014 only conversational content.",
     "license": "MIT",
     "authors": [],
     "min_macos": "15.0",
     "min_osaurus": "0.5.0",
-    "secrets": [
-      {
-        "id": "bot_token",
-        "label": "Bot Token",
-        "description": "From [@BotFather](https://t.me/BotFather)",
-        "required": true,
-        "url": "https://t.me/BotFather"
-      },
-      {
-        "id": "webhook_secret",
-        "label": "Webhook Secret",
-        "description": "Random string Telegram sends back in X-Telegram-Bot-Api-Secret-Token. Generated automatically on first run.",
-        "required": true
-      }
-    ],
     "capabilities": {
       "routes": [
         {
@@ -97,11 +90,50 @@ let pluginManifestJSON = #"""
           "requirements": ["network"],
           "permission_policy": "auto"
         }
-      ]
+      ],
+      "config": {
+        "title": "Telegram",
+        "sections": [
+          {
+            "title": "Bot Configuration",
+            "fields": [
+              {
+                "key": "bot_token",
+                "type": "secret",
+                "label": "Bot Token",
+                "placeholder": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+                "description": "Get this from [@BotFather](https://t.me/BotFather)",
+                "validation": {
+                  "required": true,
+                  "pattern": "^[0-9]+:[A-Za-z0-9_-]+$",
+                  "pattern_hint": "Must be a valid Telegram bot token (e.g. 123456:ABC...)"
+                }
+              },
+              {
+                "key": "webhook_url",
+                "type": "readonly",
+                "label": "Webhook URL",
+                "value_template": "{{plugin_url}}/webhook",
+                "copyable": true
+              },
+              {
+                "key": "webhook_status",
+                "type": "status",
+                "label": "Webhook",
+                "connected_when": "webhook_registered"
+              }
+            ]
+          }
+        ]
+      }
     },
     "docs": {
       "readme": "README.md",
-      "changelog": "CHANGELOG.md"
+      "changelog": "CHANGELOG.md",
+      "links": [
+        { "label": "Telegram Bot API", "url": "https://core.telegram.org/bots/api" },
+        { "label": "BotFather", "url": "https://t.me/BotFather" }
+      ]
     }
   }
   """#

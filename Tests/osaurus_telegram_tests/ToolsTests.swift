@@ -4,18 +4,19 @@ import XCTest
 
 final class ToolsTests: XCTestCase {
 
-  private var ctx: PluginContext!
+  private var state: AgentState!
+  private let agentId = defaultTestAgentId
 
   override func setUp() {
     super.setUp()
     TestHost.install()
     DatabaseManager.initSchema()
-    ctx = PluginContext()
-    ctx.botToken = "123:fake"
+    state = AgentState(agentId: agentId)
+    state.botToken = "123:fake"
   }
 
   override func tearDown() {
-    ctx = nil
+    state = nil
     TestHost.uninstall()
     super.tearDown()
   }
@@ -34,10 +35,10 @@ final class ToolsTests: XCTestCase {
     taskId: String = "task-1",
     expiresInSeconds: Int = 600
   ) -> String {
-    _ = DatabaseManager.upsertChatSession(chatId: chatId)
+    _ = DatabaseManager.upsertChatSession(agentId: agentId, chatId: chatId)
     let token = "TOKABC12"
     DatabaseManager.insertActiveDispatch(
-      taskId: taskId, chatId: chatId, replyToken: token,
+      taskId: taskId, agentId: agentId, chatId: chatId, replyToken: token,
       sessionId: "session-1",
       expiresAt: Int(Date().timeIntervalSince1970) + expiresInSeconds)
     return token
@@ -61,19 +62,19 @@ final class ToolsTests: XCTestCase {
   // MARK: invalid args
 
   func testReplyRejectsInvalidJSON() {
-    let env = parseEnvelope(handleReply(ctx: ctx, payload: "not-json"))
+    let env = parseEnvelope(handleReply(state: state, payload: "not-json"))
     XCTAssertEqual(env["ok"] as? Bool, false)
     XCTAssertEqual(env["error"] as? String, "invalid_request")
   }
 
   func testReplyTypingRejectsMissingToken() {
-    let env = parseEnvelope(handleReplyTyping(ctx: ctx, payload: "{}"))
+    let env = parseEnvelope(handleReplyTyping(state: state, payload: "{}"))
     XCTAssertEqual(env["error"] as? String, "invalid_request")
   }
 
   func testReplyPhotoRejectsMissingURL() {
     let env = parseEnvelope(
-      handleReplyPhoto(ctx: ctx, payload: #"{"reply_token":"TOK"}"#))
+      handleReplyPhoto(state: state, payload: #"{"reply_token":"TOK"}"#))
     XCTAssertEqual(env["error"] as? String, "invalid_request")
   }
 
@@ -82,7 +83,7 @@ final class ToolsTests: XCTestCase {
   func testReplyStaleTokenWhenUnknown() {
     let env = parseEnvelope(
       handleReply(
-        ctx: ctx,
+        state: state,
         payload: #"{"reply_token":"NOPE","text":"hi"}"#))
     XCTAssertEqual(env["error"] as? String, "stale_token")
   }
@@ -91,7 +92,7 @@ final class ToolsTests: XCTestCase {
     let token = makeBinding(expiresInSeconds: -10)
     let env = parseEnvelope(
       handleReply(
-        ctx: ctx,
+        state: state,
         payload: #"{"reply_token":"\#(token)","text":"hi"}"#))
     XCTAssertEqual(env["error"] as? String, "stale_token")
     XCTAssertTrue(TestHostGlobals.httpCalls.isEmpty, "no HTTP call on stale token")
@@ -101,10 +102,10 @@ final class ToolsTests: XCTestCase {
 
   func testReplyChatBlockedWhenChatPreviouslyBlocked() {
     let token = makeBinding(chatId: 200)
-    DatabaseManager.markChatBlocked(chatId: 200)
+    DatabaseManager.markChatBlocked(agentId: agentId, chatId: 200)
     let env = parseEnvelope(
       handleReply(
-        ctx: ctx,
+        state: state,
         payload: #"{"reply_token":"\#(token)","text":"hi"}"#))
     XCTAssertEqual(env["error"] as? String, "chat_blocked")
     XCTAssertTrue(TestHostGlobals.httpCalls.isEmpty)
@@ -114,10 +115,10 @@ final class ToolsTests: XCTestCase {
 
   func testReplyFailsWhenBotTokenMissing() {
     let token = makeBinding()
-    ctx.botToken = nil
+    state.botToken = nil
     let env = parseEnvelope(
       handleReply(
-        ctx: ctx,
+        state: state,
         payload: #"{"reply_token":"\#(token)","text":"hi"}"#))
     XCTAssertEqual(env["error"] as? String, "not_configured")
   }
@@ -130,7 +131,7 @@ final class ToolsTests: XCTestCase {
 
     let env = parseEnvelope(
       handleReply(
-        ctx: ctx,
+        state: state,
         payload: #"{"reply_token":"\#(token)","text":"hello world"}"#))
 
     XCTAssertEqual(env["ok"] as? Bool, true)
@@ -149,7 +150,7 @@ final class ToolsTests: XCTestCase {
 
     let env = parseEnvelope(
       handleReplyTyping(
-        ctx: ctx, payload: #"{"reply_token":"\#(token)"}"#))
+        state: state, payload: #"{"reply_token":"\#(token)"}"#))
 
     XCTAssertEqual(env["ok"] as? Bool, true)
     XCTAssertFalse(
@@ -166,7 +167,7 @@ final class ToolsTests: XCTestCase {
 
     let env = parseEnvelope(
       handleReplyPhoto(
-        ctx: ctx,
+        state: state,
         payload:
           #"{"reply_token":"\#(token)","photo_url":"https://example.com/p.jpg","caption":"cap"}"#))
 
@@ -185,7 +186,7 @@ final class ToolsTests: XCTestCase {
     let payloadJSON =
       String(data: try! JSONSerialization.data(withJSONObject: payload), encoding: .utf8)!
 
-    _ = handleReply(ctx: ctx, payload: payloadJSON)
+    _ = handleReply(state: state, payload: payloadJSON)
 
     let body = TestHostGlobals.httpCalls[0]["body"] as? String ?? ""
     let bodyObj = (try? JSONSerialization.jsonObject(with: Data(body.utf8))) as? [String: Any]
@@ -201,11 +202,11 @@ final class ToolsTests: XCTestCase {
 
     let env = parseEnvelope(
       handleReply(
-        ctx: ctx,
+        state: state,
         payload: #"{"reply_token":"\#(token)","text":"hi"}"#))
 
     XCTAssertEqual(env["error"] as? String, "chat_blocked")
-    XCTAssertTrue(DatabaseManager.isChatBlocked(chatId: 300))
+    XCTAssertTrue(DatabaseManager.isChatBlocked(agentId: agentId, chatId: 300))
     XCTAssertEqual(TestHostGlobals.cancelCalls, ["task-blocked"])
     XCTAssertFalse(
       DatabaseManager.hasReplied(taskId: "task-blocked"),
@@ -218,14 +219,14 @@ final class ToolsTests: XCTestCase {
 
     let env = parseEnvelope(
       handleReply(
-        ctx: ctx,
+        state: state,
         payload: #"{"reply_token":"\#(token)","text":"hi"}"#))
 
     XCTAssertEqual(env["error"] as? String, "telegram_api_error")
     XCTAssertTrue(
       (env["message"] as? String ?? "").contains("chat not found"),
       "telegram description should propagate")
-    XCTAssertFalse(DatabaseManager.isChatBlocked(chatId: 400))
+    XCTAssertFalse(DatabaseManager.isChatBlocked(agentId: agentId, chatId: 400))
     XCTAssertTrue(TestHostGlobals.cancelCalls.isEmpty)
   }
 
@@ -236,7 +237,7 @@ final class ToolsTests: XCTestCase {
     setHTTPSuccess()
 
     _ = handleReply(
-      ctx: ctx,
+      state: state,
       payload: #"{"reply_token":"\#(token)","text":"<b>hi</b>","parse_mode":"HTML"}"#)
 
     let body = TestHostGlobals.httpCalls[0]["body"] as? String ?? ""

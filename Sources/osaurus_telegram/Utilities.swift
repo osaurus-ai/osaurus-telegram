@@ -182,3 +182,19 @@ func configDelete(_ key: String) {
 func listActiveTasks() -> String? {
   callHostString(hostAPI?.pointee.list_active_tasks)
 }
+
+// MARK: - Active Agent (ABI v4)
+
+/// Returns the UUID of the agent whose callback frame we're currently inside,
+/// or `nil` if the host is older than v4, the slot isn't wired, or we're
+/// outside any per-agent frame (e.g. plugin init or a background thread the
+/// plugin spawned). Callers MUST handle the nil case — never cache the result
+/// across callbacks.
+func getActiveAgentId() -> String? {
+  guard let host = hostAPI?.pointee, host.version >= 4,
+    let fn = host.get_active_agent_id
+  else { return nil }
+  guard let ptr = fn() else { return nil }
+  defer { freeHostString(ptr) }
+  return String(cString: ptr)
+}

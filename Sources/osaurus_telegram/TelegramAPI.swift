@@ -129,6 +129,42 @@ func telegramDeleteWebhook(token: String) -> Bool {
   return telegramRequest(token: token, method: "deleteWebhook").ok
 }
 
+// MARK: - getWebhookInfo
+
+/// Snapshot of Telegram's view of our registered webhook. Used by
+/// `setupWebhook` to confirm what Telegram has actually stored, and to
+/// surface delivery failures (`last_error_message`) that `setWebhook`
+/// alone cannot detect — `setWebhook` only validates the request, not
+/// whether Telegram can subsequently reach the URL.
+struct TelegramWebhookInfo {
+  let url: String
+  let pendingUpdateCount: Int
+  let lastErrorDate: Int
+  let lastErrorMessage: String
+  let lastSyncErrorDate: Int
+
+  /// True if Telegram reported a delivery error within `staleAfterSeconds`.
+  func hasRecentError(staleAfterSeconds: Int = 300) -> Bool {
+    if lastErrorDate == 0 { return false }
+    let now = Int(Date().timeIntervalSince1970)
+    return (now - lastErrorDate) < staleAfterSeconds
+  }
+}
+
+func telegramGetWebhookInfo(token: String) -> TelegramWebhookInfo? {
+  let response = telegramRequest(token: token, method: "getWebhookInfo")
+  guard response.ok, let dict = response.result as? [String: Any] else {
+    return nil
+  }
+  return TelegramWebhookInfo(
+    url: dict["url"] as? String ?? "",
+    pendingUpdateCount: dict["pending_update_count"] as? Int ?? 0,
+    lastErrorDate: dict["last_error_date"] as? Int ?? 0,
+    lastErrorMessage: dict["last_error_message"] as? String ?? "",
+    lastSyncErrorDate: dict["last_synchronization_error_date"] as? Int ?? 0
+  )
+}
+
 /// Sends a text message. Returns `(ok, description)` so callers can surface
 /// the Telegram error string to the agent through tool envelopes.
 func telegramSendMessage(

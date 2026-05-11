@@ -32,9 +32,9 @@ private struct ReplyPhotoArgs: Decodable {
 
 // MARK: - reply
 
-func handleReply(ctx: PluginContext, payload: String) -> String {
+func handleReply(state: AgentState, payload: String) -> String {
   runReplyTool(
-    ctx: ctx, payload: payload,
+    state: state, payload: payload,
     invalidArgsMessage: "reply requires reply_token and text"
   ) { (args: ReplyArgs, token, binding) in
     let clamped = String(args.text.prefix(4000))
@@ -53,9 +53,9 @@ func handleReply(ctx: PluginContext, payload: String) -> String {
 
 // MARK: - reply_typing
 
-func handleReplyTyping(ctx: PluginContext, payload: String) -> String {
+func handleReplyTyping(state: AgentState, payload: String) -> String {
   runReplyTool(
-    ctx: ctx, payload: payload,
+    state: state, payload: payload,
     invalidArgsMessage: "reply_typing requires reply_token"
   ) { (_: ReplyTypingArgs, token, binding) in
     ReplyAction(
@@ -68,9 +68,9 @@ func handleReplyTyping(ctx: PluginContext, payload: String) -> String {
 
 // MARK: - reply_photo
 
-func handleReplyPhoto(ctx: PluginContext, payload: String) -> String {
+func handleReplyPhoto(state: AgentState, payload: String) -> String {
   runReplyTool(
-    ctx: ctx, payload: payload,
+    state: state, payload: payload,
     invalidArgsMessage: "reply_photo requires reply_token and photo_url"
   ) { (args: ReplyPhotoArgs, token, binding) in
     let photoURL = args.photo_url
@@ -91,9 +91,9 @@ func handleReplyPhoto(ctx: PluginContext, payload: String) -> String {
 //
 // All three tools share the same shape:
 //   1. parse args
-//   2. validate the binding (token expiry / blocked chat)
+//   2. validate the binding (token expiry / blocked chat / agent ownership)
 //   3. require a configured bot token
-//   4. run the Telegram POST through the per-chat send actor
+//   4. run the Telegram POST through the per-(agent,chat) send actor
 //   5. on success, optionally mark the dispatch as having replied
 //   6. on failure, special-case "bot was blocked" so the agent stops trying
 // This helper captures that flow once.
@@ -108,9 +108,10 @@ private struct ReplyAction {
   let successSummary: String?
 }
 
-/// Tool name for envelope error context — anonymous "decode" otherwise.
+/// Captures the parse → validate → send → mark pipeline shared by all
+/// three reply tools.
 private func runReplyTool<Args: Decodable>(
-  ctx: PluginContext,
+  state: AgentState,
   payload: String,
   invalidArgsMessage: String,
   build: (Args, _ botToken: String, _ binding: ActiveDispatchRow) -> ReplyAction
@@ -125,61 +126,75 @@ private func runReplyTool<Args: Decodable>(
     return toolEnvelopeError("invalid_request", "missing reply_token")
   }
 
-  switch validateBinding(token: replyToken) {
-  case .failure(.staleToken):
-    return toolEnvelopeError(
-      "stale_token",
-      "Reply token expired or unknown. End the turn — a new token will arrive on the next user message."
-    )
-  case .failure(.chatBlocked):
-    return toolEnvelopeError("chat_blocked", "User has blocked the bot.")
-  case .success(let binding):
-    guard let token = ctx.botToken, !token.isEmpty else {
-      return toolEnvelopeError("not_configured", "Bot token not configured.")
-    }
-
-    let plan = build(args, token, binding)
-    let response = runOnSendActor(chatId: binding.chatId, plan.action)
-
-    if response.ok {
-      if plan.successMarksReplied {
-        DatabaseManager.markReplied(taskId: binding.taskId)
-      }
-      return toolEnvelopeSuccess(["sent": true], summary: plan.successSummary)
-    }
-    return mapTelegramFailure(response.description, binding: binding)
+  let binding: ActiveDispatchRow
+  switch validateBinding(state: state, token: replyToken) {
+  case .reject(let envelope):
+    return envelope
+  case .ok(let row):
+    binding = row
   }
+
+  guard let token = state.botToken, !token.isEmpty else {
+    return toolEnvelopeError("not_configured", "Bot token not configured.")
+  }
+
+  let plan = build(args, token, binding)
+  let response = runOnSendActor(
+    agentId: state.agentId, chatId: binding.chatId, plan.action)
+
+  if response.ok {
+    if plan.successMarksReplied {
+      DatabaseManager.markReplied(taskId: binding.taskId)
+    }
+    return toolEnvelopeSuccess(["sent": true], summary: plan.successSummary)
+  }
+  return mapTelegramFailure(state: state, response.description, binding: binding)
 }
 
 // MARK: - Validation + failure mapping
 
-private enum BindingValidationFailure: Error {
-  case staleToken
-  case chatBlocked
+/// Outcome of `validateBinding`. The reject case carries a fully-formed tool
+/// envelope so the call site stays flat — no second layer of error mapping.
+private enum BindingResult {
+  case ok(ActiveDispatchRow)
+  case reject(String)
 }
 
-private func validateBinding(token: String) -> Result<ActiveDispatchRow, BindingValidationFailure> {
+/// Validates the reply_token can be acted on by `state`.
+private func validateBinding(state: AgentState, token: String) -> BindingResult {
   guard let binding = DatabaseManager.lookupBinding(token: token) else {
-    return .failure(.staleToken)
+    return .reject(staleTokenEnvelope)
+  }
+  // Reply tokens are globally unique but a malicious agent could in theory
+  // observe one. The binding's agent_id is the source of truth — reject any
+  // mismatch with the same envelope as expiry so the wrong agent learns
+  // nothing about the token's origin.
+  if binding.agentId != state.agentId {
+    return .reject(staleTokenEnvelope)
   }
   if binding.expiresAt <= Int(Date().timeIntervalSince1970) {
-    return .failure(.staleToken)
+    return .reject(staleTokenEnvelope)
   }
-  if DatabaseManager.isChatBlocked(chatId: binding.chatId) {
-    return .failure(.chatBlocked)
+  if DatabaseManager.isChatBlocked(agentId: state.agentId, chatId: binding.chatId) {
+    return .reject(toolEnvelopeError("chat_blocked", "User has blocked the bot."))
   }
-  return .success(binding)
+  return .ok(binding)
 }
+
+private let staleTokenEnvelope = toolEnvelopeError(
+  "stale_token",
+  "Reply token expired or unknown. End the turn — a new token will arrive on the next user message."
+)
 
 /// Translates a Telegram failure description into a tool envelope, with
 /// special handling for "bot was blocked by the user": flag the chat
 /// blocked, cancel the running task, and surface `chat_blocked` in-band so
 /// the agent stops trying.
 private func mapTelegramFailure(
-  _ description: String, binding: ActiveDispatchRow
+  state: AgentState, _ description: String, binding: ActiveDispatchRow
 ) -> String {
   if description.lowercased().contains("bot was blocked") {
-    DatabaseManager.markChatBlocked(chatId: binding.chatId)
+    DatabaseManager.markChatBlocked(agentId: state.agentId, chatId: binding.chatId)
     binding.taskId.withCString { hostAPI?.pointee.dispatch_cancel?($0) }
     return toolEnvelopeError("chat_blocked", description)
   }
@@ -204,6 +219,7 @@ private func readReplyToken<Args>(from args: Args) -> String? {
 // already caps total wait (telegramRequest uses 10s).
 
 private func runOnSendActor(
+  agentId: String,
   chatId: Int64,
   _ work: @Sendable @escaping () -> (ok: Bool, description: String)
 ) -> (ok: Bool, description: String) {
@@ -211,7 +227,8 @@ private func runOnSendActor(
   let box = ResultBox<(ok: Bool, description: String)>()
 
   Task {
-    box.value = await PerChatSendActor.shared.send(chatId: chatId, work)
+    box.value = await PerChatSendActor.shared.send(
+      agentId: agentId, chatId: chatId, work)
     semaphore.signal()
   }
 

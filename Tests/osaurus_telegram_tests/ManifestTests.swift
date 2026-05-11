@@ -18,7 +18,7 @@ final class ManifestTests: XCTestCase {
     let m = try parsed()
     XCTAssertEqual(m["plugin_id"] as? String, "osaurus.telegram")
     XCTAssertEqual(m["name"] as? String, "Telegram")
-    XCTAssertEqual(m["version"] as? String, "1.5.0")
+    XCTAssertEqual(m["version"] as? String, "1.6.0")
     XCTAssertEqual(m["license"] as? String, "MIT")
     XCTAssertNotNil(m["description"] as? String)
     XCTAssertNotNil(m["instructions"] as? String)
@@ -30,16 +30,6 @@ final class ManifestTests: XCTestCase {
     XCTAssertTrue(instructions.contains("reply_token"))
     XCTAssertTrue(instructions.contains("reply"))
     XCTAssertTrue(instructions.contains("4000"))
-  }
-
-  func testSecretsDeclaresBotTokenAndWebhookSecret() throws {
-    let m = try parsed()
-    let secrets = try XCTUnwrap(m["secrets"] as? [[String: Any]])
-    let ids = secrets.compactMap { $0["id"] as? String }
-    XCTAssertEqual(Set(ids), Set(["bot_token", "webhook_secret"]))
-    for s in secrets {
-      XCTAssertEqual(s["required"] as? Bool, true, "all secrets are required")
-    }
   }
 
   func testRoutesContainsTunnelExposedWebhook() throws {
@@ -93,10 +83,66 @@ final class ManifestTests: XCTestCase {
     }
   }
 
-  func testNoLegacyConfigSectionOrArtifactHandler() throws {
+  // MARK: - capabilities.config shape (the per-agent autoconfig signal)
+
+  func testConfigDeclaresBotTokenAsSecret() throws {
+    let field = try botConfigField(key: "bot_token")
+    XCTAssertEqual(field["type"] as? String, "secret")
+    let validation = try XCTUnwrap(field["validation"] as? [String: Any])
+    XCTAssertEqual(validation["required"] as? Bool, true)
+  }
+
+  /// `value_template: "{{plugin_url}}/webhook"` is what tells Osaurus this
+  /// plugin needs the resolved tunnel URL pushed via on_config_changed.
+  /// Without this field the per-agent autoconfig flow does not fire.
+  func testConfigExposesWebhookURLWithPluginURLTemplate() throws {
+    let field = try botConfigField(key: "webhook_url")
+    XCTAssertEqual(field["type"] as? String, "readonly")
+    XCTAssertEqual(
+      field["value_template"] as? String, "{{plugin_url}}/webhook",
+      "the {{plugin_url}} template is what triggers tunnel_url to be pushed to this plugin")
+    XCTAssertEqual(field["copyable"] as? Bool, true)
+  }
+
+  /// The status indicator reads `webhook_registered` from config; the plugin
+  /// writes `"true"` after a successful setWebhook and clears it on teardown.
+  func testConfigExposesWebhookStatusBoundToWebhookRegistered() throws {
+    let field = try botConfigField(key: "webhook_status")
+    XCTAssertEqual(field["type"] as? String, "status")
+    XCTAssertEqual(field["connected_when"] as? String, "webhook_registered")
+  }
+
+  func testNoLegacyArtifactHandlerOrSettingsSections() throws {
     let m = try parsed()
     let caps = try XCTUnwrap(m["capabilities"] as? [String: Any])
-    XCTAssertNil(caps["config"], "config section must be removed")
     XCTAssertNil(caps["artifact_handler"], "artifact_handler must be removed")
+
+    // Only the Bot Configuration section should remain; the agent / file /
+    // behavior / prompt-customisation sections were intentionally dropped
+    // by the rewrite.
+    let config = try XCTUnwrap(caps["config"] as? [String: Any])
+    let sections = try XCTUnwrap(config["sections"] as? [[String: Any]])
+    XCTAssertEqual(sections.count, 1)
+    XCTAssertEqual(sections.first?["title"] as? String, "Bot Configuration")
+  }
+
+  func testNoTopLevelSecretsArray() throws {
+    // We deliberately use capabilities.config (with type:"secret") instead
+    // of the top-level secrets array, because the latter isn't what
+    // signals tunnel_url to be pushed.
+    let m = try parsed()
+    XCTAssertNil(m["secrets"], "secrets must live under capabilities.config")
+  }
+
+  // MARK: helpers
+
+  private func botConfigField(key: String) throws -> [String: Any] {
+    let m = try parsed()
+    let caps = try XCTUnwrap(m["capabilities"] as? [String: Any])
+    let config = try XCTUnwrap(caps["config"] as? [String: Any])
+    let sections = try XCTUnwrap(config["sections"] as? [[String: Any]])
+    let bot = try XCTUnwrap(sections.first { $0["title"] as? String == "Bot Configuration" })
+    let fields = try XCTUnwrap(bot["fields"] as? [[String: Any]])
+    return try XCTUnwrap(fields.first { $0["key"] as? String == key })
   }
 }

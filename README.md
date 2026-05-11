@@ -46,28 +46,47 @@ All three take a `reply_token` (passed verbatim from the user-message header) pl
 
 ## Setup
 
+The plugin is **per-agent**: each agent in Osaurus has its own bot token, its own webhook secret, and its own tunnel URL — so one Osaurus install can run as many independent Telegram bots as you have agents.
+
 ### 1. Create a Telegram bot
 
 1. Message [@BotFather](https://t.me/BotFather) and send `/newbot`.
 2. Copy the **bot token** (e.g. `123456:ABC-DEF…`).
 
-### 2. Configure
+### 2. Configure for the agent
 
-1. Open Osaurus → Agents settings, choose your agent, and find the Telegram plugin.
+1. Open Osaurus → Agents settings, choose the agent you want to expose, and find the Telegram plugin under that agent.
 2. Paste the bot token into **Bot Token**.
-3. The plugin auto-generates a `webhook_secret` on first run and registers the webhook with Telegram as soon as both `bot_token` and the agent's `tunnel_url` are available.
+3. That's it. The plugin handles the rest:
+   - Generates a `webhook_secret` on first run (stored in the macOS Keychain, scoped to `(plugin_id, agent_id)`).
+   - Receives the agent's tunnel URL automatically from Osaurus via `on_config_changed("tunnel_url", ...)` once the tunnel is up.
+   - Calls Telegram's `setWebhook` as soon as both signals are available.
+   - Drives the **Webhook** status indicator next to the bot token field via the `webhook_registered` config flag.
 
 ### 3. Chat
 
-Send a message to your bot. The agent receives it as the next turn in a continuous session and replies via the `reply` tool.
+Send a message to your bot. The agent receives it as the next turn in a continuous session (`session_id` is a deterministic UUID5 of the chat id, so repeated messages reattach to the same Osaurus session row in the sidebar) and replies via the `reply` tool.
 
 ## Storage
 
 The plugin keeps three tables in its per-plugin SQLite DB:
 
-- `chat_sessions` — one row per chat (session salt, blocked flag, timestamps).
-- `active_dispatches` — at most one row per chat (UNIQUE chat_id) bound to a `reply_token`. Cleared on COMPLETED/FAILED.
-- `seen_updates` — idempotency cache for Telegram retries, TTL-pruned to 24 hours.
+- `chat_sessions` — one row per `(agent_id, chat_id)` (session salt, blocked flag, timestamps).
+- `active_dispatches` — at most one row per `(agent_id, chat_id)` bound to a `reply_token`. Cleared on COMPLETED/FAILED.
+- `seen_updates` — idempotency cache for Telegram retries, keyed `(agent_id, update_id)`, TTL-pruned to 24 hours.
+
+### Multi-agent isolation (ABI v4)
+
+A single plugin instance is loaded once but can be wired into many agents. The host exposes `get_active_agent_id()` (ABI v4) so every per-agent callback (`handle_route`, `invoke`, `on_config_changed`, `on_task_event`) can resolve who is calling. The plugin uses that to:
+
+- Hold per-agent in-memory state (`AgentState`) in a registry keyed by agent UUID — bot token, webhook secret, tunnel URL, and bot identity never bleed across agents.
+- Partition all SQLite tables by `agent_id`, so two agents whose Telegram bots happen to see the same `chat_id` (very common — chat_id is per Telegram user, not per bot) cannot trample each other's rows.
+- Tag each `dispatch()` with `external_session_key: "telegram:agent-<id>:chat-<id>"` so the host's session reattach is also agent-scoped.
+- Reject reply tokens minted by a different agent's binding (`stale_token`).
+
+On first launch after the ABI v4 upgrade, the plugin detects the legacy schema (no `agent_id` column) and rebuilds the three tables. Existing rows are dropped — the data is transient (10-minute dispatch TTL, 24-hour dedup TTL, chat session salts default back to zero), so nothing user-facing is lost.
+
+If the host is older than ABI v4 (`get_active_agent_id` unavailable), per-agent callbacks are refused (`handle_route` returns 503; `invoke` returns a `no_agent_context` error envelope). Upgrade Osaurus.
 
 ## Plugin-owned vs agent-owned messages
 
@@ -84,11 +103,35 @@ The agent owns content; the plugin owns meta-messages. Plugin-owned posts should
 
 ## Configuration
 
+All keys live in the per-agent (`plugin_id, agent_id`) Keychain scope. You only ever set `bot_token`; everything else is automatic.
+
 | Key | Type | Notes |
 | --- | --- | --- |
-| `bot_token` | secret | Telegram bot token from [@BotFather](https://t.me/BotFather). Required. |
-| `webhook_secret` | secret | Generated automatically on first run. Sent back by Telegram in `X-Telegram-Bot-Api-Secret-Token`. |
-| `tunnel_url` | host-managed | Pushed to the plugin by Osaurus when a tunnel is active; webhook is registered automatically once `bot_token` and `tunnel_url` are both present. |
+| `bot_token` | secret (user-set) | Telegram bot token from [@BotFather](https://t.me/BotFather). Required. |
+| `webhook_secret` | secret (auto-generated) | 32-byte hex string created on first run. Sent back by Telegram in `X-Telegram-Bot-Api-Secret-Token` and verified in constant time on every webhook delivery. |
+| `tunnel_url` | host-managed | Pushed to the plugin by Osaurus when the agent's tunnel is up. The `webhook_url` field in the plugin's config (templated as `{{plugin_url}}/webhook`) is what tells Osaurus this plugin needs the resolved URL. |
+| `webhook_registered` | host-managed (status indicator) | Set to `"true"` only after Telegram itself confirms (via `getWebhookInfo`) that our URL is registered AND there's no recent delivery error. Cleared eagerly at the start of any state change that invalidates the previous registration (bot-token swap, tunnel URL change, teardown). The plugin's `webhook_status` config field (`connected_when: "webhook_registered"`) reads this to drive the green/grey indicator. |
+
+### What "Webhook: connected" means
+
+The indicator is grounded in Telegram's view, not just the optimistic acknowledgement of `setWebhook`. After every registration the plugin calls `getWebhookInfo` and only flips the indicator green if:
+
+1. Telegram reports the URL it has matches the URL we just set, AND
+2. there is no `last_error_date` within the last 5 minutes.
+
+If either check fails (e.g. tunnel went down between requests, Telegram is failing to deliver), the indicator stays grey and the plugin's Insights log explains why (`verifyWebhook: ...`).
+
+The flag also flips grey **eagerly** at the start of bot-token swaps and tunnel-URL changes — so you never see a stale-green indicator while a transition is in flight.
+
+### What if the indicator stays grey after I save the bot token?
+
+The plugin needs both `bot_token` AND `tunnel_url`. `tunnel_url` is pushed by Osaurus once your agent's tunnel comes up. Look at the plugin's Insights log for one of:
+
+- `Saved bot_token; waiting for tunnel_url before registering webhook.` — the tunnel hasn't connected yet for this agent. Open the agent's tunnel page or restart Osaurus.
+- `Got tunnel_url; waiting for bot_token before registering webhook.` — paste the bot token.
+- `verifyWebhook: Telegram has url="..." but we expected "..."` — Telegram has a stale URL registered (e.g. from a previous tunnel). Save your bot token again or wait for the next tunnel push to re-register.
+- `verifyWebhook: Telegram reports recent delivery error: ...` — Telegram can reach us (the URL matches) but a recent delivery failed. Usually transient.
+- `Webhook registered at https://...` — done. Send a message to your bot.
 
 ## License
 

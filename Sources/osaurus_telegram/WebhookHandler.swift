@@ -2,17 +2,17 @@ import Foundation
 
 // MARK: - Route Handler
 
-func handleRoute(ctx: PluginContext, requestJSON: String) -> String {
+func handleRoute(state: AgentState, agentId: String, requestJSON: String) -> String {
   guard let req = parseJSON(requestJSON, as: RouteRequest.self) else {
     logWarn("handleRoute: failed to parse request JSON (\(requestJSON.count) chars)")
     return makeRouteResponse(status: 400, body: #"{"ok":false,"description":"bad request"}"#)
   }
 
-  logDebug("handleRoute: route_id=\(req.route_id) method=\(req.method)")
+  logDebug("handleRoute[\(agentId)]: route_id=\(req.route_id) method=\(req.method)")
 
   switch req.route_id {
   case "webhook":
-    return handleWebhook(ctx: ctx, req: req)
+    return handleWebhook(state: state, agentId: agentId, req: req)
   default:
     logWarn("handleRoute: unknown route_id '\(req.route_id)'")
     return makeRouteResponse(status: 404, body: #"{"ok":false,"description":"not found"}"#)
@@ -30,9 +30,9 @@ private func extractSecretHeader(from headers: [String: String]) -> String {
 /// Hot path. Telegram retries on slow / 4xx / 5xx, so this MUST return 200
 /// quickly. Any heavy lifting goes through dispatch — never await inference
 /// here.
-private func handleWebhook(ctx: PluginContext, req: RouteRequest) -> String {
+private func handleWebhook(state: AgentState, agentId: String, req: RouteRequest) -> String {
   // 1. Verify Telegram's secret header (constant-time).
-  let expectedSecret = ctx.webhookSecret ?? configGet("webhook_secret") ?? ""
+  let expectedSecret = state.webhookSecret ?? configGet("webhook_secret") ?? ""
   let receivedSecret = extractSecretHeader(from: req.headers ?? [:])
   guard !expectedSecret.isEmpty,
     constantTimeEquals(expectedSecret, receivedSecret)
@@ -61,15 +61,15 @@ private func handleWebhook(ctx: PluginContext, req: RouteRequest) -> String {
   let chatId = message.chat.id
 
   // 3. Idempotency: drop duplicate Telegram retries.
-  if DatabaseManager.isUpdateAlreadySeen(updateId: update.update_id) {
+  if DatabaseManager.isUpdateAlreadySeen(agentId: agentId, updateId: update.update_id) {
     logDebug("handleWebhook: duplicate update_id=\(update.update_id), 200 OK")
     return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
   }
-  DatabaseManager.markUpdateSeen(updateId: update.update_id)
+  DatabaseManager.markUpdateSeen(agentId: agentId, updateId: update.update_id)
   DatabaseManager.pruneOldSeenUpdates()
 
   // 4. Resolve / create chat row. Skip if blocked.
-  let chat = DatabaseManager.upsertChatSession(chatId: chatId)
+  let chat = DatabaseManager.upsertChatSession(agentId: agentId, chatId: chatId)
   if chat.blocked == 1 {
     logDebug("handleWebhook: chat \(chatId) is blocked, ignoring")
     return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
@@ -78,7 +78,7 @@ private func handleWebhook(ctx: PluginContext, req: RouteRequest) -> String {
   // 5. Handle /reset inline before dispatching.
   let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
   if trimmed == "/reset" {
-    handleReset(ctx: ctx, chatId: chatId)
+    handleReset(state: state, agentId: agentId, chatId: chatId)
     return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
   }
 
@@ -94,7 +94,7 @@ private func handleWebhook(ctx: PluginContext, req: RouteRequest) -> String {
   //    appends our text into the live session and cancels the stream),
   //    then dispatch a fresh turn against the same session_id. Naturally
   //    handles rapid-fire messages without queues.
-  if let active = DatabaseManager.activeDispatch(forChat: chatId) {
+  if let active = DatabaseManager.activeDispatch(agentId: agentId, forChat: chatId) {
     logDebug(
       "handleWebhook: interrupting active task \(active.taskId) for chat \(chatId)")
     if let interrupt = hostAPI?.pointee.dispatch_interrupt {
@@ -109,10 +109,14 @@ private func handleWebhook(ctx: PluginContext, req: RouteRequest) -> String {
   }
 
   // 8. Dispatch. Fire and forget. The agent will call our reply tool.
+  //    `external_session_key` keeps the host's session-reattach logic
+  //    agent-scoped as defense-in-depth alongside the new (agent_id,
+  //    chat_id) DB partitioning.
   let dispatchPayload: [String: Any] = [
     "prompt": prompt,
     "title": "Telegram \(displayName)",
     "session_id": session.uuidString,
+    "external_session_key": "telegram:agent-\(agentId):chat-\(chatId)",
   ]
   guard let dispatchJSON = makeJSONString(dispatchPayload) else {
     logError("handleWebhook: failed to serialize dispatch payload")
@@ -129,7 +133,7 @@ private func handleWebhook(ctx: PluginContext, req: RouteRequest) -> String {
   if let errCode = parsed.error {
     if errCode == "rate_limit_exceeded" {
       // Plugin-owned meta-message: the user must hear *something*.
-      if let token = ctx.botToken {
+      if let token = state.botToken {
         _ = telegramSendMessage(
           token: token, chatId: chatId,
           text: "I'm catching up on a few things. Please retry in a moment.")
@@ -147,8 +151,8 @@ private func handleWebhook(ctx: PluginContext, req: RouteRequest) -> String {
 
   let expiresAt = Int(Date().timeIntervalSince1970) + 600  // 10 minutes
   DatabaseManager.insertActiveDispatch(
-    taskId: taskId, chatId: chatId, replyToken: replyToken,
-    sessionId: session.uuidString, expiresAt: expiresAt)
+    taskId: taskId, agentId: agentId, chatId: chatId,
+    replyToken: replyToken, sessionId: session.uuidString, expiresAt: expiresAt)
   logInfo("Dispatched task \(taskId) for chat \(chatId) (token=\(replyToken))")
 
   return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
@@ -156,18 +160,18 @@ private func handleWebhook(ctx: PluginContext, req: RouteRequest) -> String {
 
 // MARK: - /reset
 
-private func handleReset(ctx: PluginContext, chatId: Int64) {
+private func handleReset(state: AgentState, agentId: String, chatId: Int64) {
   logDebug("handleReset: chat \(chatId)")
-  DatabaseManager.bumpSessionSalt(chatId: chatId)
+  DatabaseManager.bumpSessionSalt(agentId: agentId, chatId: chatId)
 
-  if let active = DatabaseManager.activeDispatch(forChat: chatId) {
+  if let active = DatabaseManager.activeDispatch(agentId: agentId, forChat: chatId) {
     active.taskId.withCString { tid in
       hostAPI?.pointee.dispatch_cancel?(tid)
     }
     DatabaseManager.deleteActiveDispatch(taskId: active.taskId)
   }
 
-  if let token = ctx.botToken {
+  if let token = state.botToken {
     _ = telegramSendMessage(
       token: token, chatId: chatId, text: "Conversation reset.")
   }

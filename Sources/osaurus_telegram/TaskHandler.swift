@@ -25,20 +25,37 @@ private let taskEventNames: [Int32: String] = [
   4: "COMPLETED", 5: "FAILED", 6: "CANCELLED", 7: "OUTPUT", 8: "DRAFT",
 ]
 
-func handleTaskEvent(ctx: PluginContext, taskId: String, eventType: Int32, eventJSON: String) {
+func handleTaskEvent(
+  state: AgentState, agentId: String, taskId: String,
+  eventType: Int32, eventJSON: String
+) {
   let eventName = taskEventNames[eventType] ?? "UNKNOWN(\(eventType))"
-  logDebug(
-    "handleTaskEvent: taskId=\(taskId) type=\(eventName) json=\(String(eventJSON.prefix(200)))")
+  state.log(
+    .debug,
+    "handleTaskEvent: taskId=\(taskId) type=\(eventName) "
+      + "json=\(String(eventJSON.prefix(200)))")
 
   switch eventType {
   case TaskEventType.completed:
-    handleCompleted(ctx: ctx, taskId: taskId, eventJSON: eventJSON)
+    runTerminalSafetyNet(
+      state: state, taskId: taskId, caller: "handleCompleted",
+      logLevel: .info,
+      message: {
+        let summary = (parseJSONObject(eventJSON)?["summary"] as? String) ?? "(done)"
+        return String(summary.prefix(4000))
+      })
 
   case TaskEventType.failed:
-    handleFailed(ctx: ctx, taskId: taskId, eventJSON: eventJSON)
+    runTerminalSafetyNet(
+      state: state, taskId: taskId, caller: "handleFailed",
+      logLevel: .warn,
+      message: { "Sorry, something went wrong handling that." })
 
   case TaskEventType.cancelled:
-    handleCancelled(taskId: taskId)
+    // Cancellation happens either from /reset or because a new message
+    // arrived and we issued dispatch_interrupt — we already cleaned up the
+    // row in both paths. Belt-and-suspenders: delete again here.
+    DatabaseManager.deleteActiveDispatch(taskId: taskId)
 
   case TaskEventType.started,
     TaskEventType.activity,
@@ -55,47 +72,40 @@ func handleTaskEvent(ctx: PluginContext, taskId: String, eventType: Int32, event
 }
 
 // MARK: - Terminal events
+//
+// COMPLETED and FAILED differ only in the safety-net message and log
+// severity. Everything else — binding lookup, agent-ownership check,
+// hasReplied gate, and row cleanup — is identical, so we share one
+// implementation.
 
-private func handleCompleted(ctx: PluginContext, taskId: String, eventJSON: String) {
+private func runTerminalSafetyNet(
+  state: AgentState,
+  taskId: String,
+  caller: String,
+  logLevel: LogLevel,
+  message: () -> String
+) {
   guard let binding = DatabaseManager.lookupBindingByTask(taskId: taskId) else {
-    logDebug("handleCompleted: no binding for task \(taskId), skipping")
+    logDebug("\(caller): no binding for task \(taskId), skipping")
     return
   }
-
-  if !DatabaseManager.hasReplied(taskId: taskId) {
-    let summary = (parseJSONObject(eventJSON)?["summary"] as? String) ?? "(done)"
-    logInfo(
-      "handleCompleted: safety-net post for task \(taskId) chat \(binding.chatId)")
-    if let token = ctx.botToken {
-      _ = telegramSendMessage(
-        token: token, chatId: binding.chatId,
-        text: String(summary.prefix(4000)))
-    }
-  }
-  DatabaseManager.deleteActiveDispatch(taskId: taskId)
-}
-
-private func handleFailed(ctx: PluginContext, taskId: String, eventJSON: String) {
-  guard let binding = DatabaseManager.lookupBindingByTask(taskId: taskId) else {
-    logDebug("handleFailed: no binding for task \(taskId), skipping")
-    return
-  }
-
-  if !DatabaseManager.hasReplied(taskId: taskId) {
+  // Defense-in-depth: a misrouted task event must never trigger a Telegram
+  // post on the wrong agent's bot.
+  guard binding.agentId == state.agentId else {
     logWarn(
-      "handleFailed: safety-net post for task \(taskId) chat \(binding.chatId)")
-    if let token = ctx.botToken {
+      "\(caller): task \(taskId) belongs to agent \(binding.agentId), "
+        + "not the active agent \(state.agentId); ignoring")
+    return
+  }
+
+  if !DatabaseManager.hasReplied(taskId: taskId) {
+    state.log(
+      logLevel, "\(caller): safety-net post for task \(taskId) chat \(binding.chatId)")
+    if let token = state.botToken {
       _ = telegramSendMessage(
         token: token, chatId: binding.chatId,
-        text: "Sorry, something went wrong handling that.")
+        text: message())
     }
   }
-  DatabaseManager.deleteActiveDispatch(taskId: taskId)
-}
-
-private func handleCancelled(taskId: String) {
-  // Cancellation happens either from /reset or because a new message arrived
-  // and we issued dispatch_interrupt — we already cleaned up the row in both
-  // paths. Belt-and-suspenders: delete again here.
   DatabaseManager.deleteActiveDispatch(taskId: taskId)
 }

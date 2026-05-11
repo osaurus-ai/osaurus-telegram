@@ -4,10 +4,45 @@ import Foundation
 //
 // We assemble the function table once at module init and hand the same
 // pointer to the host on every entry. Closures here are thin trampolines:
-// validate inputs, look up the PluginContext, and call into the per-callback
-// implementations defined in WebhookHandler.swift / Tools.swift / etc.
+// validate inputs, resolve the active agent (ABI v4) via
+// `resolveAgentFrame`, and call into the per-callback implementations
+// defined in WebhookHandler.swift / Tools.swift / etc.
 
 private nonisolated(unsafe) var api: osr_plugin_api = makeAPI()
+
+/// Resolved agent context for one host callback. nil here means we can't
+/// safely run the per-agent path (either ctx was nil, the host is older
+/// than ABI v4, or we're being called outside any per-agent frame).
+private struct AgentFrame {
+  let registry: PluginContext
+  let state: AgentState
+  let agentId: String
+}
+
+/// Common preamble for every per-agent C trampoline: extract the registry,
+/// resolve the active agent via `get_active_agent_id`, and look up its
+/// state. Returns nil with a warning logged on any failure.
+private func resolveAgentFrame(
+  _ ctxPtr: osr_plugin_ctx_t?, caller: String
+) -> AgentFrame? {
+  guard let ctxPtr else {
+    logWarn("\(caller) called with nil ctx")
+    return nil
+  }
+  let registry = Unmanaged<PluginContext>.fromOpaque(ctxPtr).takeUnretainedValue()
+  guard let agentId = getActiveAgentId() else {
+    logWarn("\(caller): no active agent_id resolvable")
+    return nil
+  }
+  return AgentFrame(registry: registry, state: registry.state(for: agentId), agentId: agentId)
+}
+
+private let noAgentRouteResponse =
+  #"{"ok":false,"description":"plugin requires per-agent host frame (ABI v4)"}"#
+
+private let noAgentInvokeEnvelope = toolEnvelopeError(
+  "no_agent_context",
+  "Plugin invoked outside any per-agent frame. Host must implement ABI v4.")
 
 private func makeAPI() -> osr_plugin_api {
   var api = osr_plugin_api()
@@ -27,54 +62,71 @@ private func makeAPI() -> osr_plugin_api {
   api.destroy = { ctxPtr in
     guard let ctxPtr else { return }
     let ctx = Unmanaged<PluginContext>.fromOpaque(ctxPtr).takeUnretainedValue()
-    destroyPlugin(ctx)
+    // We're outside any per-agent frame — iterate every cached agent and
+    // tear down its Telegram webhook directly. We deliberately skip
+    // `setWebhookRegistered(false)` per-agent because that would write to
+    // the host's default-agent fallback (no TLS).
+    for (_, state) in ctx.allStates() {
+      destroyAgent(state: state)
+    }
     Unmanaged<PluginContext>.fromOpaque(ctxPtr).release()
   }
 
   api.get_manifest = { _ in makeCString(pluginManifestJSON) }
 
   api.invoke = { ctxPtr, typePtr, idPtr, payloadPtr in
-    guard let ctxPtr, let typePtr, let idPtr, let payloadPtr else {
-      logWarn("invoke called with nil parameters")
+    guard let typePtr, let idPtr, let payloadPtr else {
+      logWarn("invoke called with nil arguments")
       return nil
     }
-    let ctx = Unmanaged<PluginContext>.fromOpaque(ctxPtr).takeUnretainedValue()
-    let type = String(cString: typePtr)
-    let id = String(cString: idPtr)
-    let payload = String(cString: payloadPtr)
-    return makeCString(handleInvoke(ctx: ctx, type: type, id: id, payload: payload))
+    guard let frame = resolveAgentFrame(ctxPtr, caller: "invoke") else {
+      return makeCString(noAgentInvokeEnvelope)
+    }
+    return makeCString(
+      handleInvoke(
+        state: frame.state,
+        type: String(cString: typePtr),
+        id: String(cString: idPtr),
+        payload: String(cString: payloadPtr)))
   }
 
   api.handle_route = { ctxPtr, requestJsonPtr in
-    guard let ctxPtr, let requestJsonPtr else {
-      logWarn("handle_route called with nil parameters")
+    guard let requestJsonPtr else {
+      logWarn("handle_route called with nil request")
       return nil
     }
-    let ctx = Unmanaged<PluginContext>.fromOpaque(ctxPtr).takeUnretainedValue()
-    let requestJson = String(cString: requestJsonPtr)
-    return makeCString(handleRoute(ctx: ctx, requestJSON: requestJson))
+    guard let frame = resolveAgentFrame(ctxPtr, caller: "handle_route") else {
+      return makeCString(makeRouteResponse(status: 503, body: noAgentRouteResponse))
+    }
+    return makeCString(
+      handleRoute(
+        state: frame.state, agentId: frame.agentId,
+        requestJSON: String(cString: requestJsonPtr)))
   }
 
   api.on_config_changed = { ctxPtr, keyPtr, valuePtr in
-    guard let ctxPtr, let keyPtr else {
-      logWarn("on_config_changed called with nil parameters")
+    guard let keyPtr else {
+      logWarn("on_config_changed called with nil key")
       return
     }
-    let ctx = Unmanaged<PluginContext>.fromOpaque(ctxPtr).takeUnretainedValue()
-    let key = String(cString: keyPtr)
-    let value = valuePtr.map { String(cString: $0) }
-    onConfigChanged(ctx: ctx, key: key, value: value)
+    guard let frame = resolveAgentFrame(ctxPtr, caller: "on_config_changed") else { return }
+    onConfigChanged(
+      state: frame.state,
+      key: String(cString: keyPtr),
+      value: valuePtr.map { String(cString: $0) })
   }
 
   api.on_task_event = { ctxPtr, taskIdPtr, eventType, eventJsonPtr in
-    guard let ctxPtr, let taskIdPtr, let eventJsonPtr else {
-      logWarn("on_task_event called with nil parameters")
+    guard let taskIdPtr, let eventJsonPtr else {
+      logWarn("on_task_event called with nil arguments")
       return
     }
-    let ctx = Unmanaged<PluginContext>.fromOpaque(ctxPtr).takeUnretainedValue()
-    let taskId = String(cString: taskIdPtr)
-    let eventJson = String(cString: eventJsonPtr)
-    handleTaskEvent(ctx: ctx, taskId: taskId, eventType: eventType, eventJSON: eventJson)
+    guard let frame = resolveAgentFrame(ctxPtr, caller: "on_task_event") else { return }
+    handleTaskEvent(
+      state: frame.state, agentId: frame.agentId,
+      taskId: String(cString: taskIdPtr),
+      eventType: eventType,
+      eventJSON: String(cString: eventJsonPtr))
   }
 
   return api
@@ -83,9 +135,9 @@ private func makeAPI() -> osr_plugin_api {
 // MARK: - Invoke dispatcher
 
 private func handleInvoke(
-  ctx: PluginContext, type: String, id: String, payload: String
+  state: AgentState, type: String, id: String, payload: String
 ) -> String {
-  logDebug("invoke: type=\(type) id=\(id) payload=\(payload.count) chars")
+  state.log(.debug, "invoke: type=\(type) id=\(id) payload=\(payload.count) chars")
 
   guard type == "tool" else {
     logWarn("invoke: unknown capability type '\(type)'")
@@ -93,12 +145,9 @@ private func handleInvoke(
   }
 
   switch id {
-  case "reply":
-    return handleReply(ctx: ctx, payload: payload)
-  case "reply_typing":
-    return handleReplyTyping(ctx: ctx, payload: payload)
-  case "reply_photo":
-    return handleReplyPhoto(ctx: ctx, payload: payload)
+  case "reply": return handleReply(state: state, payload: payload)
+  case "reply_typing": return handleReplyTyping(state: state, payload: payload)
+  case "reply_photo": return handleReplyPhoto(state: state, payload: payload)
   default:
     logWarn("invoke: unknown tool '\(id)'")
     return toolEnvelopeError("unknown_tool", "Unknown tool: \(id)")
@@ -108,6 +157,7 @@ private func handleInvoke(
 // MARK: - Diagnostics
 
 private func logHostAPIAvailability() {
+  let hostVersion = hostAPI?.pointee.version ?? 0
   let checks: [(String, Bool)] = [
     ("dispatch", hostAPI?.pointee.dispatch != nil),
     ("dispatch_interrupt", hostAPI?.pointee.dispatch_interrupt != nil),
@@ -118,12 +168,19 @@ private func logHostAPIAvailability() {
     ("config_get", hostAPI?.pointee.config_get != nil),
     ("log", hostAPI?.pointee.log != nil),
     ("list_active_tasks", hostAPI?.pointee.list_active_tasks != nil),
+    // ABI v4
+    ("get_active_agent_id", hostVersion >= 4 && hostAPI?.pointee.get_active_agent_id != nil),
   ]
   let available = checks.filter { $0.1 }.map { $0.0 }
   let missing = checks.filter { !$0.1 }.map { $0.0 }
   logInfo(
-    "Plugin init complete. Host APIs available: [\(available.joined(separator: ", "))], missing: [\(missing.joined(separator: ", "))]"
-  )
+    "Plugin init complete (host ABI v\(hostVersion)). Host APIs available: "
+      + "[\(available.joined(separator: ", "))], missing: [\(missing.joined(separator: ", "))]")
+  if hostVersion < 4 {
+    logWarn(
+      "Host ABI < 4: no per-agent isolation possible. Per-agent callbacks will be rejected. "
+        + "Upgrade Osaurus to a version that exposes get_active_agent_id.")
+  }
 }
 
 // MARK: - Entry Points

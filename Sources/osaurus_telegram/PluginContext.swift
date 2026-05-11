@@ -1,16 +1,148 @@
 import Foundation
 
-// MARK: - Plugin Context
-
-/// In-memory state cached from the host. Everything persistent lives in the
-/// per-plugin SQLite DB; this just avoids a `config_get` round-trip on the
-/// hot path.
-final class PluginContext: @unchecked Sendable {
+// MARK: - AgentState
+//
+// One per agent that loads this plugin. Holds the cached config values for
+// that agent so we don't make a `config_get` round-trip on every callback.
+// All persistent state still lives in the per-plugin SQLite DB; this class
+// is purely the in-memory mirror.
+//
+// Lifetime: created lazily by `PluginContext.state(for:)` the first time we
+// see a per-agent callback for a given agent_id. Freed only when the plugin
+// itself is destroyed.
+final class AgentState: @unchecked Sendable {
+  let agentId: String
   var botToken: String?
   var botId: String?
   var botUsername: String?
   var webhookSecret: String?
+  /// Public base URL of the agent's Osaurus tunnel. The host pushes this via
+  /// `on_config_changed("tunnel_url", ...)` once the tunnel is up — there is
+  /// no synchronous getter, so the plugin must wait for the push.
   var tunnelURL: String?
+
+  /// Hydration is one-shot per-agent. The lock makes concurrent first-touches
+  /// for the same agent_id wait for the inserter rather than racing against a
+  /// half-populated state object. Per-agent (not registry-wide) so different
+  /// agents can hydrate in parallel.
+  private let hydrationLock = NSLock()
+  private var didHydrate = false
+
+  init(agentId: String) {
+    self.agentId = agentId
+  }
+
+  /// Runs `body` exactly once across all callers. Subsequent calls are
+  /// cheap (just a lock acquire). Hydration may do Keychain reads + a
+  /// blocking Telegram round-trip, so callers should only invoke this from
+  /// inside a per-agent host frame and outside any other lock.
+  func hydrateOnce(_ body: () -> Void) {
+    hydrationLock.lock()
+    defer { hydrationLock.unlock() }
+    if didHydrate { return }
+    body()
+    didHydrate = true
+  }
+
+  /// Convenience: prefixes log lines with the agent id so cross-agent logs
+  /// stay legible in the Insights tab.
+  func log(_ level: LogLevel, _ message: String) {
+    let prefixed = "[\(agentId)] \(message)"
+    switch level {
+    case .debug: logDebug(prefixed)
+    case .info: logInfo(prefixed)
+    case .warn: logWarn(prefixed)
+    case .error: logError(prefixed)
+    }
+  }
+}
+
+enum LogLevel { case debug, info, warn, error }
+
+// MARK: - PluginContext (agent registry)
+//
+// The opaque pointer the host hands back to us on every callback. There is
+// exactly one of these per plugin load, regardless of how many agents the
+// host wires up to it. Its only job is to hand out per-agent `AgentState`
+// instances.
+final class PluginContext: @unchecked Sendable {
+  private let lock = NSLock()
+  private var states: [String: AgentState] = [:]
+
+  /// Returns the cached `AgentState` for `agentId`, creating it on first
+  /// encounter and triggering a one-shot hydration from `config_get`. MUST
+  /// be called from inside a per-agent callback frame so config_get and
+  /// config_set resolve to the right agent.
+  func state(for agentId: String) -> AgentState {
+    let state = lock.withLock {
+      if let existing = states[agentId] { return existing }
+      let fresh = AgentState(agentId: agentId)
+      states[agentId] = fresh
+      return fresh
+    }
+    // Hydrate outside the registry lock — Keychain reads and the optional
+    // Telegram reconciliation are slow. AgentState's own lock makes this
+    // race-free for the same agent.
+    state.hydrateOnce { hydrate(state) }
+    return state
+  }
+
+  /// Snapshot of every (agentId, state) pair. Used by `destroy` to tear down
+  /// every agent's webhook even though we no longer have per-agent context.
+  func allStates() -> [(String, AgentState)] {
+    lock.withLock { states.map { ($0.key, $0.value) } }
+  }
+
+  private func hydrate(_ state: AgentState) {
+    if let secret = configGet("webhook_secret"), !secret.isEmpty {
+      state.webhookSecret = secret
+      state.log(.debug, "webhook_secret loaded from config")
+    } else {
+      let secret = randomHexString(bytes: 32)
+      configSet("webhook_secret", secret)
+      state.webhookSecret = secret
+      state.log(.info, "generated new webhook_secret")
+    }
+
+    if let token = configGet("bot_token"), !token.isEmpty {
+      state.botToken = token
+      state.log(.debug, "bot_token loaded from config (\(token.count) chars)")
+    }
+
+    if let url = configGet("tunnel_url"), !url.isEmpty {
+      state.tunnelURL = url
+      state.log(.debug, "tunnel_url loaded from config")
+    }
+
+    // If both halves are already on disk, reconcile with Telegram now so
+    // the UI indicator is accurate by the time the user opens the plugin
+    // pane. Otherwise log what we're still waiting on.
+    if let token = state.botToken, let url = state.tunnelURL {
+      setupWebhook(state: state, token: token, tunnelURL: url)
+    } else {
+      setWebhookRegistered(false)
+      logWebhookWaitingState(state: state)
+    }
+  }
+}
+
+// MARK: - Webhook status flag
+//
+// `connected_when: "webhook_registered"` (declared in the manifest) drives
+// the green/grey indicator next to the bot token field. We treat the flag
+// as ground truth for the UI and only flip it to "true" after Telegram
+// itself confirms (via getWebhookInfo) that our URL is registered with no
+// recent delivery errors. Any state change that invalidates the previous
+// registration clears it eagerly so the UI never shows stale-green.
+
+private let webhookRegisteredKey = "webhook_registered"
+
+private func setWebhookRegistered(_ on: Bool) {
+  if on {
+    configSet(webhookRegisteredKey, "true")
+  } else {
+    configDelete(webhookRegisteredKey)
+  }
 }
 
 // MARK: - Lifecycle
@@ -19,28 +151,11 @@ func initPlugin(_ ctx: PluginContext) {
   logDebug("initPlugin: starting")
   DatabaseManager.initSchema()
   DatabaseManager.sweepExpiredDispatches()
-
-  if let secret = configGet("webhook_secret"), !secret.isEmpty {
-    ctx.webhookSecret = secret
-    logDebug("initPlugin: webhook_secret loaded from config")
-  } else {
-    let secret = randomHexString(bytes: 32)
-    configSet("webhook_secret", secret)
-    ctx.webhookSecret = secret
-    logInfo("initPlugin: generated new webhook_secret")
-  }
-
-  if let token = configGet("bot_token"), !token.isEmpty {
-    ctx.botToken = token
-    logDebug("initPlugin: bot_token loaded from config (\(token.count) chars)")
-  }
-
-  if let tunnelURL = configGet("tunnel_url"), !tunnelURL.isEmpty {
-    ctx.tunnelURL = tunnelURL
-    logDebug("initPlugin: tunnel_url loaded from config")
-  }
-
-  logInfo("initPlugin: ready, waiting for config delivery")
+  // No per-agent config_get here — there is no agent context at plugin-load
+  // time. Each agent's state hydrates lazily on its first per-agent callback
+  // (handle_route / on_config_changed / invoke / on_task_event), where TLS
+  // is bound and config_get resolves to the right agent.
+  logInfo("initPlugin: ready (per-agent state hydrates on first event)")
 }
 
 // MARK: - Webhook Setup
@@ -63,105 +178,196 @@ private func withRetry<T>(
   return nil
 }
 
-func setupWebhook(ctx: PluginContext, token: String, tunnelURL: String) {
-  logDebug("setupWebhook: calling getMe to validate token")
+func setupWebhook(state: AgentState, token: String, tunnelURL: String) {
+  // Whatever was registered before is at best "unknown" until this attempt
+  // lands — surface that in the UI immediately rather than letting the old
+  // green linger across getMe + setWebhook + getWebhookInfo (~1-3s).
+  setWebhookRegistered(false)
+
+  state.log(.debug, "setupWebhook: calling getMe to validate token")
   guard let botInfo = withRetry(operation: "getMe", block: { telegramGetMe(token: token) }) else {
-    logError("Failed to validate bot token with getMe")
+    state.log(.error, "Failed to validate bot token with getMe")
     return
   }
 
-  ctx.botId = botInfo.botId
-  ctx.botUsername = botInfo.username
-  logInfo("Telegram bot @\(botInfo.username) (id: \(botInfo.botId)) validated")
+  state.botId = botInfo.botId
+  state.botUsername = botInfo.username
+  state.log(.info, "Telegram bot @\(botInfo.username) (id: \(botInfo.botId)) validated")
 
-  guard let secret = ctx.webhookSecret, !secret.isEmpty else {
-    logError("setupWebhook: no webhook_secret available")
+  guard let secret = state.webhookSecret, !secret.isEmpty else {
+    state.log(.error, "setupWebhook: no webhook_secret available")
     return
   }
 
   let pluginId = "osaurus.telegram"
   let webhookURL =
-    tunnelURL.trimmingCharacters(in: .init(charactersIn: "/")) + "/plugins/\(pluginId)/webhook"
-  logDebug("setupWebhook: registering webhook at \(webhookURL)")
+    tunnelURL.trimmingCharacters(in: .init(charactersIn: "/"))
+    + "/plugins/\(pluginId)/webhook"
+  state.log(.debug, "setupWebhook: registering webhook at \(webhookURL)")
 
   let registered =
     withRetry(operation: "setWebhook") {
       telegramSetWebhook(token: token, url: webhookURL, secretToken: secret) ? true : nil
     } != nil
-  if registered {
-    logInfo("Webhook registered at \(webhookURL)")
+  guard registered else {
+    state.log(.error, "Failed to register webhook at \(webhookURL)")
+    return
+  }
+
+  // setWebhook only validates the request shape. Confirm with getWebhookInfo
+  // that Telegram has the URL we expect AND isn't already failing to deliver
+  // to it (e.g. our tunnel went down between requests).
+  if verifyWebhook(token: token, expectedURL: webhookURL) {
+    setWebhookRegistered(true)
+    state.log(.info, "Webhook registered at \(webhookURL)")
   } else {
-    logError("Failed to register webhook at \(webhookURL)")
+    // Don't trust the optimistic setWebhook response — the indicator stays
+    // red so the user sees something is wrong.
+    state.log(
+      .error,
+      "setWebhook accepted, but Telegram doesn't confirm \(webhookURL) "
+        + "or is reporting a recent delivery error.")
   }
 }
 
-func onConfigChanged(ctx: PluginContext, key: String, value: String?) {
-  logDebug("onConfigChanged: key=\(key) hasValue=\(value != nil)")
-
-  if key == "tunnel_url" {
-    guard let newURL = value, !newURL.isEmpty else {
-      logDebug("onConfigChanged: tunnel_url cleared")
-      ctx.tunnelURL = nil
-      return
-    }
-    ctx.tunnelURL = newURL
-    guard let token = ctx.botToken, !token.isEmpty else {
-      logDebug("onConfigChanged: tunnel_url stored, waiting for bot_token")
-      return
-    }
-    logDebug("onConfigChanged: tunnel_url + bot_token both available, registering webhook")
-    setupWebhook(ctx: ctx, token: token, tunnelURL: newURL)
-    return
+/// Asks Telegram what URL it has registered and whether delivery is healthy.
+/// Returns true only if both checks pass.
+@discardableResult
+func verifyWebhook(token: String, expectedURL: String) -> Bool {
+  guard let info = telegramGetWebhookInfo(token: token) else {
+    logWarn("verifyWebhook: getWebhookInfo failed; assuming disconnected")
+    return false
   }
+  if info.url != expectedURL {
+    logWarn(
+      "verifyWebhook: Telegram has url=\"\(info.url)\" but we expected \"\(expectedURL)\"")
+    return false
+  }
+  if info.hasRecentError() {
+    logWarn(
+      "verifyWebhook: Telegram reports recent delivery error: \(info.lastErrorMessage)")
+    return false
+  }
+  if info.pendingUpdateCount > 0 {
+    logDebug("verifyWebhook: \(info.pendingUpdateCount) pending updates queued")
+  }
+  return true
+}
 
-  if key == "webhook_secret" {
+func onConfigChanged(state: AgentState, key: String, value: String?) {
+  state.log(.debug, "onConfigChanged: key=\(key) hasValue=\(value != nil)")
+
+  switch key {
+  case "tunnel_url":
+    handleTunnelURLChange(state: state, value: value)
+
+  case "webhook_secret":
     if let v = value, !v.isEmpty {
-      ctx.webhookSecret = v
-      logDebug("onConfigChanged: webhook_secret refreshed")
+      state.webhookSecret = v
+      state.log(.debug, "onConfigChanged: webhook_secret refreshed")
     }
+
+  case "bot_token":
+    handleBotTokenChange(state: state, value: value)
+
+  default:
+    state.log(.debug, "onConfigChanged: ignoring key '\(key)'")
+  }
+}
+
+private func handleTunnelURLChange(state: AgentState, value: String?) {
+  let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+  guard let newURL = trimmed, !newURL.isEmpty else {
+    state.log(.debug, "onConfigChanged: tunnel_url cleared")
+    state.tunnelURL = nil
+    setWebhookRegistered(false)
     return
   }
 
-  guard key == "bot_token" else {
-    logDebug("onConfigChanged: ignoring key '\(key)'")
+  // No-op if the value is identical — avoids a pointless re-registration
+  // and the brief red-flash that comes with it.
+  if newURL == state.tunnelURL {
+    state.log(.debug, "onConfigChanged: tunnel_url unchanged, skipping")
     return
   }
 
+  state.tunnelURL = newURL
+  // The previous registration (if any) is now stale; flip red until the new
+  // setup completes.
+  setWebhookRegistered(false)
+
+  guard let token = state.botToken, !token.isEmpty else {
+    state.log(.info, "Got tunnel_url; waiting for bot_token before registering webhook.")
+    return
+  }
+  state.log(.debug, "tunnel_url + bot_token both available, registering webhook")
+  setupWebhook(state: state, token: token, tunnelURL: newURL)
+}
+
+private func handleBotTokenChange(state: AgentState, value: String?) {
   let newToken = (value?.isEmpty == false) ? value : nil
 
-  if newToken == ctx.botToken {
-    logDebug("onConfigChanged: bot_token unchanged, skipping")
+  if newToken == state.botToken {
+    state.log(.debug, "onConfigChanged: bot_token unchanged, skipping")
     return
   }
 
-  if let oldToken = ctx.botToken, !oldToken.isEmpty {
-    logDebug("onConfigChanged: tearing down old webhook")
+  // Eagerly flip red — whatever was registered with the old token (or with
+  // the agent's previous bot) is no longer the source of truth.
+  setWebhookRegistered(false)
+
+  if let oldToken = state.botToken, !oldToken.isEmpty {
+    state.log(.debug, "tearing down old webhook")
     _ = telegramDeleteWebhook(token: oldToken)
-    logInfo("Old webhook deleted")
+    state.log(.info, "Old webhook deleted")
   }
 
-  ctx.botToken = nil
-  ctx.botId = nil
-  ctx.botUsername = nil
+  state.botToken = nil
+  state.botId = nil
+  state.botUsername = nil
 
   guard let newToken else {
-    logInfo("Bot token cleared")
+    state.log(.info, "Bot token cleared")
     return
   }
 
-  ctx.botToken = newToken
-  logDebug("onConfigChanged: bot_token stored (\(newToken.count) chars)")
+  state.botToken = newToken
+  state.log(.debug, "bot_token stored (\(newToken.count) chars)")
 
-  guard let tunnelURL = ctx.tunnelURL, !tunnelURL.isEmpty else {
-    logDebug("onConfigChanged: bot_token stored, waiting for tunnel_url")
+  guard let tunnelURL = state.tunnelURL, !tunnelURL.isEmpty else {
+    state.log(
+      .info,
+      "Saved bot_token; waiting for tunnel_url before registering webhook. "
+        + "Osaurus will push it once the agent's tunnel is up.")
     return
   }
-  setupWebhook(ctx: ctx, token: newToken, tunnelURL: tunnelURL)
+  setupWebhook(state: state, token: newToken, tunnelURL: tunnelURL)
 }
 
-func destroyPlugin(_ ctx: PluginContext) {
-  if let token = ctx.botToken, !token.isEmpty {
+/// Logs a single line summarising what's still missing for webhook setup, so
+/// the user can quickly see why the bot isn't replying after install.
+private func logWebhookWaitingState(state: AgentState) {
+  var missing: [String] = []
+  if state.botToken == nil { missing.append("bot_token (set in plugin Bot Configuration)") }
+  if state.tunnelURL == nil { missing.append("tunnel_url (pushed by Osaurus when tunnel is up)") }
+  if missing.isEmpty { return }
+  state.log(
+    .info,
+    "Webhook not yet registered \u{2014} waiting on: \(missing.joined(separator: "; "))")
+}
+
+/// Tears down a single agent's webhook. Called from `destroy` for every
+/// agent the registry has cached.
+///
+/// Note: `destroy` runs without a per-agent TLS frame, so we deliberately
+/// do NOT call `setWebhookRegistered(false)` here — that would write to the
+/// host's default-agent fallback. The host clears its own caches at plugin
+/// shutdown; the per-agent `webhook_registered` flag will be re-evaluated
+/// the next time the plugin loads.
+func destroyAgent(state: AgentState) {
+  if let token = state.botToken, !token.isEmpty {
     _ = telegramDeleteWebhook(token: token)
-    logInfo("Webhook deleted on destroy")
+    logInfo("Webhook deleted on destroy for agent \(state.agentId)")
   }
 }

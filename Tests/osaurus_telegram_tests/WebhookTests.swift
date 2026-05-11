@@ -4,20 +4,21 @@ import XCTest
 
 final class WebhookTests: XCTestCase {
 
-  private var ctx: PluginContext!
+  private var state: AgentState!
+  private let agentId = defaultTestAgentId
   private let secret = "super-secret"
 
   override func setUp() {
     super.setUp()
     TestHost.install()
     DatabaseManager.initSchema()
-    ctx = PluginContext()
-    ctx.botToken = "123:fake"
-    ctx.webhookSecret = secret
+    state = AgentState(agentId: agentId)
+    state.botToken = "123:fake"
+    state.webhookSecret = secret
   }
 
   override func tearDown() {
-    ctx = nil
+    state = nil
     TestHost.uninstall()
     super.tearDown()
   }
@@ -129,11 +130,17 @@ final class WebhookTests: XCTestCase {
     return (obj["status"] as? Int ?? 0, obj["body"] as? String ?? "")
   }
 
+  /// Convenience wrapper so test bodies don't have to repeat the
+  /// `state: state, agentId: agentId` boilerplate every call.
+  private func route(_ requestJSON: String) -> String {
+    handleRoute(state: state, agentId: agentId, requestJSON: requestJSON)
+  }
+
   // MARK: - End-to-end webhook flow
 
   func testWebhookRejectsMissingSecret() {
     let req = webhookRequest(secret: nil, update: textUpdate(updateId: 1, chatId: 1, text: "hi"))
-    let response = parseRouteResponse(handleRoute(ctx: ctx, requestJSON: req))
+    let response = parseRouteResponse(route(req))
     XCTAssertEqual(response.status, 401)
     XCTAssertTrue(TestHostGlobals.dispatchCalls.isEmpty)
   }
@@ -141,7 +148,7 @@ final class WebhookTests: XCTestCase {
   func testWebhookRejectsWrongSecret() {
     let req = webhookRequest(
       secret: "wrong", update: textUpdate(updateId: 1, chatId: 1, text: "hi"))
-    let response = parseRouteResponse(handleRoute(ctx: ctx, requestJSON: req))
+    let response = parseRouteResponse(route(req))
     XCTAssertEqual(response.status, 401)
     XCTAssertTrue(TestHostGlobals.dispatchCalls.isEmpty)
   }
@@ -156,14 +163,14 @@ final class WebhookTests: XCTestCase {
     ]
     let json = String(
       data: try! JSONSerialization.data(withJSONObject: req), encoding: .utf8)!
-    let response = parseRouteResponse(handleRoute(ctx: ctx, requestJSON: json))
+    let response = parseRouteResponse(route(json))
     XCTAssertEqual(response.status, 404)
   }
 
   func testWebhookDispatchesValidTextMessage() throws {
     let req = webhookRequest(
       secret: secret, update: textUpdate(updateId: 100, chatId: 555, text: "hello"))
-    let response = parseRouteResponse(handleRoute(ctx: ctx, requestJSON: req))
+    let response = parseRouteResponse(route(req))
     XCTAssertEqual(response.status, 200)
 
     XCTAssertEqual(TestHostGlobals.dispatchCalls.count, 1)
@@ -178,29 +185,38 @@ final class WebhookTests: XCTestCase {
     XCTAssertEqual(title, "Telegram alice")
 
     let sessionId = try XCTUnwrap(dispatch["session_id"] as? String)
-    let chat = try XCTUnwrap(DatabaseManager.getChatSession(chatId: 555))
+    let chat = try XCTUnwrap(
+      DatabaseManager.getChatSession(agentId: agentId, chatId: 555))
     let expected = sessionUUID(forChatId: 555, salt: chat.sessionSalt).uuidString
     XCTAssertEqual(sessionId, expected, "session id must be deterministic UUID5")
 
+    // The dispatch carries an agent-scoped external_session_key so the
+    // host's reattach lookup can't collide across agents.
+    let externalKey = try XCTUnwrap(dispatch["external_session_key"] as? String)
+    XCTAssertEqual(externalKey, "telegram:agent-\(agentId):chat-555")
+
     // Active dispatch row inserted for this chat.
-    let active = try XCTUnwrap(DatabaseManager.activeDispatch(forChat: 555))
+    let active = try XCTUnwrap(
+      DatabaseManager.activeDispatch(agentId: agentId, forChat: 555))
     XCTAssertEqual(active.taskId, "task-uuid")
+    XCTAssertEqual(active.agentId, agentId)
     XCTAssertGreaterThan(active.expiresAt, Int(Date().timeIntervalSince1970))
   }
 
   func testWebhookSessionIdStableAcrossMessages() throws {
     let firstReq = webhookRequest(
       secret: secret, update: textUpdate(updateId: 200, chatId: 777, text: "first"))
-    _ = handleRoute(ctx: ctx, requestJSON: firstReq)
+    _ = route(firstReq)
 
-    // Need a fresh task id for the second one (UNIQUE chat_id requires we
-    // remove the prior row first; the interrupt branch handles that).
+    // Need a fresh task id for the second one (UNIQUE (agent_id, chat_id)
+    // requires we remove the prior row first; the interrupt branch handles
+    // that).
     TestHostGlobals.nextDispatchResponse =
       #"{"id":"task-uuid-2","status":"running"}"#
 
     let secondReq = webhookRequest(
       secret: secret, update: textUpdate(updateId: 201, chatId: 777, text: "second"))
-    _ = handleRoute(ctx: ctx, requestJSON: secondReq)
+    _ = route(secondReq)
 
     XCTAssertEqual(TestHostGlobals.dispatchCalls.count, 2)
     let s1 = TestHostGlobals.dispatchCalls[0]["session_id"] as? String
@@ -211,8 +227,8 @@ final class WebhookTests: XCTestCase {
   func testWebhookDeduplicatesByUpdateId() {
     let req = webhookRequest(
       secret: secret, update: textUpdate(updateId: 300, chatId: 1, text: "hi"))
-    _ = handleRoute(ctx: ctx, requestJSON: req)
-    _ = handleRoute(ctx: ctx, requestJSON: req)
+    _ = route(req)
+    _ = route(req)
     XCTAssertEqual(
       TestHostGlobals.dispatchCalls.count, 1,
       "duplicate update_id must short-circuit before dispatch")
@@ -228,17 +244,17 @@ final class WebhookTests: XCTestCase {
       ],
     ]
     let req = webhookRequest(secret: secret, update: update)
-    let response = parseRouteResponse(handleRoute(ctx: ctx, requestJSON: req))
+    let response = parseRouteResponse(route(req))
     XCTAssertEqual(response.status, 200)
     XCTAssertTrue(TestHostGlobals.dispatchCalls.isEmpty)
   }
 
   func testWebhookSkipsBlockedChat() {
-    _ = DatabaseManager.upsertChatSession(chatId: 600)
-    DatabaseManager.markChatBlocked(chatId: 600)
+    _ = DatabaseManager.upsertChatSession(agentId: agentId, chatId: 600)
+    DatabaseManager.markChatBlocked(agentId: agentId, chatId: 600)
     let req = webhookRequest(
       secret: secret, update: textUpdate(updateId: 500, chatId: 600, text: "hi"))
-    let response = parseRouteResponse(handleRoute(ctx: ctx, requestJSON: req))
+    let response = parseRouteResponse(route(req))
     XCTAssertEqual(response.status, 200)
     XCTAssertTrue(TestHostGlobals.dispatchCalls.isEmpty)
   }
@@ -247,20 +263,21 @@ final class WebhookTests: XCTestCase {
 
   func testResetBumpsSaltAndCancelsActiveDispatch() {
     // Seed an active dispatch for chat 800.
-    _ = DatabaseManager.upsertChatSession(chatId: 800)
+    _ = DatabaseManager.upsertChatSession(agentId: agentId, chatId: 800)
     DatabaseManager.insertActiveDispatch(
-      taskId: "running-task", chatId: 800, replyToken: "TOKABCDE",
-      sessionId: "old-session",
+      taskId: "running-task", agentId: agentId, chatId: 800,
+      replyToken: "TOKABCDE", sessionId: "old-session",
       expiresAt: Int(Date().timeIntervalSince1970) + 600)
 
     let req = webhookRequest(
       secret: secret, update: textUpdate(updateId: 700, chatId: 800, text: "/reset"))
-    let response = parseRouteResponse(handleRoute(ctx: ctx, requestJSON: req))
+    let response = parseRouteResponse(route(req))
     XCTAssertEqual(response.status, 200)
 
     // Salt bumped, active dispatch cleared, no new dispatch issued.
-    XCTAssertEqual(DatabaseManager.getChatSession(chatId: 800)?.sessionSalt, 1)
-    XCTAssertNil(DatabaseManager.activeDispatch(forChat: 800))
+    XCTAssertEqual(
+      DatabaseManager.getChatSession(agentId: agentId, chatId: 800)?.sessionSalt, 1)
+    XCTAssertNil(DatabaseManager.activeDispatch(agentId: agentId, forChat: 800))
     XCTAssertEqual(TestHostGlobals.cancelCalls, ["running-task"])
     XCTAssertTrue(TestHostGlobals.dispatchCalls.isEmpty, "/reset must not dispatch")
 
@@ -277,7 +294,7 @@ final class WebhookTests: XCTestCase {
     let first = webhookRequest(
       secret: secret,
       update: textUpdate(updateId: 900, chatId: 900, text: "what's on my calendar?"))
-    _ = handleRoute(ctx: ctx, requestJSON: first)
+    _ = route(first)
     XCTAssertEqual(TestHostGlobals.dispatchCalls.count, 1)
 
     // Second message arrives mid-flight. Configure a new task id so the
@@ -288,7 +305,7 @@ final class WebhookTests: XCTestCase {
     let second = webhookRequest(
       secret: secret,
       update: textUpdate(updateId: 901, chatId: 900, text: "actually, just tomorrow"))
-    _ = handleRoute(ctx: ctx, requestJSON: second)
+    _ = route(second)
 
     // dispatch_interrupt called once with the prior task id and the raw user text.
     XCTAssertEqual(TestHostGlobals.interruptCalls.count, 1)
@@ -303,7 +320,7 @@ final class WebhookTests: XCTestCase {
       TestHostGlobals.dispatchCalls[1]["session_id"] as? String)
 
     // Active dispatch row now points at the new task.
-    let active = DatabaseManager.activeDispatch(forChat: 900)
+    let active = DatabaseManager.activeDispatch(agentId: agentId, forChat: 900)
     XCTAssertEqual(active?.taskId, "task-second")
   }
 
@@ -313,11 +330,11 @@ final class WebhookTests: XCTestCase {
     TestHostGlobals.nextDispatchResponse = #"{"error":"rate_limit_exceeded"}"#
     let req = webhookRequest(
       secret: secret, update: textUpdate(updateId: 1000, chatId: 50, text: "hi"))
-    let response = parseRouteResponse(handleRoute(ctx: ctx, requestJSON: req))
+    let response = parseRouteResponse(route(req))
 
     XCTAssertEqual(response.status, 200)
     // No active dispatch row inserted because the dispatch failed.
-    XCTAssertNil(DatabaseManager.activeDispatch(forChat: 50))
+    XCTAssertNil(DatabaseManager.activeDispatch(agentId: agentId, forChat: 50))
     // Plugin posted the apology directly via http_request.
     XCTAssertEqual(TestHostGlobals.httpCalls.count, 1)
     let body = TestHostGlobals.httpCalls[0]["body"] as? String ?? ""
@@ -329,11 +346,12 @@ final class WebhookTests: XCTestCase {
   func testPromptHeaderIncludesMintedReplyToken() throws {
     let req = webhookRequest(
       secret: secret, update: textUpdate(updateId: 1100, chatId: 60, text: "ping"))
-    _ = handleRoute(ctx: ctx, requestJSON: req)
+    _ = route(req)
 
     let prompt = try XCTUnwrap(
       TestHostGlobals.dispatchCalls.first?["prompt"] as? String)
-    let active = try XCTUnwrap(DatabaseManager.activeDispatch(forChat: 60))
+    let active = try XCTUnwrap(
+      DatabaseManager.activeDispatch(agentId: agentId, forChat: 60))
     XCTAssertTrue(
       prompt.contains("[reply_token \(active.replyToken)"),
       "prompt header must carry the same token stored in active_dispatches")
