@@ -89,6 +89,11 @@ func handleTaskEvent(
     // can fall back to the agent's actual streamed prose when the host
     // fires a multi-round COMPLETED whose `output` field contains
     // interim text instead of the final answer.
+    //
+    // Each OUTPUT also bumps the binding's TTL forward — a long-running
+    // research turn that emits tokens past the original 10-minute window
+    // would otherwise have its `reply_token` swept out from under it.
+    bumpDispatchTTL(taskId: taskId)
     if let obj = parseJSONObject(eventJSON),
       let text = obj["text"] as? String
     {
@@ -98,14 +103,16 @@ func handleTaskEvent(
       }
     }
 
+  case TaskEventType.activity, TaskEventType.progress:
+    // Activity / progress lifecycle events also count as proof-of-life
+    // for the TTL bump, but we don't otherwise act on them.
+    bumpDispatchTTL(taskId: taskId)
+
   case TaskEventType.clarification:
     // See `handleClarification` below.
     handleClarification(state: state, taskId: taskId, eventJSON: eventJSON)
 
-  case TaskEventType.started,
-    TaskEventType.activity,
-    TaskEventType.progress,
-    TaskEventType.draft:
+  case TaskEventType.started, TaskEventType.draft:
     // Observability only. Agent owns user-visible UI via tools.
     break
 
@@ -160,6 +167,17 @@ private func scheduleSafetyNet(
 ) {
   guard delay > 0 else { return work() }
   DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay, execute: work)
+}
+
+/// Per-event TTL extension applied on every OUTPUT / ACTIVITY / PROGRESS
+/// event. Keeps long-running research / clarification flows from losing
+/// their reply binding to the 10-minute sweeper. Bound is monotone (the
+/// DB query refuses to shrink the existing value).
+private let activityKeepaliveSeconds: Int = 600
+
+private func bumpDispatchTTL(taskId: String) {
+  let extended = Int(Date().timeIntervalSince1970) + activityKeepaliveSeconds
+  DatabaseManager.bumpExpiry(taskId: taskId, newExpiresAt: extended)
 }
 
 /// Looks up the active dispatch for `taskId` and confirms it belongs to

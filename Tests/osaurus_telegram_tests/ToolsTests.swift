@@ -378,7 +378,8 @@ final class ToolsTests: XCTestCase {
 
     let path = "/tmp/mandelbrot-share.png"
     TestHostGlobals.fileReadStore[path] = (
-      mimeType: "image/png", data: Data([0x89, 0x50, 0x4E, 0x47]))
+      mimeType: "image/png", data: Data([0x89, 0x50, 0x4E, 0x47])
+    )
     setHTTPSuccess()
 
     let response = handleArtifactShare(
@@ -388,9 +389,10 @@ final class ToolsTests: XCTestCase {
     let envelope = parseEnvelope(response)
     XCTAssertEqual(envelope["uploaded"] as? Bool, true)
 
-    let sendCall = try XCTUnwrap(TestHostGlobals.httpCalls.first {
-      ($0["url"] as? String ?? "").contains("/sendPhoto")
-    })
+    let sendCall = try XCTUnwrap(
+      TestHostGlobals.httpCalls.first {
+        ($0["url"] as? String ?? "").contains("/sendPhoto")
+      })
     XCTAssertEqual(sendCall["body_encoding"] as? String, "base64")
     let bodyB64 = sendCall["body"] as? String ?? ""
     // Multipart bodies sandwich raw PNG bytes between ASCII headers, so
@@ -439,7 +441,8 @@ final class ToolsTests: XCTestCase {
   func testArtifactShareSkipsWhenNoActiveDispatch() {
     let path = "/tmp/orphan.png"
     TestHostGlobals.fileReadStore[path] = (
-      mimeType: "image/png", data: Data([0x89]))
+      mimeType: "image/png", data: Data([0x89])
+    )
 
     let response = handleArtifactShare(
       state: state,
@@ -462,7 +465,8 @@ final class ToolsTests: XCTestCase {
     _ = makeBinding(chatId: 740, taskId: "task-camel", incomingMessageId: 33)
     let path = "/tmp/camel.png"
     TestHostGlobals.fileReadStore[path] = (
-      mimeType: "image/png", data: Data([0x89, 0x50, 0x4E, 0x47]))
+      mimeType: "image/png", data: Data([0x89, 0x50, 0x4E, 0x47])
+    )
     setHTTPSuccess()
 
     let camelPayload = #"""

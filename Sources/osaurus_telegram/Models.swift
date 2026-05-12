@@ -1,23 +1,150 @@
 import Foundation
 
 // MARK: - Telegram Update (minimal)
+//
+// Fields we actually consume — decoder is forgiving so unknown keys are
+// silently dropped (Telegram's payload is huge and most fields are
+// irrelevant to a chat-bridge plugin). Decode failures here are fatal:
+// the webhook handler treats them as "non-actionable" and 200-OKs so
+// Telegram doesn't retry.
 
 struct TGUpdate: Decodable {
+  /// Message entity. Telegram annotates `text` / `caption` ranges with
+  /// these; we only care about the `mention` / `text_mention` types so
+  /// the group-chat gate can detect when the bot is being addressed.
+  struct MessageEntity: Decodable {
+    let type: String
+    let offset: Int
+    let length: Int
+    let user: From?
+  }
+
+  /// User reference. `id` is the canonical identifier (numeric, never
+  /// changes). `username` is the handle without `@` and CAN change /
+  /// be deleted, so the allowlist matches case-insensitively and the
+  /// per-user session keying always prefers `id`.
+  struct From: Decodable {
+    let id: Int64?
+    let username: String?
+    let first_name: String?
+    let is_bot: Bool?
+  }
+
+  /// Chat reference. `type` is "private" / "group" / "supergroup" /
+  /// "channel"; we treat group + supergroup identically and drop
+  /// channel posts entirely (we don't subscribe to them anyway).
+  struct Chat: Decodable {
+    let id: Int64
+    let type: String?
+    let title: String?
+  }
+
+  /// Reply target reference — only the `from.id` is needed so the
+  /// mention/reply gate can recognise replies-to-the-bot. We decode the
+  /// full nested message just enough to reach `from.id`.
+  struct ReplyToMessage: Decodable {
+    let message_id: Int64?
+    let from: From?
+  }
+
+  /// Photo size variant. Telegram returns an array of progressively
+  /// larger sizes for each photo; we always take the largest one (last
+  /// in the array) and pull its bytes via getFile.
+  struct PhotoSize: Decodable {
+    let file_id: String
+    let file_unique_id: String?
+    let width: Int?
+    let height: Int?
+    let file_size: Int?
+  }
+
+  /// Document attachment (catch-all for non-image/audio uploads).
+  struct Document: Decodable {
+    let file_id: String
+    let file_unique_id: String?
+    let file_name: String?
+    let mime_type: String?
+    let file_size: Int?
+  }
+
+  /// Voice note (always ogg/opus per Telegram spec).
+  struct Voice: Decodable {
+    let file_id: String
+    let file_unique_id: String?
+    let duration: Int?
+    let mime_type: String?
+    let file_size: Int?
+  }
+
+  /// Audio (music) attachment.
+  struct Audio: Decodable {
+    let file_id: String
+    let file_unique_id: String?
+    let duration: Int?
+    let performer: String?
+    let title: String?
+    let file_name: String?
+    let mime_type: String?
+    let file_size: Int?
+  }
+
+  /// Video attachment.
+  struct Video: Decodable {
+    let file_id: String
+    let file_unique_id: String?
+    let width: Int?
+    let height: Int?
+    let duration: Int?
+    let mime_type: String?
+    let file_name: String?
+    let file_size: Int?
+  }
+
+  /// Animation (GIF / silent video). Telegram delivers GIFs via this
+  /// field, not `video`.
+  struct Animation: Decodable {
+    let file_id: String
+    let file_unique_id: String?
+    let mime_type: String?
+    let file_name: String?
+    let duration: Int?
+    let file_size: Int?
+  }
+
   struct Message: Decodable {
-    struct Chat: Decodable {
-      let id: Int64
-    }
-    struct From: Decodable {
-      let username: String?
-      let first_name: String?
-    }
+    let message_id: Int64
+    let date: Int?
     let chat: Chat
     let from: From?
     let text: String?
-    let message_id: Int64
+    let caption: String?
+    let entities: [MessageEntity]?
+    let caption_entities: [MessageEntity]?
+    let reply_to_message: ReplyToMessage?
+    // Media — at most one of these is set per message.
+    let photo: [PhotoSize]?
+    let document: Document?
+    let voice: Voice?
+    let audio: Audio?
+    let video: Video?
+    let animation: Animation?
   }
+
+  /// Inline keyboard button press. Telegram delivers this on a separate
+  /// update field (`callback_query`); we synthesize a user turn so the
+  /// agent can react via the same reply pipeline.
+  struct CallbackQuery: Decodable {
+    let id: String
+    let from: From?
+    let message: Message?
+    let data: String?
+    let chat_instance: String?
+  }
+
   let update_id: Int
   let message: Message?
+  let edited_message: Message?
+  let callback_query: CallbackQuery?
 }
 
 // MARK: - Route Request/Response

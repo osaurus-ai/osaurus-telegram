@@ -33,13 +33,31 @@ To make the reply contract race-free, the plugin pre-inserts the row in `active_
 
 ## Tools (called by the agent)
 
-| Tool           | Description                                                                                                                                                            |
-| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `reply`        | Send a text message. May be called multiple times per run.                                                                                                             |
-| `reply_typing` | Show the Telegram "typing…" indicator (~5s).                                                                                                                           |
-| `reply_photo`  | Send a photo by public URL with optional caption.                                                                                                                      |
+| Tool             | Description                                                                                                                                                  |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `reply`          | Send a text message. May be called multiple times per run. Optional `reply_to_message_id` threads under the user's message; optional `inline_keyboard` attaches buttons. |
+| `reply_typing`   | Show the Telegram "typing…" indicator (~5s).                                                                                                                 |
+| `reply_photo`    | Send a photo by public URL with optional caption.                                                                                                            |
+| `reply_document` | Send any file (PDF, transcript, archive, etc.) by public URL with optional caption.                                                                          |
+| `reply_voice`    | Send a voice note (ogg/opus) by public URL.                                                                                                                  |
+| `reply_audio`    | Send a music/audio file by public URL.                                                                                                                       |
+| `reply_video`    | Send a video file by public URL.                                                                                                                             |
 
-All three take a `reply_token` (passed verbatim from the user-message header) plus their own arguments. Sandbox-generated files (images, PDFs, transcripts, etc.) are auto-forwarded by the plugin via the host's `invoke(type: "artifact")` hook — the agent doesn't need a tool call for them.
+All take a `reply_token` (passed verbatim from the user-message header) plus their own arguments and an optional `reply_to_message_id`. Sandbox-generated files (images, PDFs, transcripts, etc.) are auto-forwarded by the plugin via the host's `invoke(type: "artifact")` hook — the agent doesn't need a tool call for them.
+
+### Inline keyboards and button presses
+
+`reply` accepts an optional `inline_keyboard` (a 2D array of `{text, callback_data}` or `{text, url}` buttons). When the user taps a button, Telegram delivers a `callback_query` update which the plugin turns into a synthetic user turn whose body is `[button:<callback_data>]` — the agent sees it as just another user message on the same `external_session_key` and replies the same way. The inline button's spinner is acknowledged automatically via `answerCallbackQuery`.
+
+### Inbound media (user → agent)
+
+When the user sends a photo, document, voice note, audio file, video, or animated GIF, the plugin downloads it via Telegram's `getFile` (capped at 20 MB per file) and stashes the bytes under `~/.osaurus/artifacts/osaurus.telegram-inbound/<agent>/chat-<id>/msg-<id>/`. The prompt header injected into the agent's turn carries an extra bracketed segment listing each attachment:
+
+```
+[reply_token AB12CD34 from alice in_group reply_to_message_id=42][attachments path1=/Users/.../msg-42/photo-AgADAB...jpg type=image/jpeg kind=photo] respond by calling reply(...) before ending the turn.
+```
+
+The agent reads the file via its sandbox `read_file` tool. Captionless media also dispatches a turn — the body is replaced with an explicit prompt to describe / act on the attachment so the agent doesn't think it's missing context. Each downloaded path is pre-claimed in the artifact watcher's "already seen" set so the user's own upload doesn't ping-pong back to them as an auto-forwarded artifact.
 
 ## Routes
 
@@ -49,9 +67,55 @@ All three take a `reply_token` (passed verbatim from the user-message header) pl
 
 ## Bot commands
 
-| Command                                | Description                                                                                                                                                                                                                                           |
-| -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/clear`, `/reset`, `/new`, `/restart` | All aliases for the same action: bump the chat's session salt and cancel any in-flight task. The next message lands in a fresh transcript. Match is case-insensitive and tolerates Telegram's `@botname` suffix in group chats (e.g. `/clear@MyBot`). |
+| Command                                | Description                                                                                                                                                                                                                                                                                                                                                              |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/start`                               | Plugin-owned welcome message. Bypasses the allowlist so denied users still get a useful first response. Telegram clients open `/start` automatically the first time a user opens the bot.                                                                                                                                                                                |
+| `/help`                                | Plugin-owned overview of what the bot can do (sendable media, commands, group-chat behaviour). Bypasses the allowlist for the same reason as `/start`.                                                                                                                                                                                                                  |
+| `/clear`, `/reset`, `/new`, `/restart` | Bump the **caller's** per-user session salt and cancel any in-flight task they own. In groups this only affects the user who typed the command; other participants keep their transcripts. In DMs it's just "reset this conversation." Match is case-insensitive and tolerates Telegram's `@botname` suffix in group chats (e.g. `/clear@MyBot`).                        |
+| `/clearall`                            | Group-wide variant: bumps every participant's salt for the chat and cancels every in-flight task. Useful when an admin wants to reset the whole group's bot state at once. In DMs behaves identically to `/clear` (only one participant).                                                                                                                               |
+| `/whoami`                              | Replies with `your user_id`, `your username`, and `this chat_id` so an admin can fill in the allowlist (see below) without external tooling. Bypasses the allowlist itself so denied users still get a useful response — none of the values it surfaces leak anything that wasn't already visible in any Telegram client.                                                |
+
+The full list (`/start`, `/help`, `/clear`, `/clearall`, `/whoami`) is registered with Telegram via `setMyCommands` after the webhook is confirmed, so it shows up in the Telegram client's "/" menu without users having to read this README.
+
+## Group chats
+
+The bot only responds in groups when it's **explicitly addressed**. That means:
+
+1. The user `@mention`s the bot's username, OR
+2. The user replies to one of the bot's prior messages, OR
+3. The user issues a slash command targeted at the bot (`/clear@MyBot` and similar).
+
+This stays out of every other conversation in the room — Telegram's privacy-mode setting controls whether the bot even *receives* non-mention messages; we add the mention/reply gate on top so a privacy-mode-disabled bot still doesn't burn agent runs on chatter.
+
+Inside a group every participant gets their **own session and their own per-user transcript**. Two people typing in the same chat don't share memory, and `/clear` only wipes the caller's transcript. The session id is a deterministic UUID5 of `(chat_id, user_id, salt)`, so repeat messages from the same person always reattach to the same Osaurus session row.
+
+In group replies the agent threads its answer to the user's specific message via `reply_to_message_id` — the bracketed prompt header carries the `reply_to_message_id=<id>` hint so the agent threads by default.
+
+### Running multiple agents in one group
+
+Multiple Osaurus agents (each with their own bot token) can be added to the same Telegram group. Each agent only ever:
+
+- responds when its own `@<botname>` is mentioned (or a user replies to *its* messages) — agents stay out of each other's threads,
+- sets/clears its own loading 👀 reaction (Telegram scopes reactions per-bot, so two bots in the same chat don't fight over the eye),
+- reads its own `chat_sessions` / `active_dispatches` rows (every table is partitioned by `agent_id`),
+- enforces its own allowlist (allowlist is per-`AgentState`, never shared).
+
+The artifact auto-forward fallback (`invoke(type: "artifact")` fired without a per-agent frame) declines to guess when more than one agent has an in-flight task at the same instant — the file is dropped with a warn-level log rather than risk delivering it to the wrong user. With exactly one agent in flight the routing is unambiguous and the fallback delivers as before.
+
+## Access control: allowlists
+
+Two optional CSV fields live in **Bot Configuration** and gate the webhook. Empty / missing means "allow everything" (default).
+
+| Field              | Format                                                                                  | Notes                                                                                                                            |
+| ------------------ | --------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `allowed_users`    | Comma-separated mix of numeric Telegram user IDs and `@usernames` (e.g. `123, @alice`)  | Numeric IDs are durable; `@usernames` can change. Use `/whoami` (above) to find values. Username matching is case-insensitive.   |
+| `allowed_chat_ids` | Comma-separated numeric chat IDs (DMs are positive, groups/supergroups are negative)    | Use `/whoami` inside the chat to find the id.                                                                                    |
+
+Order: the chat allowlist is checked first (cheap set lookup; rejects entire conversations regardless of who sent the message), then the user allowlist (rejects messages from non-listed users in any allowed chat). Both can be combined.
+
+Rejections are **silent**: the bot 200-OKs the webhook with no Telegram-visible reaction or `deny_message` and writes exactly one info-level line per rejection to Insights. The plan deliberately picked silent over noisy — making the bot answer denied users in any way reveals it's listening, which defeats the point of an allowlist for some setups.
+
+Allowlists are loaded on first touch and refreshed live via `on_config_changed` — no restart required.
 
 ## Setup
 
@@ -80,8 +144,8 @@ Send a message to your bot. The agent receives it as the next turn in a continuo
 
 The plugin keeps three tables in its per-plugin SQLite DB:
 
-- `chat_sessions` — one row per `(agent_id, chat_id)` (session salt, blocked flag, timestamps).
-- `active_dispatches` — one row per in-flight turn, keyed on `reply_token`. Multiple concurrent rows per `(agent_id, chat_id)` are allowed: each is created when the webhook handler dispatches that turn and cleared by its own terminal event (COMPLETED/FAILED/CANCELLED) or the 10-minute TTL sweep.
+- `chat_sessions` — one row per `(agent_id, chat_id, user_id)` (per-user session salt, blocked flag, timestamps). For DMs `user_id == chat_id`, so behaviour matches the legacy "one row per chat" contract; for groups every member has their own row.
+- `active_dispatches` — one row per in-flight turn, keyed on `reply_token`. Multiple concurrent rows per `(agent_id, chat_id, user_id)` are allowed: each is created when the webhook handler dispatches that turn and cleared by its own terminal event (COMPLETED/FAILED/CANCELLED) or the 10-minute TTL sweep. Soft-interrupts target only the calling user's prior task — two parallel users in the same group can't bump each other.
 - `seen_updates` — idempotency cache for Telegram retries, keyed `(agent_id, update_id)`, TTL-pruned to 24 hours.
 
 ### Multi-agent isolation (ABI v4)
@@ -90,9 +154,9 @@ A single plugin instance is loaded once but can be wired into many agents. The h
 
 - Hold per-agent in-memory state (`AgentState`) in a registry keyed by agent UUID — bot token, webhook secret, tunnel URL, and bot identity never bleed across agents.
 - Partition all SQLite tables by `agent_id`, so two agents whose Telegram bots happen to see the same `chat_id` (very common — chat_id is per Telegram user, not per bot) cannot trample each other's rows.
-- Use a deterministic per-chat `session_id` (UUID5 of `(salt, chat_id)`) so repeated deliveries reattach to the same Osaurus session. The host treats `session_id` as the external grouping key as of v3.
+- Use a deterministic per-(chat, user) `session_id` (UUID5 of `(salt, chat_id, user_id)`) so repeated deliveries reattach to the same Osaurus session. The host treats `session_id` as the external grouping key as of v3.
 - Reject reply tokens minted by a different agent's binding (`stale_token`).
-- Pass `tools: ["reply", "reply_typing", "reply_photo"]` on every `dispatch()` so the agent's loop has the reply surface loaded regardless of its own auto/manual tool-selection mode.
+- Pass the full reply surface (`reply`, `reply_typing`, `reply_photo`, `reply_document`, `reply_voice`, `reply_audio`, `reply_video`) on every `dispatch()` so the agent's loop has it loaded regardless of its own auto/manual tool-selection mode.
 
 On first launch after the ABI v4 upgrade, the plugin detects the legacy schema (no `agent_id` column) and rebuilds the three tables. Existing rows are dropped — the data is transient (10-minute dispatch TTL, 24-hour dedup TTL, chat session salts default back to zero), so nothing user-facing is lost. The same drop-and-rebuild path also runs when the plugin detects the v2 `active_dispatches` schema (where `task_id` was the primary key); the v3 schema keys on `reply_token` instead so multiple in-flight turns per chat can coexist.
 

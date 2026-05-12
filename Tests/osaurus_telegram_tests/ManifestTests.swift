@@ -51,11 +51,17 @@ final class ManifestTests: XCTestCase {
     let tools = try XCTUnwrap(caps["tools"] as? [[String: Any]])
     let ids = tools.compactMap { $0["id"] as? String }
     XCTAssertEqual(
-      Set(ids),
-      Set(["reply", "reply_typing", "reply_photo"]),
+      Set(ids), Set(dispatchToolNames),
       "manifest tools list must mirror dispatchToolNames; "
         + "files reach the user via the artifact auto-forward hook, "
         + "not a tool")
+    XCTAssertEqual(
+      Set(ids),
+      Set([
+        "reply", "reply_typing", "reply_photo",
+        "reply_document", "reply_voice", "reply_audio", "reply_video",
+      ]),
+      "Phase 3b expects the full media reply surface (document/voice/audio/video)")
   }
 
   /// Telegram has no native clarification UI, so the host `clarify` tool

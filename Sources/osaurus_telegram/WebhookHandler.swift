@@ -1,19 +1,5 @@
 import Foundation
 
-// MARK: - Dispatch tool surface
-//
-// Names of the tools the agent is allowed (and expected) to use to talk
-// back to Telegram. We pass these on every dispatch via the v3+ `tools`
-// field so an agent with manual / restrictive tool selection still has
-// the reply surface loaded — without it, the agent would receive the
-// user's message but have no way to respond.
-//
-// MUST stay in sync with the manifest's `capabilities.tools[].id`
-// values. `ManifestTests.testToolsListIsExactlyTheReplySurface` pins the
-// manifest side; `WebhookTests.testWebhookDispatchesValidTextMessage`
-// pins this set on the dispatch payload.
-let dispatchToolNames: [String] = ["reply", "reply_typing", "reply_photo"]
-
 /// Emoji used for the loading-eye reaction set on incoming user messages
 /// while a dispatch is in flight. Cleared by the first content-bearing
 /// reply (`reply` / `reply_photo`), by the artifact auto-forward hook,
@@ -72,110 +58,367 @@ private func handleWebhook(state: AgentState, agentId: String, req: RouteRequest
     return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
   }
 
-  guard let message = update.message,
-    let text = message.text, !text.isEmpty
-  else {
-    logDebug("handleWebhook: non-text update_id=\(update.update_id), ignoring")
+  // 3. Dispatch by update type. Today we handle plain `message` and
+  //    `callback_query`; everything else is acked silently.
+  if let cb = update.callback_query {
+    return handleCallbackQuery(
+      state: state, agentId: agentId,
+      updateId: update.update_id, cb: cb)
+  }
+
+  guard let message = update.message else {
+    logDebug("handleWebhook: non-message update_id=\(update.update_id), ignoring")
     return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
   }
 
+  return handleMessageUpdate(
+    state: state, agentId: agentId,
+    updateId: update.update_id, message: message)
+}
+
+/// Returns the user-visible content of the message: prefer `text` (plain
+/// text message) then `caption` (caption attached to media). Empty string
+/// when neither is set; callers may still proceed if media is attached.
+private func messageBodyText(_ message: TGUpdate.Message) -> String {
+  if let t = message.text, !t.isEmpty { return t }
+  if let c = message.caption, !c.isEmpty { return c }
+  return ""
+}
+
+/// True when the message carries any media attachment. Any non-text path
+/// the agent should still respond to lands here.
+private func messageHasMedia(_ message: TGUpdate.Message) -> Bool {
+  if let p = message.photo, !p.isEmpty { return true }
+  return message.document != nil || message.voice != nil
+    || message.audio != nil || message.video != nil
+    || message.animation != nil
+}
+
+/// Resolves the per-user identifier we use for session keying. Falls back
+/// to `chat_id` when the message has no `from` (channel posts, anonymous
+/// admin posts) so behaviour matches the legacy "one session per chat"
+/// contract for those cases.
+private func effectiveUserId(message: TGUpdate.Message) -> Int64 {
+  message.from?.id ?? message.chat.id
+}
+
+/// True when the chat is `group` or `supergroup`. The mention/reply gate
+/// only fires in groups — DMs always pass through.
+private func isGroupChat(_ chat: TGUpdate.Chat) -> Bool {
+  guard let type = chat.type else { return false }
+  return type == "group" || type == "supergroup"
+}
+
+/// In groups Telegram delivers every message to bots whose privacy mode
+/// is disabled. We only respond when the bot is *addressed*: by @mention,
+/// by reply-to-bot, or via a slash command containing the bot's username
+/// (the latter is already accepted by `isResetCommand`).
+///
+/// In DMs (and anything that isn't a group/supergroup) the message is
+/// always considered addressed.
+func shouldRespondInChat(
+  message: TGUpdate.Message, botId: Int64?, botUsername: String?
+) -> Bool {
+  guard isGroupChat(message.chat) else { return true }
+
+  // Reply-to-bot wins immediately. Telegram populates `reply_to_message`
+  // when the user explicitly replies to one of our prior messages.
+  if let botId, let replyTarget = message.reply_to_message?.from?.id,
+    replyTarget == botId
+  {
+    return true
+  }
+
+  // Mention via @username entity. Both `entities` (text body) and
+  // `caption_entities` (media caption) are valid sources.
+  let allEntities = (message.entities ?? []) + (message.caption_entities ?? [])
+  let body = message.text ?? message.caption ?? ""
+
+  // text_mention entity: targets a specific user_id directly (no
+  // @username substring lookup needed).
+  if let botId {
+    for entity in allEntities where entity.type == "text_mention" {
+      if entity.user?.id == botId { return true }
+    }
+  }
+
+  // mention entity: must @<our-bot-username> within the body. Compare
+  // case-insensitively because users routinely type `@MyBot` even when
+  // the canonical username is `mybot`. Slice via UTF-16 offsets because
+  // that's what Telegram uses for entity offsets/lengths.
+  if let username = botUsername, !username.isEmpty {
+    let target = "@\(username)".lowercased()
+    let bodyUTF16 = Array(body.utf16)
+    for entity in allEntities where entity.type == "mention" {
+      let start = entity.offset
+      let end = entity.offset + entity.length
+      guard start >= 0, end <= bodyUTF16.count, start < end else { continue }
+      let slice = String(utf16CodeUnits: Array(bodyUTF16[start..<end]), count: end - start)
+      if slice.lowercased() == target { return true }
+    }
+  }
+
+  // Slash commands with @<bot> (e.g. `/help@MyBot some args`) are
+  // explicitly addressed to us. The leading-slash check is cheap.
+  if body.hasPrefix("/"), let username = botUsername, !username.isEmpty {
+    let firstToken = body.split(whereSeparator: { $0.isWhitespace }).first ?? ""
+    if firstToken.lowercased().hasSuffix("@\(username.lowercased())") {
+      return true
+    }
+  }
+
+  return false
+}
+
+private func handleMessageUpdate(
+  state: AgentState, agentId: String, updateId: Int, message: TGUpdate.Message
+) -> String {
   let chatId = message.chat.id
   let incomingMessageId = message.message_id
 
-  // 3. Idempotency: drop duplicate Telegram retries.
-  if DatabaseManager.isUpdateAlreadySeen(agentId: agentId, updateId: update.update_id) {
-    logDebug("handleWebhook: duplicate update_id=\(update.update_id), 200 OK")
+  let bodyText = messageBodyText(message)
+  let hasMedia = messageHasMedia(message)
+  guard !bodyText.isEmpty || hasMedia else {
+    logDebug("handleMessageUpdate: empty/non-actionable message update_id=\(updateId), ignoring")
     return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
   }
-  DatabaseManager.markUpdateSeen(agentId: agentId, updateId: update.update_id)
+
+  // Idempotency: drop duplicate Telegram retries.
+  if DatabaseManager.isUpdateAlreadySeen(agentId: agentId, updateId: updateId) {
+    logDebug("handleMessageUpdate: duplicate update_id=\(updateId), 200 OK")
+    return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
+  }
+  DatabaseManager.markUpdateSeen(agentId: agentId, updateId: updateId)
   DatabaseManager.pruneOldSeenUpdates()
   // active_dispatches rows outlive COMPLETED (see runTerminalSafetyNet),
   // so piggy-back a TTL sweep here instead of running a background timer.
   DatabaseManager.sweepExpiredDispatches()
 
-  // 4. Resolve / create chat row. Skip if blocked.
-  let chat = DatabaseManager.upsertChatSession(agentId: agentId, chatId: chatId)
-  if chat.blocked == 1 {
-    logDebug("handleWebhook: chat \(chatId) is blocked, ignoring")
+  // Resolve / refuse blocked chats early.
+  if DatabaseManager.isChatBlocked(agentId: agentId, chatId: chatId) {
+    logDebug("handleMessageUpdate: chat \(chatId) is blocked, ignoring")
     return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
   }
 
-  // 5. Handle reset commands inline before dispatching. Telegram appends
-  //    `@botname` to commands sent in group chats — `/clear@MyBot` should
-  //    behave identically to `/clear`. We also accept `/reset` as a
-  //    historical alias.
-  let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-  if isResetCommand(trimmed) {
-    handleReset(state: state, agentId: agentId, chatId: chatId)
+  let userId = effectiveUserId(message: message)
+  let trimmed = bodyText.trimmingCharacters(in: .whitespacesAndNewlines)
+
+  // /whoami is a plugin-owned helper that bypasses the allowlist by
+  // design — denied users still get a useful response with the IDs
+  // an admin needs to add them to the list. Nothing it returns leaks
+  // information the user couldn't already see in any Telegram client.
+  if isWhoamiCommand(trimmed) {
+    handleWhoami(state: state, message: message)
     return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
   }
 
-  // 6. Build session id (deterministic per chat+salt) and a reply token.
-  let session = sessionUUID(forChatId: chatId, salt: chat.sessionSalt)
+  // /start and /help are plugin-owned static-text commands. They run
+  // BEFORE the allowlist gate so a denied user still gets the welcome
+  // text (and can see whose ID they need to ask the admin to add).
+  // Nothing about the response is sensitive.
+  if let staticReply = staticCommandReply(trimmed) {
+    if let token = state.botToken, !token.isEmpty {
+      _ = telegramSendMessage(
+        token: token, chatId: chatId, text: staticReply,
+        replyToMessageId: incomingMessageId)
+    }
+    return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
+  }
+
+  // Allowlist gate (silent). Order: chat-list first (cheap set check),
+  // then user-list (also a set check). Only one info-level log per
+  // rejection, no Telegram reaction or deny_message — the plan
+  // explicitly opted for silent drops.
+  if let denial = checkAllowlist(state: state, message: message, userId: userId) {
+    logInfo(denial)
+    return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
+  }
+
+  // Upsert the per-(agent, chat, user) row so we have a salt to derive
+  // the session UUID from.
+  let chat = DatabaseManager.upsertChatSession(
+    agentId: agentId, chatId: chatId, userId: userId)
+
+  // Reset commands are dispatched BEFORE the group-mention gate so a
+  // user in a group can run `/clear@MyBot` even when the privacy mode
+  // would otherwise hide subsequent messages from us.
+  if let resetVerb = parseResetCommand(trimmed) {
+    handleReset(
+      state: state, agentId: agentId, chatId: chatId, userId: userId,
+      scope: resetVerb)
+    return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
+  }
+
+  // Group chats: stay silent unless we're addressed. Doing this AFTER
+  // dedup means duplicate retries still short-circuit cheaply, but
+  // BEFORE dispatch means we don't burn agent runs on chatter.
+  if !shouldRespondInChat(
+    message: message, botId: state.botId,
+    botUsername: state.botUsername)
+  {
+    logDebug(
+      "handleMessageUpdate: group chat \(chatId) message not addressed to bot, ignoring "
+        + "(user=\(userId))")
+    return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
+  }
+
+  // Inbound media: download attachments now (synchronously) so the path
+  // is ready to inject into the prompt. Telegram's getFile + bytes
+  // download is fast (single round-trip per file, ~hundreds of ms each
+  // at most for documents under our 20 MB cap); doing it inline keeps
+  // the per-turn order obvious. Failures are logged inside the helper
+  // and return an empty list — the agent still sees the body text.
+  let attachments =
+    hasMedia
+    ? downloadInboundMedia(state: state, agentId: agentId, message: message)
+    : []
+
+  return dispatchUserTurn(
+    state: state, agentId: agentId,
+    chat: chat, message: message, bodyText: bodyText,
+    incomingMessageId: incomingMessageId, attachments: attachments)
+}
+
+// MARK: - allowlist gate
+//
+// Returns nil when the message passes; returns a one-line audit log
+// string (which the caller logs at info) when the message should be
+// silently dropped. Per the plan: silent drops, no deny_message, no
+// reaction, exactly one log line per rejection.
+//
+// Order of checks matches the plan's explicit ordering: chat first
+// (cheaper, more selective), then user. Either non-empty allowlist on
+// its own restricts the surface; both can be combined.
+
+private func checkAllowlist(
+  state: AgentState, message: TGUpdate.Message, userId: Int64
+) -> String? {
+  let chatId = message.chat.id
+
+  if !state.allowedChatIds.isEmpty, !state.allowedChatIds.contains(chatId) {
+    return "allowlist: chat \(chatId) not allowed"
+  }
+
+  if !state.allowedUsers.isEmpty {
+    let from = message.from
+    let usernameMatches: Bool
+    if let name = from?.username?.lowercased(), !name.isEmpty {
+      usernameMatches = state.allowedUsers.usernames.contains(name)
+    } else {
+      usernameMatches = false
+    }
+    let idMatches: Bool
+    if let id = from?.id {
+      idMatches = state.allowedUsers.ids.contains(id)
+    } else {
+      idMatches = false
+    }
+    if !usernameMatches && !idMatches {
+      let nameTrace = from?.username.map { "@\($0)" } ?? "(no username)"
+      return "allowlist: user \(userId)/\(nameTrace) not allowed in chat \(chatId)"
+    }
+  }
+  return nil
+}
+
+/// Builds the dispatch payload for a user turn, pre-binds the reply token,
+/// soft-interrupts the prior in-flight task for the same user, and fires
+/// the dispatch. Caller is responsible for the post-dispatch loading-eye
+/// reaction. Returns the route response body.
+private func dispatchUserTurn(
+  state: AgentState, agentId: String,
+  chat: ChatSessionRow, message: TGUpdate.Message,
+  bodyText: String, incomingMessageId: Int64,
+  attachments: [InboundAttachment] = []
+) -> String {
+  let chatId = chat.chatId
+  let userId = chat.userId
+  let session = sessionUUID(
+    forChatId: chatId, userId: userId, salt: chat.sessionSalt)
   let replyToken = mintReplyToken()
 
   let displayName =
     message.from?.username ?? message.from?.first_name ?? "user"
+
   // The per-turn header is the highest-recency place to remind the model of
   // the reply contract. Without this, models that lean on a generic
   // "gather → complete" agent loop sometimes finish a turn after a
   // data-gathering tool without ever calling `reply`, leaving the user
   // staring at our safety-net fallback instead of the actual answer.
+  //
+  // In group chats the model also benefits from knowing the user's
+  // message_id so it can thread its reply via `reply_to_message_id`. The
+  // hint is informational; in DMs threading is unnecessary.
+  var header = "[reply_token \(replyToken) from \(displayName)"
+  if isGroupChat(message.chat) {
+    header += " in_group reply_to_message_id=\(incomingMessageId)"
+  }
+  header += "] "
+  if let attachmentsSegment = renderAttachmentsHeader(attachments) {
+    header += attachmentsSegment + " "
+  }
+  // For media-only turns Telegram's `text` is empty; tell the agent
+  // explicitly so it doesn't think it's missing context.
+  let effectiveBody =
+    bodyText.isEmpty
+    ? "(user sent media without a text caption — describe / act on the attached file(s))"
+    : bodyText
   let prompt =
-    "[reply_token \(replyToken) from \(displayName)] "
+    header
     + "respond by calling reply(reply_token=\"\(replyToken)\", text=...) "
-    + "before ending the turn.\n\(text)"
+    + "before ending the turn.\n\(effectiveBody)"
 
-  // 7. Pre-bind reply_token BEFORE calling `dispatch`. The host can
-  //    schedule the agent the instant dispatch returns, and a fast agent
-  //    can call `reply` before our INSERT lands if we don't get ahead of
-  //    it. The placeholder task_id is patched to the real one once
-  //    dispatch returns; reply lookups key on reply_token (the PK).
+  // Pre-bind reply_token BEFORE calling `dispatch`. The host can
+  // schedule the agent the instant dispatch returns, and a fast agent
+  // can call `reply` before our INSERT lands if we don't get ahead of
+  // it. The placeholder task_id is patched to the real one once
+  // dispatch returns; reply lookups key on reply_token (the PK).
   let expiresAt = Int(Date().timeIntervalSince1970) + 600  // 10 minutes
   DatabaseManager.insertActiveDispatch(
     taskId: pendingTaskId(for: replyToken),
-    agentId: agentId, chatId: chatId,
+    agentId: agentId, chatId: chatId, userId: userId,
     replyToken: replyToken, sessionId: session.uuidString,
     expiresAt: expiresAt, incomingMessageId: incomingMessageId)
 
-  // 8. Soft-stop the previous in-flight task for this chat (if any) so
-  //    the host doesn't keep burning tokens on an answer the user has
-  //    already moved past. We DO NOT delete its row — its own terminal
-  //    event handles that. `priorActiveDispatch` filters out our just-
-  //    inserted row so we never interrupt ourselves.
+  // Soft-stop the previous in-flight task FOR THE SAME USER (if any). In
+  // a group two parallel users typing simultaneously must NOT interrupt
+  // each other — that's the whole point of per-user routing.
   if let prior = DatabaseManager.priorActiveDispatch(
-    agentId: agentId, forChat: chatId, excluding: replyToken)
+    agentId: agentId, forChat: chatId, userId: userId, excluding: replyToken)
   {
-    logDebug("handleWebhook: interrupting prior task \(prior.taskId) for chat \(chatId)")
+    logDebug(
+      "dispatchUserTurn: interrupting prior task \(prior.taskId) for "
+        + "chat \(chatId) user \(userId)")
     if let interrupt = hostAPI?.pointee.dispatch_interrupt {
       prior.taskId.withCString { tid in
-        text.withCString { p in interrupt(tid, p) }
+        bodyText.withCString { p in interrupt(tid, p) }
       }
     } else if let cancel = hostAPI?.pointee.dispatch_cancel {
-      logWarn("handleWebhook: dispatch_interrupt unavailable; cancelling instead")
+      logWarn("dispatchUserTurn: dispatch_interrupt unavailable; cancelling instead")
       prior.taskId.withCString { tid in cancel(tid) }
     }
   }
 
-  // 9. Dispatch. Fire and forget — the agent will call our reply tools.
-  //    - `tools` (v3+) explicitly requests the reply surface so an agent
-  //      with manual tool selection still has it loaded.
-  //    - `external_session_key` is the canonical re-attachment key on
-  //      v4+ hosts (see `externalSessionKey` for the salt rationale).
-  //      Without it the agent loses context across turns — e.g. a
-  //      follow-up after a clarification has no idea what was asked.
-  //    - `session_id` is the legacy UUID5 path; kept for backwards
-  //      compatibility and stays in sync with `external_session_key` so
-  //      either lookup resolves to the same logical conversation.
+  // Dispatch. Fire and forget — the agent will call our reply tools.
+  //   - `tools` (v3+) explicitly requests the reply surface so an agent
+  //     with manual tool selection still has it loaded.
+  //   - `external_session_key` is the canonical re-attachment key on
+  //     v4+ hosts (see `externalSessionKey` for the salt rationale).
+  //     Per-user keying means two participants in the same group each
+  //     get their own conversation.
+  //   - `session_id` is the legacy UUID5 path; kept for backwards
+  //     compatibility and stays in sync with `external_session_key` so
+  //     either lookup resolves to the same logical conversation.
   let dispatchPayload: [String: Any] = [
     "prompt": prompt,
     "title": "Telegram \(displayName)",
     "session_id": session.uuidString,
-    "external_session_key": externalSessionKey(chatId: chatId, salt: chat.sessionSalt),
+    "external_session_key": externalSessionKey(
+      chatId: chatId, userId: userId, salt: chat.sessionSalt),
     "tools": dispatchToolNames,
   ]
   guard let dispatchJSON = makeJSONString(dispatchPayload) else {
-    logError("handleWebhook: failed to serialize dispatch payload")
+    logError("dispatchUserTurn: failed to serialize dispatch payload")
     DatabaseManager.deleteActiveDispatch(replyToken: replyToken)
     return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
   }
@@ -183,7 +426,7 @@ private func handleWebhook(state: AgentState, agentId: String, req: RouteRequest
   guard let resultStr = callHostString(hostAPI?.pointee.dispatch, dispatchJSON),
     let parsed = parseJSON(resultStr, as: DispatchResponse.self)
   else {
-    logError("handleWebhook: dispatch unavailable or returned malformed result")
+    logError("dispatchUserTurn: dispatch unavailable or returned malformed result")
     DatabaseManager.deleteActiveDispatch(replyToken: replyToken)
     return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
   }
@@ -198,26 +441,26 @@ private func handleWebhook(state: AgentState, agentId: String, req: RouteRequest
           text: "I'm catching up on a few things. Please retry in a moment.")
       }
     } else {
-      logWarn("handleWebhook: dispatch failed: \(errCode)")
+      logWarn("dispatchUserTurn: dispatch failed: \(errCode)")
     }
     return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
   }
 
   guard let taskId = parsed.id else {
-    logError("handleWebhook: dispatch result missing id: \(String(resultStr.prefix(200)))")
+    logError(
+      "dispatchUserTurn: dispatch result missing id: \(String(resultStr.prefix(200)))")
     DatabaseManager.deleteActiveDispatch(replyToken: replyToken)
     return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
   }
 
-  // 10. Patch the placeholder task_id so terminal events can resolve back
-  //     to the binding via lookupBindingByTask.
+  // Patch the placeholder task_id so terminal events can resolve back
+  // to the binding via lookupBindingByTask.
   DatabaseManager.updateTaskId(replyToken: replyToken, newTaskId: taskId)
-  logInfo("Dispatched task \(taskId) for chat \(chatId) (token=\(replyToken))")
+  logInfo(
+    "Dispatched task \(taskId) for chat \(chatId) user \(userId) (token=\(replyToken))")
 
-  // 11. Loading-eye: react with 👀 on the user's message so they see
-  //     "I'm working on it" within a heartbeat. The reaction is best-
-  //     effort (older Telegram clients ignore it; some chat types
-  //     refuse it) — failures are non-fatal and only logged.
+  // Loading-eye: react with 👀 on the user's message so they see
+  // "I'm working on it" within a heartbeat. Best-effort.
   if let token = state.botToken {
     _ = telegramSetMessageReaction(
       token: token, chatId: chatId, messageId: incomingMessageId,
@@ -225,6 +468,79 @@ private func handleWebhook(state: AgentState, agentId: String, req: RouteRequest
   }
 
   return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
+}
+
+// MARK: - callback_query (inline keyboard button presses)
+
+private func handleCallbackQuery(
+  state: AgentState, agentId: String, updateId: Int,
+  cb: TGUpdate.CallbackQuery
+) -> String {
+  // Idempotency uses the synthetic update_id Telegram already supplies.
+  if DatabaseManager.isUpdateAlreadySeen(agentId: agentId, updateId: updateId) {
+    logDebug("handleCallbackQuery: duplicate update_id=\(updateId), 200 OK")
+    return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
+  }
+  DatabaseManager.markUpdateSeen(agentId: agentId, updateId: updateId)
+  DatabaseManager.pruneOldSeenUpdates()
+  DatabaseManager.sweepExpiredDispatches()
+
+  // Always acknowledge the callback first so the spinner clears in
+  // Telegram even if we end up dropping the event.
+  if let token = state.botToken, !token.isEmpty {
+    _ = telegramAnswerCallbackQuery(token: token, callbackQueryId: cb.id)
+  }
+
+  guard let message = cb.message else {
+    logDebug(
+      "handleCallbackQuery: callback \(cb.id) has no source message; "
+        + "can't route, dropping")
+    return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
+  }
+
+  let chatId = message.chat.id
+  if DatabaseManager.isChatBlocked(agentId: agentId, chatId: chatId) {
+    logDebug("handleCallbackQuery: chat \(chatId) is blocked, ignoring")
+    return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
+  }
+
+  // Use the BUTTON-PRESSER's user_id (cb.from), not the source message's
+  // author. In a group it's normal for someone to press a button on a
+  // bot message they didn't send.
+  let userId = cb.from?.id ?? chatId
+  let presserName =
+    cb.from?.username ?? cb.from?.first_name ?? "user"
+  let chatRow = DatabaseManager.upsertChatSession(
+    agentId: agentId, chatId: chatId, userId: userId)
+
+  // Synthesize the user turn. The bracketed marker mirrors the prompt
+  // header the agent already understands — easy to spot in logs and
+  // distinguishable from a freeform message.
+  let data = cb.data ?? ""
+  let synthetic = "[button:\(data)]"
+
+  // Synthesize a minimal Message so dispatchUserTurn can reuse the
+  // existing pipeline. We don't have a direct `message_id` for the
+  // press itself; reuse the source message_id so the loading eye lands
+  // on the message the user clicked (visually accurate enough).
+  let synthMessage = TGUpdate.Message(
+    message_id: message.message_id,
+    date: nil,
+    chat: message.chat,
+    from: TGUpdate.From(
+      id: userId, username: presserName, first_name: nil, is_bot: nil),
+    text: synthetic,
+    caption: nil,
+    entities: nil,
+    caption_entities: nil,
+    reply_to_message: nil,
+    photo: nil, document: nil, voice: nil, audio: nil,
+    video: nil, animation: nil)
+
+  return dispatchUserTurn(
+    state: state, agentId: agentId,
+    chat: chatRow, message: synthMessage,
+    bodyText: synthetic, incomingMessageId: message.message_id)
 }
 
 /// Placeholder task_id stamped on the pre-inserted row before `dispatch`
@@ -239,50 +555,17 @@ func pendingTaskId(for replyToken: String) -> String {
 /// after into separate sessions even though the chat_id is unchanged.
 /// Format is intentionally human-readable so it shows up legibly in
 /// host-side traces.
+///
+/// Per-user keying (since v4) means each participant in a group gets
+/// their own session. In DMs `userId == chatId` so the key collapses to
+/// a per-chat identifier, matching legacy behaviour.
+func externalSessionKey(chatId: Int64, userId: Int64, salt: Int) -> String {
+  "telegram:chat-\(chatId):user-\(userId):salt-\(salt)"
+}
+
+/// DM-style overload: `userId == chatId`.
 func externalSessionKey(chatId: Int64, salt: Int) -> String {
-  "telegram:chat-\(chatId):salt-\(salt)"
-}
-
-// MARK: - reset commands
-
-/// Verbs the user can send to bump the chat's session salt. Compared
-/// case-insensitively after stripping the `/` prefix and any
-/// `@botname` suffix Telegram appends in group chats.
-private let resetCommandVerbs: Set<String> = ["reset", "clear", "new", "restart"]
-
-/// True when `text` (already trimmed of surrounding whitespace) is one
-/// of the documented reset commands. Handles `/clear`, `/clear@MyBot`,
-/// `/CLEAR`, etc. uniformly.
-func isResetCommand(_ text: String) -> Bool {
-  guard text.hasPrefix("/") else { return false }
-  // Drop the leading slash, then lop off Telegram's `@botname` suffix
-  // (only present in group chats; harmless to strip in DMs since `@`
-  // isn't valid inside a command verb).
-  var verb = Substring(text.dropFirst())
-  if let at = verb.firstIndex(of: "@") { verb = verb[..<at] }
-  // Reject anything with embedded whitespace ("/clear now" is a chat
-  // message, not a command).
-  guard !verb.contains(where: { $0.isWhitespace }) else { return false }
-  return resetCommandVerbs.contains(verb.lowercased())
-}
-
-private func handleReset(state: AgentState, agentId: String, chatId: Int64) {
-  logDebug("handleReset: chat \(chatId)")
-  DatabaseManager.bumpSessionSalt(agentId: agentId, chatId: chatId)
-
-  // v3 allows multiple in-flight rows per chat; /reset means "wipe
-  // everything for this chat", so cancel and delete each one. Any
-  // terminal events that fire afterwards no-op (binding lookup misses).
-  for active in DatabaseManager.allActiveDispatches(agentId: agentId, forChat: chatId) {
-    active.taskId.withCString { tid in
-      hostAPI?.pointee.dispatch_cancel?(tid)
-    }
-    DatabaseManager.deleteActiveDispatch(taskId: active.taskId)
-  }
-
-  if let token = state.botToken {
-    _ = telegramSendMessage(token: token, chatId: chatId, text: "Conversation reset.")
-  }
+  externalSessionKey(chatId: chatId, userId: chatId, salt: salt)
 }
 
 // MARK: - Response Builder

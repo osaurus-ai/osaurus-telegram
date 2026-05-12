@@ -85,51 +85,6 @@ final class WebhookTests: XCTestCase {
 
   // MARK: - Helpers for end-to-end webhook tests
 
-  private func webhookRequest(
-    secret: String?,
-    update: [String: Any],
-    method: String = "POST"
-  ) -> String {
-    let body = String(
-      data: try! JSONSerialization.data(withJSONObject: update),
-      encoding: .utf8)!
-    var headers: [String: String] = [:]
-    if let secret { headers["x-telegram-bot-api-secret-token"] = secret }
-    let req: [String: Any] = [
-      "route_id": "webhook",
-      "method": method,
-      "path": "/webhook",
-      "headers": headers,
-      "body": body,
-    ]
-    return String(
-      data: try! JSONSerialization.data(withJSONObject: req),
-      encoding: .utf8)!
-  }
-
-  private func textUpdate(
-    updateId: Int,
-    chatId: Int64,
-    text: String,
-    username: String = "alice"
-  ) -> [String: Any] {
-    return [
-      "update_id": updateId,
-      "message": [
-        "message_id": 1,
-        "chat": ["id": chatId],
-        "from": ["username": username, "first_name": "Alice"],
-        "text": text,
-      ],
-    ]
-  }
-
-  private func parseRouteResponse(_ s: String) -> (status: Int, body: String) {
-    let data = s.data(using: .utf8) ?? Data()
-    let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
-    return (obj["status"] as? Int ?? 0, obj["body"] as? String ?? "")
-  }
-
   /// Convenience wrapper so test bodies don't have to repeat the
   /// `state: state, agentId: agentId` boilerplate every call.
   private func route(_ requestJSON: String) -> String {
@@ -210,11 +165,17 @@ final class WebhookTests: XCTestCase {
     // The dispatch must explicitly request our reply tools on the
     // host's v3+ `tools` field. Without this, an agent with manual
     // tool selection would receive the user's message but have no way
-    // to respond.
+    // to respond. The set MUST mirror `dispatchToolNames` (and the
+    // manifest's tool list), so the test pins the source of truth.
     let tools = try XCTUnwrap(dispatch["tools"] as? [String])
     XCTAssertEqual(
-      Set(tools), Set(["reply", "reply_typing", "reply_photo"]),
+      Set(tools), Set(dispatchToolNames),
       "dispatch must request the full reply surface")
+    XCTAssertTrue(
+      tools.contains("reply") && tools.contains("reply_photo")
+        && tools.contains("reply_document") && tools.contains("reply_voice")
+        && tools.contains("reply_audio") && tools.contains("reply_video"),
+      "every documented reply_* tool must reach the agent")
 
     // Active dispatch row inserted for this chat.
     let active = try XCTUnwrap(
@@ -260,16 +221,19 @@ final class WebhookTests: XCTestCase {
   func testWebhookExternalSessionKeyChangesAfterReset() throws {
     let chatId: Int64 = 888
 
-    _ = route(webhookRequest(
-      secret: secret, update: textUpdate(updateId: 500, chatId: chatId, text: "first")))
+    _ = route(
+      webhookRequest(
+        secret: secret, update: textUpdate(updateId: 500, chatId: chatId, text: "first")))
 
-    _ = route(webhookRequest(
-      secret: secret, update: textUpdate(updateId: 501, chatId: chatId, text: "/reset")))
+    _ = route(
+      webhookRequest(
+        secret: secret, update: textUpdate(updateId: 501, chatId: chatId, text: "/reset")))
 
     TestHostGlobals.nextDispatchResponse =
       #"{"id":"task-after-reset","status":"running"}"#
-    _ = route(webhookRequest(
-      secret: secret, update: textUpdate(updateId: 502, chatId: chatId, text: "second")))
+    _ = route(
+      webhookRequest(
+        secret: secret, update: textUpdate(updateId: 502, chatId: chatId, text: "second")))
 
     XCTAssertEqual(TestHostGlobals.dispatchCalls.count, 2, "/reset must not dispatch")
     let preReset = TestHostGlobals.dispatchCalls[0]["external_session_key"] as? String
@@ -339,11 +303,15 @@ final class WebhookTests: XCTestCase {
   }
 
   func testClearCommandResetsTheConversation() {
-    // Same flow as /reset: bump salt, cancel active dispatch, post the
-    // confirmation, do NOT dispatch a fresh agent turn.
-    _ = DatabaseManager.upsertChatSession(agentId: agentId, chatId: 810)
+    // Same flow as /reset: bump the caller's per-user salt, cancel
+    // their active dispatch, post the confirmation, do NOT dispatch a
+    // fresh agent turn. Per-user keying: the test webhook delivers no
+    // explicit `from.id`, so production resolves the user_id to
+    // chat.id (DM-style fallback) and the seeded row matches when its
+    // user_id is set the same way.
+    _ = DatabaseManager.upsertChatSession(agentId: agentId, chatId: 810, userId: 810)
     DatabaseManager.insertActiveDispatch(
-      taskId: "running-task-clear", agentId: agentId, chatId: 810,
+      taskId: "running-task-clear", agentId: agentId, chatId: 810, userId: 810,
       replyToken: "TOKCLEAR1", sessionId: "old-session",
       expiresAt: Int(Date().timeIntervalSince1970) + 600)
 
@@ -353,8 +321,9 @@ final class WebhookTests: XCTestCase {
     XCTAssertEqual(response.status, 200)
 
     XCTAssertEqual(
-      DatabaseManager.getChatSession(agentId: agentId, chatId: 810)?.sessionSalt, 1,
-      "/clear must bump the session salt")
+      DatabaseManager.getChatSession(agentId: agentId, chatId: 810, userId: 810)?
+        .sessionSalt, 1,
+      "/clear must bump the caller's per-user salt")
     XCTAssertNil(DatabaseManager.activeDispatch(agentId: agentId, forChat: 810))
     XCTAssertEqual(TestHostGlobals.cancelCalls, ["running-task-clear"])
     XCTAssertTrue(
@@ -377,10 +346,13 @@ final class WebhookTests: XCTestCase {
   }
 
   func testResetBumpsSaltAndCancelsActiveDispatch() {
-    // Seed an active dispatch for chat 800.
-    _ = DatabaseManager.upsertChatSession(agentId: agentId, chatId: 800)
+    // Seed an active dispatch keyed by (chat=800, user=800) — the
+    // textUpdate helper omits `from.id`, so production resolves the
+    // user_id to chat.id (DM fallback) and `/reset` (per-user scope)
+    // will match this row.
+    _ = DatabaseManager.upsertChatSession(agentId: agentId, chatId: 800, userId: 800)
     DatabaseManager.insertActiveDispatch(
-      taskId: "running-task", agentId: agentId, chatId: 800,
+      taskId: "running-task", agentId: agentId, chatId: 800, userId: 800,
       replyToken: "TOKABCDE", sessionId: "old-session",
       expiresAt: Int(Date().timeIntervalSince1970) + 600)
 
@@ -389,9 +361,11 @@ final class WebhookTests: XCTestCase {
     let response = parseRouteResponse(route(req))
     XCTAssertEqual(response.status, 200)
 
-    // Salt bumped, active dispatch cleared, no new dispatch issued.
+    // Per-user salt bumped, the caller's active dispatch cleared, no
+    // new dispatch issued.
     XCTAssertEqual(
-      DatabaseManager.getChatSession(agentId: agentId, chatId: 800)?.sessionSalt, 1)
+      DatabaseManager.getChatSession(agentId: agentId, chatId: 800, userId: 800)?
+        .sessionSalt, 1)
     XCTAssertNil(DatabaseManager.activeDispatch(agentId: agentId, forChat: 800))
     XCTAssertEqual(TestHostGlobals.cancelCalls, ["running-task"])
     XCTAssertTrue(TestHostGlobals.dispatchCalls.isEmpty, "/reset must not dispatch")

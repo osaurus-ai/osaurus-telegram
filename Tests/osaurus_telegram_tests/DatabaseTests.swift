@@ -568,9 +568,10 @@ final class DatabaseTests: XCTestCase {
   /// production accessors (which now SELECT columns the legacy schema
   /// doesn't have).
   private func legacyRowCount(token: String) -> Int {
-    let resultStr = DatabaseManager.dbQuery(
-      "SELECT COUNT(*) FROM active_dispatches WHERE reply_token = ?1",
-      params: DatabaseManager.serializeParams([token])) ?? "{}"
+    let resultStr =
+      DatabaseManager.dbQuery(
+        "SELECT COUNT(*) FROM active_dispatches WHERE reply_token = ?1",
+        params: DatabaseManager.serializeParams([token])) ?? "{}"
     guard let rows = DatabaseManager.extractRows(resultStr),
       let row = rows.first, let count = row.first as? Int
     else { return 0 }

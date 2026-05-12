@@ -71,12 +71,17 @@ private let sessionNamespaceUUID: [UInt8] = [
   0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
 ]
 
-/// Deterministic UUID5 over `"telegram:<salt>:<chat_id>"`. Same chat + same
-/// salt always produces the same UUID, so repeated webhook deliveries
-/// reattach to the same Osaurus session row. Bumping the salt (via /reset)
-/// produces a different UUID and starts a fresh transcript.
-func sessionUUID(forChatId chatId: Int64, salt: Int) -> UUID {
-  let name = "telegram:\(salt):\(chatId)"
+/// Deterministic UUID5 over `"telegram:<salt>:<chat_id>:<user_id>"`. Same
+/// chat + same user + same salt always produces the same UUID, so repeated
+/// webhook deliveries reattach to the same Osaurus session row. Bumping
+/// the salt (via /clear or /reset) produces a different UUID and starts
+/// a fresh transcript.
+///
+/// In DMs `user_id == chat_id` so the UUID is per-chat (single user). In
+/// groups every member gets their own UUID (and their own session) so the
+/// agent's memory doesn't mix everyone's conversations together.
+func sessionUUID(forChatId chatId: Int64, userId: Int64, salt: Int) -> UUID {
+  let name = "telegram:\(salt):\(chatId):\(userId)"
   var input = Data(sessionNamespaceUUID)
   input.append(contentsOf: name.utf8)
 
@@ -94,6 +99,90 @@ func sessionUUID(forChatId chatId: Int64, salt: Int) -> UUID {
       bytes[8], bytes[9], bytes[10], bytes[11],
       bytes[12], bytes[13], bytes[14], bytes[15]
     ))
+}
+
+/// DM-style overload: `user_id == chat_id`. Existing tests and any
+/// caller that doesn't care about per-user partitioning use this one.
+func sessionUUID(forChatId chatId: Int64, salt: Int) -> UUID {
+  sessionUUID(forChatId: chatId, userId: chatId, salt: salt)
+}
+
+// MARK: - Allowlist parsing
+//
+// Two flavours of allowlist live in `capabilities.config`:
+//   * allowed_users    — CSV mixing numeric Telegram user IDs and
+//                        `@usernames` (e.g. `123, @alice, @bob`).
+//   * allowed_chat_ids — CSV of numeric chat IDs (negative for groups).
+//
+// Both are optional; an empty / nil / missing value means "no
+// restriction" and the webhook handler skips the corresponding gate.
+//
+// The parser is forgiving: extra whitespace, empty entries (e.g.
+// trailing commas) are ignored, and the @ on usernames is stripped so
+// the comparison is just a lowercase string equality. Anything that
+// looks like neither a numeric ID nor a `@username` produces a
+// warn-level log and is skipped — the alternative would be silently
+// allowing everyone if the user typo'd their list, which is exactly
+// the wrong default for an allowlist.
+
+/// Parsed shape for `allowed_users`. `usernames` carries lowercase
+/// strings without the leading `@` so the gate can do a single
+/// case-folded membership check on each side.
+struct AllowedUsers: Equatable {
+  let ids: Set<Int64>
+  let usernames: Set<String>
+  var isEmpty: Bool { ids.isEmpty && usernames.isEmpty }
+}
+
+func parseAllowedUsers(_ csv: String?) -> AllowedUsers {
+  guard let csv else { return AllowedUsers(ids: [], usernames: []) }
+  var ids: Set<Int64> = []
+  var usernames: Set<String> = []
+  for raw in csv.split(separator: ",") {
+    let token = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if token.isEmpty { continue }
+    if token.hasPrefix("@") {
+      let name = String(token.dropFirst()).lowercased()
+      if name.isEmpty {
+        logWarn("allowlist: skipping bare '@' in allowed_users")
+        continue
+      }
+      usernames.insert(name)
+      continue
+    }
+    if let id = Int64(token) {
+      ids.insert(id)
+      continue
+    }
+    // Bare alphanumeric (no @): treat as a username for forgiveness — most
+    // users will type "alice" and forget the @ even though Telegram
+    // requires it. Only do this when the token is otherwise a plausible
+    // username; reject anything containing whitespace or punctuation.
+    let alphanumericOK = token.allSatisfy { ch in
+      ch.isLetter || ch.isNumber || ch == "_"
+    }
+    if alphanumericOK, !token.isEmpty {
+      usernames.insert(token.lowercased())
+      continue
+    }
+    logWarn("allowlist: skipping unrecognised token '\(token)' in allowed_users")
+  }
+  return AllowedUsers(ids: ids, usernames: usernames)
+}
+
+func parseAllowedChatIds(_ csv: String?) -> Set<Int64> {
+  guard let csv else { return [] }
+  var ids: Set<Int64> = []
+  for raw in csv.split(separator: ",") {
+    let token = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if token.isEmpty { continue }
+    if let id = Int64(token) {
+      ids.insert(id)
+    } else {
+      logWarn("allowlist: skipping non-numeric token '\(token)' in allowed_chat_ids")
+    }
+  }
+  return ids
 }
 
 // MARK: - Host string ownership

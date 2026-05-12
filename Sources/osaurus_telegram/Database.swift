@@ -7,19 +7,25 @@ import Foundation
 // scoped, not bot-scoped — the same chat_id can mean different things to
 // two agents sharing the plugin.
 //
-//   * chat_sessions      — (agent_id, chat_id) PK. session_salt + blocked.
+//   * chat_sessions      — (agent_id, chat_id, user_id) PK (schema v4).
+//                          session_salt + blocked are tracked PER USER
+//                          inside a chat so /clear in a group only wipes
+//                          the caller's transcript, not everyone else's.
+//                          For DMs `user_id == chat_id` so the row count
+//                          and behaviour are identical to the v3 schema.
 //   * active_dispatches  — reply_token PK (schema v3). Pre-inserted BEFORE
 //                          `dispatch` so a fast agent can't race past us
 //                          and hit `stale_token`. The placeholder task_id
 //                          is patched by `updateTaskId` once dispatch
 //                          returns. Multiple in-flight rows per
-//                          (agent_id, chat_id) coexist and age out under
-//                          the 10-minute TTL sweep.
+//                          (agent_id, chat_id, user_id) coexist and age
+//                          out under the 10-minute TTL sweep.
 //   * seen_updates       — (agent_id, update_id) PK; Telegram-retry
 //                          idempotency cache, pruned to 24h.
 
 struct ChatSessionRow {
   let chatId: Int64
+  let userId: Int64
   let sessionSalt: Int
   let blocked: Int
 }
@@ -28,6 +34,11 @@ struct ActiveDispatchRow {
   let taskId: String
   let agentId: String
   let chatId: Int64
+  /// Telegram user_id of the user that triggered this dispatch. Used to
+  /// scope per-user soft-interrupts and per-user session lookups inside
+  /// group chats. 0 is the "unknown user" sentinel (older rows / synthetic
+  /// test seeds); behaves exactly like a single-user chat in DMs.
+  let userId: Int64
   let replyToken: String
   let sessionId: String
   let expiresAt: Int
@@ -59,6 +70,17 @@ enum DatabaseManager {
       }
     }
 
+    // v3 chat_sessions ((agent_id, chat_id) PK) → v4 ((agent_id, chat_id,
+    // user_id) PK). Per-user salts let `/clear` in a group affect only
+    // the caller. Detect by the missing `user_id` column. Data is
+    // transient (salts default back to zero) so a drop is harmless.
+    if tableExists("chat_sessions"),
+      !columnExists(table: "chat_sessions", column: "user_id")
+    {
+      logInfo("Database: detected v3 chat_sessions (no user_id); rebuilding for per-user sessions")
+      dbExec("DROP TABLE IF EXISTS chat_sessions", params: "[]")
+    }
+
     // v2 active_dispatches (task_id PK) → v3 (reply_token PK).
     if tableExists("active_dispatches"),
       primaryKeyColumn(table: "active_dispatches") != "reply_token"
@@ -78,16 +100,26 @@ enum DatabaseManager {
       dbExec("DROP TABLE IF EXISTS active_dispatches", params: "[]")
     }
 
+    // v3.1 → v3.2: user_id column added so per-user soft-interrupts in
+    // group chats target only the calling user's prior task. Transient.
+    if tableExists("active_dispatches"),
+      !columnExists(table: "active_dispatches", column: "user_id")
+    {
+      logInfo("Database: detected pre-user_id active_dispatches; rebuilding")
+      dbExec("DROP TABLE IF EXISTS active_dispatches", params: "[]")
+    }
+
     let statements = [
       """
       CREATE TABLE IF NOT EXISTS chat_sessions (
         agent_id       TEXT    NOT NULL,
         chat_id        INTEGER NOT NULL,
+        user_id        INTEGER NOT NULL,
         session_salt   INTEGER NOT NULL DEFAULT 0,
         blocked        INTEGER NOT NULL DEFAULT 0,
         last_msg_at    INTEGER NOT NULL,
         created_at     INTEGER NOT NULL,
-        PRIMARY KEY (agent_id, chat_id)
+        PRIMARY KEY (agent_id, chat_id, user_id)
       )
       """,
       """
@@ -96,6 +128,7 @@ enum DatabaseManager {
         task_id             TEXT NOT NULL,
         agent_id            TEXT NOT NULL,
         chat_id             INTEGER NOT NULL,
+        user_id             INTEGER NOT NULL DEFAULT 0,
         session_id          TEXT NOT NULL,
         started_at          INTEGER NOT NULL,
         expires_at          INTEGER NOT NULL,
@@ -106,6 +139,8 @@ enum DatabaseManager {
       "CREATE INDEX IF NOT EXISTS idx_dispatches_task ON active_dispatches(task_id)",
       "CREATE INDEX IF NOT EXISTS idx_dispatches_chat "
         + "ON active_dispatches(agent_id, chat_id, started_at)",
+      "CREATE INDEX IF NOT EXISTS idx_dispatches_user "
+        + "ON active_dispatches(agent_id, chat_id, user_id, started_at)",
       """
       CREATE TABLE IF NOT EXISTS seen_updates (
         agent_id       TEXT NOT NULL,
@@ -168,41 +203,86 @@ enum DatabaseManager {
   }
 
   // MARK: - chat_sessions
+  //
+  // All accessors are scoped by `(agent_id, chat_id, user_id)` (schema v4).
+  // For DMs the caller passes `user_id == chat_id` so behaviour is
+  // identical to the v3 schema — there's only one user per DM. For groups
+  // each member has its own row, so `/clear` only wipes the caller's
+  // transcript and `blocked` (set by Telegram on user-side block in DMs)
+  // doesn't accidentally silence everyone.
 
   /// Inserts or refreshes the chat row, returning the post-upsert state. Always
   /// preserves `session_salt` and `blocked`.
   @discardableResult
-  static func upsertChatSession(agentId: String, chatId: Int64) -> ChatSessionRow {
+  static func upsertChatSession(
+    agentId: String, chatId: Int64, userId: Int64
+  ) -> ChatSessionRow {
     let now = Int(Date().timeIntervalSince1970)
     let upsert = """
-      INSERT INTO chat_sessions (agent_id, chat_id, session_salt, blocked, last_msg_at, created_at)
-      VALUES (?1, ?2, 0, 0, ?3, ?3)
-      ON CONFLICT(agent_id, chat_id) DO UPDATE SET last_msg_at = ?3
+      INSERT INTO chat_sessions
+        (agent_id, chat_id, user_id, session_salt, blocked, last_msg_at, created_at)
+      VALUES (?1, ?2, ?3, 0, 0, ?4, ?4)
+      ON CONFLICT(agent_id, chat_id, user_id) DO UPDATE SET last_msg_at = ?4
       """
-    dbExec(upsert, params: serializeParams([agentId, chatId, now]))
-    return getChatSession(agentId: agentId, chatId: chatId)
-      ?? ChatSessionRow(chatId: chatId, sessionSalt: 0, blocked: 0)
+    dbExec(upsert, params: serializeParams([agentId, chatId, userId, now]))
+    return getChatSession(agentId: agentId, chatId: chatId, userId: userId)
+      ?? ChatSessionRow(chatId: chatId, userId: userId, sessionSalt: 0, blocked: 0)
   }
 
-  static func getChatSession(agentId: String, chatId: Int64) -> ChatSessionRow? {
+  /// Convenience overload for DM-style call sites where `user_id == chat_id`.
+  /// Existing tests rely on this single-arg shape; production code paths
+  /// resolve the real user_id via `effectiveUserId(chatId:fromId:)`.
+  @discardableResult
+  static func upsertChatSession(agentId: String, chatId: Int64) -> ChatSessionRow {
+    upsertChatSession(agentId: agentId, chatId: chatId, userId: chatId)
+  }
+
+  static func getChatSession(
+    agentId: String, chatId: Int64, userId: Int64
+  ) -> ChatSessionRow? {
     let sql = """
-      SELECT chat_id, session_salt, blocked
+      SELECT chat_id, user_id, session_salt, blocked
       FROM chat_sessions
-      WHERE agent_id = ?1 AND chat_id = ?2
+      WHERE agent_id = ?1 AND chat_id = ?2 AND user_id = ?3
       LIMIT 1
       """
-    guard let resultStr = dbQuery(sql, params: serializeParams([agentId, chatId])),
+    guard let resultStr = dbQuery(sql, params: serializeParams([agentId, chatId, userId])),
       let rows = extractRows(resultStr),
-      let row = rows.first, row.count >= 3
+      let row = rows.first, row.count >= 4
     else { return nil }
     return ChatSessionRow(
       chatId: int64FromAny(row[0]) ?? chatId,
-      sessionSalt: intFromAny(row[1]) ?? 0,
-      blocked: intFromAny(row[2]) ?? 0
+      userId: int64FromAny(row[1]) ?? userId,
+      sessionSalt: intFromAny(row[2]) ?? 0,
+      blocked: intFromAny(row[3]) ?? 0
     )
   }
 
+  /// DM convenience: looks up the row keyed by `(agent_id, chat_id, chat_id)`.
+  /// Used by tests and any call site that doesn't resolve a per-user id.
+  static func getChatSession(agentId: String, chatId: Int64) -> ChatSessionRow? {
+    getChatSession(agentId: agentId, chatId: chatId, userId: chatId)
+  }
+
+  /// Bumps the per-user salt for one (chat, user) pair. Used by `/clear`
+  /// in groups to start a fresh transcript for the calling user only.
+  static func bumpSessionSalt(agentId: String, chatId: Int64, userId: Int64) {
+    let sql = """
+      UPDATE chat_sessions SET session_salt = session_salt + 1
+      WHERE agent_id = ?1 AND chat_id = ?2 AND user_id = ?3
+      """
+    dbExec(sql, params: serializeParams([agentId, chatId, userId]))
+  }
+
+  /// DM convenience.
   static func bumpSessionSalt(agentId: String, chatId: Int64) {
+    bumpSessionSalt(agentId: agentId, chatId: chatId, userId: chatId)
+  }
+
+  /// Bumps the salt for EVERY user inside the chat. Used by `/clearall`
+  /// in groups to wipe all transcripts at once. In DMs there's only one
+  /// row, so this behaves identically to `bumpSessionSalt`.
+  static func bumpAllSessionSalts(agentId: String, chatId: Int64) {
     let sql = """
       UPDATE chat_sessions SET session_salt = session_salt + 1
       WHERE agent_id = ?1 AND chat_id = ?2
@@ -210,21 +290,46 @@ enum DatabaseManager {
     dbExec(sql, params: serializeParams([agentId, chatId]))
   }
 
+  /// Marks every user row in the chat as blocked. The "bot was blocked"
+  /// signal from Telegram only ever fires in DMs (there's no concept of
+  /// a group-wide block at the bot level); we keep the per-user partition
+  /// for forward compat but always update every row in the chat.
   static func markChatBlocked(agentId: String, chatId: Int64) {
     let sql =
       "UPDATE chat_sessions SET blocked = 1 WHERE agent_id = ?1 AND chat_id = ?2"
     dbExec(sql, params: serializeParams([agentId, chatId]))
   }
 
+  /// True when ANY user row in the chat is blocked. We treat the chat as
+  /// blocked if Telegram has signalled it for any participant — for DMs
+  /// that's the only user, for groups we'd never normally hit this path
+  /// (no group-wide block) but the behaviour stays defensive.
   static func isChatBlocked(agentId: String, chatId: Int64) -> Bool {
-    return (getChatSession(agentId: agentId, chatId: chatId)?.blocked ?? 0) == 1
+    let sql = """
+      SELECT 1 FROM chat_sessions
+      WHERE agent_id = ?1 AND chat_id = ?2 AND blocked = 1
+      LIMIT 1
+      """
+    guard let resultStr = dbQuery(sql, params: serializeParams([agentId, chatId])),
+      let rows = extractRows(resultStr)
+    else { return false }
+    return !rows.isEmpty
   }
 
   // MARK: - active_dispatches
 
+  /// Column list shared by every dispatch SELECT. Centralised so the
+  /// `parseDispatchRow` field offsets stay in sync with the columns we
+  /// actually pull (otherwise adding a new column means hunting through
+  /// every SELECT).
+  private static let dispatchSelectColumns =
+    "task_id, agent_id, chat_id, user_id, reply_token, session_id, "
+    + "expires_at, has_replied, incoming_message_id"
+
   static func insertActiveDispatch(
-    taskId: String, agentId: String, chatId: Int64, replyToken: String,
-    sessionId: String, expiresAt: Int, incomingMessageId: Int64 = 0
+    taskId: String, agentId: String, chatId: Int64, userId: Int64 = 0,
+    replyToken: String, sessionId: String, expiresAt: Int,
+    incomingMessageId: Int64 = 0
   ) {
     // started_at is an ordering key (not a wall-clock); milliseconds give
     // rapid-fire turns and unit tests strict ordering. expires_at stays
@@ -232,15 +337,15 @@ enum DatabaseManager {
     let nowMillis = Int(Date().timeIntervalSince1970 * 1000)
     let sql = """
       INSERT INTO active_dispatches
-        (task_id, agent_id, chat_id, reply_token, session_id,
+        (task_id, agent_id, chat_id, user_id, reply_token, session_id,
          started_at, expires_at, has_replied, incoming_message_id)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9)
       """
     dbExec(
       sql,
       params: serializeParams(
         [
-          taskId, agentId, chatId, replyToken, sessionId,
+          taskId, agentId, chatId, userId, replyToken, sessionId,
           nowMillis, expiresAt, incomingMessageId,
         ]))
   }
@@ -251,7 +356,7 @@ enum DatabaseManager {
   /// for the soft-interrupt branch in `handleWebhook`.
   static func activeDispatch(agentId: String, forChat chatId: Int64) -> ActiveDispatchRow? {
     let sql = """
-      SELECT task_id, agent_id, chat_id, reply_token, session_id, expires_at, has_replied, incoming_message_id
+      SELECT \(dispatchSelectColumns)
       FROM active_dispatches
       WHERE agent_id = ?1 AND chat_id = ?2
       ORDER BY started_at DESC
@@ -270,7 +375,7 @@ enum DatabaseManager {
   /// which translates to the latest pre-inserted dispatch row for the agent.
   static func latestActiveDispatch(agentId: String) -> ActiveDispatchRow? {
     let sql = """
-      SELECT task_id, agent_id, chat_id, reply_token, session_id, expires_at, has_replied, incoming_message_id
+      SELECT \(dispatchSelectColumns)
       FROM active_dispatches
       WHERE agent_id = ?1
       ORDER BY started_at DESC
@@ -282,16 +387,15 @@ enum DatabaseManager {
     return parseDispatchRow(resultStr)
   }
 
-  /// Returns the most recently dispatched in-flight row across ALL agents.
-  /// Used as a fallback when the host fires `invoke(type: "artifact")` from
-  /// a thread that doesn't bind a per-agent frame — the artifact must
-  /// belong to an agent that's currently running a task, and "the only
-  /// agent in flight" is the unambiguous case. With multiple agents in
-  /// flight we bias to the latest; the wrong-chat risk is documented at
-  /// the call site in `Plugin.swift`.
+  /// Returns the most recently dispatched in-flight row across ALL agents,
+  /// constrained to agents that have rows in flight. With exactly one
+  /// in-flight agent the result is unambiguous (single-agent install or
+  /// only one agent currently working). With multiple in-flight agents
+  /// the routing is ambiguous so the artifact fallback in `Plugin.swift`
+  /// declines to guess; callers must check `inFlightAgentCount()` first.
   static func latestActiveDispatchAcrossAgents() -> ActiveDispatchRow? {
     let sql = """
-      SELECT task_id, agent_id, chat_id, reply_token, session_id, expires_at, has_replied, incoming_message_id
+      SELECT \(dispatchSelectColumns)
       FROM active_dispatches
       ORDER BY started_at DESC
       LIMIT 1
@@ -302,15 +406,51 @@ enum DatabaseManager {
     return parseDispatchRow(resultStr)
   }
 
-  /// Like `activeDispatch`, but skips a specific `reply_token`. Used by the
-  /// soft-interrupt branch in `handleWebhook` AFTER it has pre-inserted the
-  /// current turn's row — we want the *prior* in-flight task to interrupt,
-  /// not ourselves.
+  /// Returns the count of distinct agents that have at least one in-flight
+  /// dispatch row. Used by `routeArtifactWithoutFrame` to decide whether
+  /// the cross-agent fallback is unambiguous (1) or ambiguous (>1).
+  static func inFlightAgentCount() -> Int {
+    let sql =
+      "SELECT COUNT(DISTINCT agent_id) FROM active_dispatches"
+    guard let resultStr = dbQuery(sql, params: "[]"),
+      let rows = extractRows(resultStr),
+      let row = rows.first, !row.isEmpty
+    else { return 0 }
+    return intFromAny(row[0]) ?? 0
+  }
+
+  /// Like `activeDispatch`, but skips a specific `reply_token` AND scopes
+  /// to a specific user. Used by the soft-interrupt branch in
+  /// `handleWebhook` AFTER it has pre-inserted the current turn's row —
+  /// we want the *prior* in-flight task FOR THE SAME USER to interrupt,
+  /// not ourselves and not someone else's parallel turn in the same group.
+  static func priorActiveDispatch(
+    agentId: String, forChat chatId: Int64, userId: Int64,
+    excluding replyToken: String
+  ) -> ActiveDispatchRow? {
+    let sql = """
+      SELECT \(dispatchSelectColumns)
+      FROM active_dispatches
+      WHERE agent_id = ?1 AND chat_id = ?2 AND user_id = ?3 AND reply_token != ?4
+      ORDER BY started_at DESC
+      LIMIT 1
+      """
+    guard
+      let resultStr = dbQuery(
+        sql, params: serializeParams([agentId, chatId, userId, replyToken]))
+    else { return nil }
+    return parseDispatchRow(resultStr)
+  }
+
+  /// DM-style overload retained for tests that don't care about user
+  /// scoping. In production the per-user variant is what `handleWebhook`
+  /// invokes — group chats need to interrupt only the calling user's
+  /// prior task, not random other participants'.
   static func priorActiveDispatch(
     agentId: String, forChat chatId: Int64, excluding replyToken: String
   ) -> ActiveDispatchRow? {
     let sql = """
-      SELECT task_id, agent_id, chat_id, reply_token, session_id, expires_at, has_replied, incoming_message_id
+      SELECT \(dispatchSelectColumns)
       FROM active_dispatches
       WHERE agent_id = ?1 AND chat_id = ?2 AND reply_token != ?3
       ORDER BY started_at DESC
@@ -324,18 +464,36 @@ enum DatabaseManager {
   }
 
   /// Returns every in-flight dispatch row for `(agentId, chatId)`. Used by
-  /// `/reset` so we can hard-cancel every concurrent turn for a chat in one
-  /// pass, not just the latest one.
+  /// `/reset` and `/clearall` so we can hard-cancel every concurrent turn
+  /// for a chat in one pass, not just the latest one.
   static func allActiveDispatches(agentId: String, forChat chatId: Int64)
     -> [ActiveDispatchRow]
   {
     let sql = """
-      SELECT task_id, agent_id, chat_id, reply_token, session_id, expires_at, has_replied, incoming_message_id
+      SELECT \(dispatchSelectColumns)
       FROM active_dispatches
       WHERE agent_id = ?1 AND chat_id = ?2
       ORDER BY started_at DESC
       """
     guard let resultStr = dbQuery(sql, params: serializeParams([agentId, chatId]))
+    else { return [] }
+    return parseDispatchRows(resultStr)
+  }
+
+  /// Per-user variant: every in-flight row for one user inside one chat.
+  /// Used by `/clear` (per-user) so we cancel only the caller's tasks
+  /// without disturbing other group members.
+  static func allActiveDispatches(
+    agentId: String, forChat chatId: Int64, userId: Int64
+  ) -> [ActiveDispatchRow] {
+    let sql = """
+      SELECT \(dispatchSelectColumns)
+      FROM active_dispatches
+      WHERE agent_id = ?1 AND chat_id = ?2 AND user_id = ?3
+      ORDER BY started_at DESC
+      """
+    guard
+      let resultStr = dbQuery(sql, params: serializeParams([agentId, chatId, userId]))
     else { return [] }
     return parseDispatchRows(resultStr)
   }
@@ -346,7 +504,7 @@ enum DatabaseManager {
   /// current callback frame.
   static func lookupBinding(token: String) -> ActiveDispatchRow? {
     let sql = """
-      SELECT task_id, agent_id, chat_id, reply_token, session_id, expires_at, has_replied, incoming_message_id
+      SELECT \(dispatchSelectColumns)
       FROM active_dispatches
       WHERE reply_token = ?1
       LIMIT 1
@@ -357,7 +515,7 @@ enum DatabaseManager {
 
   static func lookupBindingByTask(taskId: String) -> ActiveDispatchRow? {
     let sql = """
-      SELECT task_id, agent_id, chat_id, reply_token, session_id, expires_at, has_replied, incoming_message_id
+      SELECT \(dispatchSelectColumns)
       FROM active_dispatches
       WHERE task_id = ?1
       LIMIT 1
@@ -389,6 +547,20 @@ enum DatabaseManager {
   static func markReplied(taskId: String) {
     let sql = "UPDATE active_dispatches SET has_replied = 1 WHERE task_id = ?1"
     dbExec(sql, params: serializeParams([taskId]))
+  }
+
+  /// Pushes `expires_at` forward to `newExpiresAt` IF the new value is
+  /// later. Used by the activity-keepalive path: every OUTPUT/ACTIVITY
+  /// event from a long-running agent extends the TTL so a 12-minute
+  /// research turn doesn't lose its reply binding mid-run. Idempotent
+  /// and safe to call from any thread.
+  static func bumpExpiry(taskId: String, newExpiresAt: Int) {
+    let sql = """
+      UPDATE active_dispatches
+      SET expires_at = ?1
+      WHERE task_id = ?2 AND expires_at < ?1
+      """
+    dbExec(sql, params: serializeParams([newExpiresAt, taskId]))
   }
 
   static func hasReplied(taskId: String) -> Bool {
@@ -443,9 +615,14 @@ enum DatabaseManager {
 
   // MARK: - Row helpers
 
+  /// Number of columns the shared `dispatchSelectColumns` SELECT pulls.
+  /// Bump this when you add a column there; the per-row offsets in
+  /// `dispatchRow(from:)` must move in lockstep.
+  private static let dispatchColumnCount = 9
+
   private static func parseDispatchRow(_ resultStr: String) -> ActiveDispatchRow? {
     guard let rows = extractRows(resultStr),
-      let row = rows.first, row.count >= 8
+      let row = rows.first, row.count >= dispatchColumnCount
     else { return nil }
     return dispatchRow(from: row)
   }
@@ -456,7 +633,7 @@ enum DatabaseManager {
   private static func parseDispatchRows(_ resultStr: String) -> [ActiveDispatchRow] {
     guard let rows = extractRows(resultStr) else { return [] }
     return rows.compactMap { row -> ActiveDispatchRow? in
-      guard row.count >= 8 else { return nil }
+      guard row.count >= dispatchColumnCount else { return nil }
       return dispatchRow(from: row)
     }
   }
@@ -466,11 +643,12 @@ enum DatabaseManager {
       taskId: "\(row[0])",
       agentId: "\(row[1])",
       chatId: int64FromAny(row[2]) ?? 0,
-      replyToken: "\(row[3])",
-      sessionId: "\(row[4])",
-      expiresAt: intFromAny(row[5]) ?? 0,
-      hasReplied: intFromAny(row[6]) ?? 0,
-      incomingMessageId: int64FromAny(row[7]) ?? 0
+      userId: int64FromAny(row[3]) ?? 0,
+      replyToken: "\(row[4])",
+      sessionId: "\(row[5])",
+      expiresAt: intFromAny(row[6]) ?? 0,
+      hasReplied: intFromAny(row[7]) ?? 0,
+      incomingMessageId: int64FromAny(row[8]) ?? 0
     )
   }
 

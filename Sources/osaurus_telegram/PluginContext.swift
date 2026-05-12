@@ -13,13 +13,30 @@ import Foundation
 final class AgentState: @unchecked Sendable {
   let agentId: String
   var botToken: String?
-  var botId: String?
+  /// Numeric Telegram bot user_id, populated from `getMe`. Used by the
+  /// group-chat mention/reply gate to recognise replies-to-bot and
+  /// `text_mention` entities targeting us. Stored as `Int64` so we
+  /// don't pay parse cost on the webhook hot path.
+  var botId: Int64?
   var botUsername: String?
   var webhookSecret: String?
   /// Public base URL of the agent's Osaurus tunnel. The host pushes this via
   /// `on_config_changed("tunnel_url", ...)` once the tunnel is up — there is
   /// no synchronous getter, so the plugin must wait for the push.
   var tunnelURL: String?
+
+  /// Parsed allowlist of users that may invoke this agent. An empty
+  /// `AllowedUsers` means "no restriction" (everyone passes the user
+  /// gate). Hydrated from `allowed_users` on first touch and refreshed
+  /// on `on_config_changed`. Read on the webhook hot path so we keep
+  /// the parsed shape rather than the raw CSV.
+  var allowedUsers: AllowedUsers = AllowedUsers(ids: [], usernames: [])
+
+  /// Parsed allowlist of chat IDs (DMs are positive, groups negative).
+  /// Empty set means "no restriction". Same hydration path as
+  /// `allowedUsers`. Webhook handler runs the chat check before the
+  /// per-user check so a denied chat short-circuits cheap.
+  var allowedChatIds: Set<Int64> = []
 
   /// Hydration is one-shot per-agent. The lock makes concurrent first-touches
   /// for the same agent_id wait for the inserter rather than racing against a
@@ -176,6 +193,19 @@ final class PluginContext: @unchecked Sendable {
       state.log(.debug, "tunnel_url loaded from config")
     }
 
+    // Allowlists. Empty / nil = no restriction; the parser tolerates
+    // mixed numeric ids + @usernames and skips obvious garbage with a
+    // warn-level log so a typo can't accidentally allow everyone.
+    state.allowedUsers = parseAllowedUsers(configGet("allowed_users"))
+    state.allowedChatIds = parseAllowedChatIds(configGet("allowed_chat_ids"))
+    if !state.allowedUsers.isEmpty || !state.allowedChatIds.isEmpty {
+      state.log(
+        .info,
+        "allowlist loaded: users(ids=\(state.allowedUsers.ids.count) "
+          + "@names=\(state.allowedUsers.usernames.count)) "
+          + "chats(\(state.allowedChatIds.count))")
+    }
+
     // If both halves are already on disk, reconcile with Telegram now so
     // the UI indicator is accurate by the time the user opens the plugin
     // pane. Otherwise log what we're still waiting on.
@@ -267,9 +297,28 @@ func setupWebhook(state: AgentState, token: String, tunnelURL: String) {
     + "/plugins/\(pluginId)/webhook"
   state.log(.debug, "setupWebhook: registering webhook at \(webhookURL)")
 
+  // Decide whether to drop Telegram's pending-update queue. On a fresh
+  // install / boot we drop (default) so the agent loop doesn't get
+  // slammed with stale chatter. But when we're re-registering after a
+  // transient tunnel hiccup, the queued updates are recent and dropping
+  // them would silently lose the user's just-typed messages — keep them.
+  let preExistingInfo = telegramGetWebhookInfo(token: token)
+  let isReRegistration =
+    preExistingInfo.map { $0.url == webhookURL && $0.hasRecentError() } ?? false
+  if isReRegistration {
+    state.log(
+      .info,
+      "setupWebhook: re-registering after recent delivery error "
+        + "(pending=\(preExistingInfo?.pendingUpdateCount ?? 0)) "
+        + "— preserving Telegram's queued updates")
+  }
+
   let registered =
     withRetry(operation: "setWebhook") {
-      telegramSetWebhook(token: token, url: webhookURL, secretToken: secret) ? true : nil
+      telegramSetWebhook(
+        token: token, url: webhookURL, secretToken: secret,
+        dropPendingUpdates: !isReRegistration
+      ) ? true : nil
     } != nil
   guard registered else {
     state.log(.error, "Failed to register webhook at \(webhookURL)")
@@ -282,6 +331,10 @@ func setupWebhook(state: AgentState, token: String, tunnelURL: String) {
   if verifyWebhook(token: token, expectedURL: webhookURL) {
     setWebhookRegistered(true)
     state.log(.info, "Webhook registered at \(webhookURL)")
+    // Populate the "/" command menu so users discover bot-supported
+    // commands without reading docs. Best-effort: failures here don't
+    // invalidate the registration.
+    _ = telegramSetMyCommands(token: token, commands: defaultBotCommands)
   } else {
     // Don't trust the optimistic setWebhook response — the indicator stays
     // red so the user sees something is wrong.
@@ -291,6 +344,19 @@ func setupWebhook(state: AgentState, token: String, tunnelURL: String) {
         + "or is reporting a recent delivery error.")
   }
 }
+
+/// Default "/" menu entries exposed to the Telegram client. Mirrors the
+/// commands the webhook handler actually recognises (`/start`, `/help`,
+/// `/clear`, `/clearall`, `/whoami`). Order matters — Telegram displays
+/// the menu in array order.
+let defaultBotCommands: [TelegramBotCommand] = [
+  TelegramBotCommand(command: "start", description: "Start a conversation with the bot"),
+  TelegramBotCommand(command: "help", description: "Show what the bot can do"),
+  TelegramBotCommand(command: "clear", description: "Reset your conversation"),
+  TelegramBotCommand(
+    command: "clearall", description: "Reset every participant's conversation (groups)"),
+  TelegramBotCommand(command: "whoami", description: "Show your user/chat IDs"),
+]
 
 /// Asks Telegram what URL it has registered and whether delivery is healthy.
 /// Returns true only if both checks pass.
@@ -331,6 +397,17 @@ func onConfigChanged(state: AgentState, key: String, value: String?) {
 
   case "bot_token":
     handleBotTokenChange(state: state, value: value)
+
+  case "allowed_users":
+    state.allowedUsers = parseAllowedUsers(value)
+    state.log(
+      .info,
+      "allowlist refreshed: users(ids=\(state.allowedUsers.ids.count) "
+        + "@names=\(state.allowedUsers.usernames.count))")
+
+  case "allowed_chat_ids":
+    state.allowedChatIds = parseAllowedChatIds(value)
+    state.log(.info, "allowlist refreshed: chats(\(state.allowedChatIds.count))")
 
   default:
     state.log(.debug, "onConfigChanged: ignoring key '\(key)'")

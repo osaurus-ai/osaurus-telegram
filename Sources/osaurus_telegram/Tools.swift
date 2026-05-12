@@ -2,10 +2,14 @@ import Foundation
 
 // MARK: - Tool Handlers
 //
-// The agent owns user-visible text content. These three tools (`reply`,
-// `reply_typing`, `reply_photo`) are the agent-driven delivery path,
-// gated by an opaque `reply_token` so the agent never learns the
-// chat_id (prompt injection cannot redirect outbound messages).
+// The agent owns user-visible text content. The reply surface is gated
+// by an opaque `reply_token` so the agent never learns the chat_id
+// (prompt injection cannot redirect outbound messages):
+//
+//   * `reply` / `reply_typing` / `reply_photo` (legacy, unchanged shape)
+//   * `reply_document` / `reply_voice` / `reply_audio` / `reply_video`
+//     — additional media surfaces, all routed by URL through the
+//     `telegramSendMediaByURL` helper.
 //
 // Files the agent writes into the sandbox are NOT sent via a tool —
 // they're auto-forwarded by `handleArtifactShare` (host hook below)
@@ -17,12 +21,68 @@ import Foundation
 // in one run. We bridge with a DispatchSemaphore so the synchronous
 // callback can block briefly until the network call returns.
 
+// MARK: - Dispatch tool surface
+//
+// Names of the tools the agent is allowed (and expected) to use to talk
+// back to Telegram. We pass these on every dispatch via the v3+ `tools`
+// field so an agent with manual / restrictive tool selection still has
+// the reply surface loaded — without it, the agent would receive the
+// user's message but have no way to respond.
+//
+// MUST stay in sync with the manifest's `capabilities.tools[].id`
+// values. `ManifestTests.testToolsListIsExactlyTheReplySurface` pins the
+// manifest side; `WebhookTests.testWebhookDispatchesValidTextMessage`
+// pins this set on the dispatch payload.
+let dispatchToolNames: [String] = [
+  "reply", "reply_typing", "reply_photo",
+  "reply_document", "reply_voice", "reply_audio", "reply_video",
+]
+
+// MARK: - Inline keyboard arg
+//
+// Telegram inline keyboards are a 2D array of buttons. The agent passes
+// them through verbatim; we validate the shape, then forward as the
+// `reply_markup.inline_keyboard` field. Only `text` + (`callback_data`
+// XOR `url`) are supported — login URLs / web-app buttons / pay buttons
+// are intentionally excluded so the surface stays small and the agent
+// can't accidentally embed credentials.
+private struct InlineKeyboardButton: Decodable {
+  let text: String
+  let callback_data: String?
+  let url: String?
+}
+
+/// Pre-serializes the inline keyboard to a JSON string so it survives
+/// the `Sendable` closure boundary into `PerChatSendActor`. Returns nil
+/// for an absent / empty keyboard so the caller can skip the field.
+private func encodeInlineKeyboardJSON(
+  _ rows: [[InlineKeyboardButton]]?
+) -> String? {
+  guard let rows, !rows.isEmpty else { return nil }
+  let encoded: [[[String: Any]]] = rows.map { row in
+    row.map { btn -> [String: Any] in
+      var dict: [String: Any] = ["text": String(btn.text.prefix(64))]
+      if let cb = btn.callback_data, !cb.isEmpty {
+        // Telegram caps callback_data at 64 bytes UTF-8.
+        dict["callback_data"] = String(cb.prefix(64))
+      } else if let url = btn.url, !url.isEmpty {
+        dict["url"] = url
+      }
+      return dict
+    }
+  }
+  let payload: [String: Any] = ["inline_keyboard": encoded]
+  return makeJSONString(payload)
+}
+
 // MARK: - Argument types
 
 private struct ReplyArgs: Decodable {
   let reply_token: String
   let text: String
   let parse_mode: String?
+  let reply_to_message_id: Int64?
+  let inline_keyboard: [[InlineKeyboardButton]]?
 }
 
 private struct ReplyTypingArgs: Decodable {
@@ -33,6 +93,35 @@ private struct ReplyPhotoArgs: Decodable {
   let reply_token: String
   let photo_url: String
   let caption: String?
+  let reply_to_message_id: Int64?
+}
+
+private struct ReplyDocumentArgs: Decodable {
+  let reply_token: String
+  let document_url: String
+  let caption: String?
+  let reply_to_message_id: Int64?
+}
+
+private struct ReplyVoiceArgs: Decodable {
+  let reply_token: String
+  let voice_url: String
+  let caption: String?
+  let reply_to_message_id: Int64?
+}
+
+private struct ReplyAudioArgs: Decodable {
+  let reply_token: String
+  let audio_url: String
+  let caption: String?
+  let reply_to_message_id: Int64?
+}
+
+private struct ReplyVideoArgs: Decodable {
+  let reply_token: String
+  let video_url: String
+  let caption: String?
+  let reply_to_message_id: Int64?
 }
 
 // MARK: - reply
@@ -44,11 +133,14 @@ func handleReply(state: AgentState, payload: String) -> String {
   ) { (args: ReplyArgs, token, binding) in
     let clamped = String(args.text.prefix(4000))
     let parseMode = args.parse_mode
+    let replyTo = args.reply_to_message_id
+    let markupJSON = encodeInlineKeyboardJSON(args.inline_keyboard)
     return ReplyAction(
       action: {
         telegramSendMessage(
           token: token, chatId: binding.chatId,
-          text: clamped, parseMode: parseMode)
+          text: clamped, parseMode: parseMode,
+          replyToMessageId: replyTo, replyMarkupJSON: markupJSON)
       },
       successMarksReplied: true,
       successSummary: "Sent message to user."
@@ -80,14 +172,97 @@ func handleReplyPhoto(state: AgentState, payload: String) -> String {
   ) { (args: ReplyPhotoArgs, token, binding) in
     let photoURL = args.photo_url
     let caption = args.caption
+    let replyTo = args.reply_to_message_id
     return ReplyAction(
       action: {
         telegramSendPhotoByURL(
           token: token, chatId: binding.chatId,
-          photoURL: photoURL, caption: caption)
+          photoURL: photoURL, caption: caption,
+          replyToMessageId: replyTo)
       },
       successMarksReplied: true,
       successSummary: "Sent photo to user."
+    )
+  }
+}
+
+// MARK: - reply_document / reply_voice / reply_audio / reply_video
+//
+// All four follow the same shape: a public URL plus optional caption,
+// routed through `telegramSendMediaByURL` (Telegram accepts a URL string
+// in the media field for every Bot-API send method we use here, just
+// like `sendPhoto`). The reply token + chat_id resolution + send-order
+// serialization lives in `runReplyTool` — these handlers just pick the
+// API method and the JSON field name.
+
+func handleReplyDocument(state: AgentState, payload: String) -> String {
+  runReplyTool(
+    state: state, payload: payload,
+    invalidArgsMessage: "reply_document requires reply_token and document_url"
+  ) { (args: ReplyDocumentArgs, token, binding) in
+    return ReplyAction(
+      action: {
+        telegramSendMediaByURL(
+          token: token, method: "sendDocument", mediaField: "document",
+          chatId: binding.chatId, mediaURL: args.document_url,
+          caption: args.caption, replyToMessageId: args.reply_to_message_id)
+      },
+      successMarksReplied: true,
+      successSummary: "Sent document to user."
+    )
+  }
+}
+
+func handleReplyVoice(state: AgentState, payload: String) -> String {
+  runReplyTool(
+    state: state, payload: payload,
+    invalidArgsMessage: "reply_voice requires reply_token and voice_url"
+  ) { (args: ReplyVoiceArgs, token, binding) in
+    return ReplyAction(
+      action: {
+        telegramSendMediaByURL(
+          token: token, method: "sendVoice", mediaField: "voice",
+          chatId: binding.chatId, mediaURL: args.voice_url,
+          caption: args.caption, replyToMessageId: args.reply_to_message_id)
+      },
+      successMarksReplied: true,
+      successSummary: "Sent voice note to user."
+    )
+  }
+}
+
+func handleReplyAudio(state: AgentState, payload: String) -> String {
+  runReplyTool(
+    state: state, payload: payload,
+    invalidArgsMessage: "reply_audio requires reply_token and audio_url"
+  ) { (args: ReplyAudioArgs, token, binding) in
+    return ReplyAction(
+      action: {
+        telegramSendMediaByURL(
+          token: token, method: "sendAudio", mediaField: "audio",
+          chatId: binding.chatId, mediaURL: args.audio_url,
+          caption: args.caption, replyToMessageId: args.reply_to_message_id)
+      },
+      successMarksReplied: true,
+      successSummary: "Sent audio to user."
+    )
+  }
+}
+
+func handleReplyVideo(state: AgentState, payload: String) -> String {
+  runReplyTool(
+    state: state, payload: payload,
+    invalidArgsMessage: "reply_video requires reply_token and video_url"
+  ) { (args: ReplyVideoArgs, token, binding) in
+    return ReplyAction(
+      action: {
+        telegramSendMediaByURL(
+          token: token, method: "sendVideo", mediaField: "video",
+          chatId: binding.chatId, mediaURL: args.video_url,
+          caption: args.caption, replyToMessageId: args.reply_to_message_id)
+      },
+      successMarksReplied: true,
+      successSummary: "Sent video to user."
     )
   }
 }
@@ -108,7 +283,6 @@ func handleArtifactShare(state: AgentState, payload: String) -> String {
   state.log(.debug, "artifact-share: received payload_size=\(payload.count)")
 
   guard let artifact = parseJSON(payload, as: ArtifactPayload.self) else {
-    // Truncate so a giant payload doesn't blow up Insights.
     let preview = String(payload.prefix(512))
     return artifactSkip(state, reason: "bad_payload", level: .warn, detail: "raw=\(preview)")
   }
@@ -217,7 +391,7 @@ private func artifactSkip(
 
 // MARK: - Shared reply pipeline
 //
-// All three tools share the same shape:
+// Every reply tool follows the same shape:
 //   1. parse args
 //   2. validate the binding (token expiry / blocked chat / agent ownership)
 //   3. require a configured bot token
@@ -237,7 +411,7 @@ private struct ReplyAction {
 }
 
 /// Captures the parse → validate → send → mark pipeline shared by all
-/// three reply tools.
+/// reply tools.
 private func runReplyTool<Args: Decodable>(
   state: AgentState,
   payload: String,

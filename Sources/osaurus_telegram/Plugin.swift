@@ -47,24 +47,47 @@ private let noAgentInvokeEnvelope = toolEnvelopeError(
 /// Best-effort routing for artifact events fired without a per-agent
 /// frame. The host's file watcher can dispatch `invoke(type: "artifact", ...)`
 /// from a thread that doesn't bind a frame — without this fallback the
-/// user would never receive generated files. We pick the most recent
-/// in-flight dispatch across ALL agents; routing is unambiguous in the
-/// common single-agent case and biases to "the latest task" otherwise.
+/// user would never receive generated files.
+///
+/// Multi-agent safety: we only auto-route when the cross-agent picture
+/// is unambiguous (exactly ONE agent has any in-flight dispatch). With
+/// two or more agents in flight at the same instant, a "latest task
+/// wins" heuristic would silently mis-deliver the file to the wrong
+/// user; we drop with a warn-level log instead so the misroute is
+/// loud and the user just sees nothing rather than the wrong thing.
+/// In the common single-agent install this is exactly the legacy
+/// behaviour.
 private func routeArtifactWithoutFrame(
   ctxPtr: osr_plugin_ctx_t?, payload: String
 ) -> String {
-  guard let ctxPtr,
-    let binding = DatabaseManager.latestActiveDispatchAcrossAgents()
-  else {
+  guard let ctxPtr else {
+    logWarn(
+      "invoke: artifact fired without a per-agent frame AND nil ctx; "
+        + "skipping (payload=\(payload.count) chars)")
+    return #"{"skipped":true,"reason":"no_agent_frame_no_dispatch"}"#
+  }
+  let inFlight = DatabaseManager.inFlightAgentCount()
+  if inFlight == 0 {
     logWarn(
       "invoke: artifact fired without a per-agent frame AND no in-flight dispatch; "
         + "skipping (payload=\(payload.count) chars)")
     return #"{"skipped":true,"reason":"no_agent_frame_no_dispatch"}"#
   }
+  if inFlight > 1 {
+    logWarn(
+      "invoke: artifact fired without a per-agent frame AND multiple agents in flight "
+        + "(count=\(inFlight)); refusing to guess which chat to route to "
+        + "(payload=\(payload.count) chars)")
+    return #"{"skipped":true,"reason":"ambiguous_agent_no_frame"}"#
+  }
+  // Exactly one agent in flight — unambiguous. Pick its latest dispatch.
+  guard let binding = DatabaseManager.latestActiveDispatchAcrossAgents() else {
+    return #"{"skipped":true,"reason":"no_agent_frame_no_dispatch"}"#
+  }
   let registry = Unmanaged<PluginContext>.fromOpaque(ctxPtr).takeUnretainedValue()
   let state = registry.state(for: binding.agentId)
   logInfo(
-    "invoke: artifact fallback (no per-agent frame) "
+    "invoke: artifact fallback (no per-agent frame, single in-flight agent) "
       + "routing via DB agent=\(binding.agentId) chat=\(binding.chatId) "
       + "task=\(binding.taskId)")
   return handleArtifactShare(state: state, payload: payload)
@@ -201,6 +224,10 @@ private func handleInvoke(
   case "reply": return handleReply(state: state, payload: payload)
   case "reply_typing": return handleReplyTyping(state: state, payload: payload)
   case "reply_photo": return handleReplyPhoto(state: state, payload: payload)
+  case "reply_document": return handleReplyDocument(state: state, payload: payload)
+  case "reply_voice": return handleReplyVoice(state: state, payload: payload)
+  case "reply_audio": return handleReplyAudio(state: state, payload: payload)
+  case "reply_video": return handleReplyVideo(state: state, payload: payload)
   default:
     logWarn("invoke: unknown tool '\(id)'")
     return toolEnvelopeError("unknown_tool", "Unknown tool: \(id)")

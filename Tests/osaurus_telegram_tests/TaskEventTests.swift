@@ -446,7 +446,8 @@ final class TaskEventTests: XCTestCase {
   func testCompletedWithClarifyEnvelopePostsFallback() {
     seedBinding(taskId: "task-clarify-envelope", chatId: 3_000, incomingMessageId: 42)
 
-    let envelope = #"{\"ok\":true,\"result\":{\"text\":\"Awaiting user response.\"},\"tool\":\"clarify\"}"#
+    let envelope =
+      #"{\"ok\":true,\"result\":{\"text\":\"Awaiting user response.\"},\"tool\":\"clarify\"}"#
     let event = "{\"output\":\"\(envelope)\",\"success\":true}"
     handleTaskEvent(
       state: state, agentId: agentId,
@@ -567,7 +568,8 @@ final class TaskEventTests: XCTestCase {
     // Trailing COMPLETED whose `output` is the legacy clarify tool
     // envelope — this is exactly the JSON that leaked to users before
     // the fix.
-    let bogus = #"{\"ok\":true,\"result\":{\"text\":\"Awaiting user response.\"},\"tool\":\"clarify\"}"#
+    let bogus =
+      #"{\"ok\":true,\"result\":{\"text\":\"Awaiting user response.\"},\"tool\":\"clarify\"}"#
     handleTaskEvent(
       state: state, agentId: agentId,
       taskId: "task-clarify-then-complete", eventType: 4,
