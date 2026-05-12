@@ -196,6 +196,56 @@ func listActiveTasks() -> String? {
   callHostString(hostAPI?.pointee.list_active_tasks)
 }
 
+// MARK: - Host file read
+
+/// Decoded result of `readHostFile`: raw bytes plus the host's MIME guess.
+struct HostFileResult {
+  let data: Data
+  let mimeType: String
+}
+
+enum HostFileError: Error, CustomStringConvertible {
+  case unavailable
+  case readFailed(String)
+
+  var description: String {
+    switch self {
+    case .unavailable: return "file_read host capability unavailable"
+    case .readFailed(let msg): return "file_read failed: \(msg)"
+    }
+  }
+}
+
+/// Reads a file via `host->file_read`. The host returns a JSON envelope
+/// with base64 `data` and a `mime_type` hint; we decode and surface both
+/// to the caller. Used by `handleArtifactShare` (the auto-forward hook)
+/// to grab sandbox-generated artifacts (`~/.osaurus/artifacts/...`)
+/// before forwarding them to Telegram as multipart uploads.
+func readHostFile(path: String) -> Result<HostFileResult, HostFileError> {
+  guard let fileRead = hostAPI?.pointee.file_read else {
+    return .failure(.unavailable)
+  }
+  guard let req = makeJSONString(["path": path]) else {
+    return .failure(.readFailed("internal: request serialize failed"))
+  }
+  guard let responseStr = callHostString(fileRead, req) else {
+    return .failure(.readFailed("no response from file_read"))
+  }
+  guard let envelope = parseJSONObject(responseStr) else {
+    return .failure(.readFailed("malformed file_read response"))
+  }
+  if let error = envelope["error"] as? String {
+    return .failure(.readFailed(error))
+  }
+  guard let base64 = envelope["data"] as? String,
+    let bytes = Data(base64Encoded: base64)
+  else {
+    return .failure(.readFailed("missing or invalid base64 data"))
+  }
+  let mimeType = envelope["mime_type"] as? String ?? "application/octet-stream"
+  return .success(HostFileResult(data: bytes, mimeType: mimeType))
+}
+
 // MARK: - Active Agent (ABI v4)
 
 /// Returns the UUID of the agent whose callback frame we're currently inside,

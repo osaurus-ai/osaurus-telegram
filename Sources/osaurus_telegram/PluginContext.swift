@@ -28,8 +28,70 @@ final class AgentState: @unchecked Sendable {
   private let hydrationLock = NSLock()
   private var didHydrate = false
 
+  /// Per-agent set of `host_path`s that the plugin has already uploaded to
+  /// Telegram for this agent. Idempotency for the artifact auto-forward
+  /// hook: if the host fires `invoke(type: "artifact")` twice for the same
+  /// `host_path` (e.g. file watcher re-fires), the second call short-
+  /// circuits. Bounded by plugin process lifetime; in practice an agent
+  /// only emits a handful of artifacts per session.
+  private let artifactLock = NSLock()
+  private var uploadedArtifactPaths: Set<String> = []
+
+  /// Per-task cache of the agent's most recent streamed text output.
+  /// Populated from `OUTPUT` task events (event type 7), which carry the
+  /// agent's running prose throttled to 1/sec. Used as the safety-net
+  /// source when COMPLETED arrives but the agent never called `reply` —
+  /// preferred over COMPLETED's own `output` field because the host
+  /// sometimes fires multiple COMPLETED events per task and the first one
+  /// can carry interim text like `"No response needed."` that races the
+  /// real answer.
+  ///
+  /// Cleared when `clearOutput(taskId:)` is called from the safety-net
+  /// path after `markReplied`, so the cache doesn't grow unbounded.
+  private let outputLock = NSLock()
+  private var latestOutputByTask: [String: String] = [:]
+
   init(agentId: String) {
     self.agentId = agentId
+  }
+
+  /// Atomically inserts `path` into the per-agent uploaded set.
+  /// Returns `true` if the path was already uploaded (caller should skip),
+  /// `false` on first claim (caller should proceed with the upload).
+  func claimArtifactUpload(_ path: String) -> Bool {
+    artifactLock.lock()
+    defer { artifactLock.unlock() }
+    if uploadedArtifactPaths.contains(path) { return true }
+    uploadedArtifactPaths.insert(path)
+    return false
+  }
+
+  /// Stash the latest streamed text for `taskId`. Each call overwrites the
+  /// previous entry — OUTPUT events carry cumulative content, so the most
+  /// recent one is the most accurate snapshot of what the agent has said.
+  /// No-op for empty strings to avoid blanking out a previously-good cache
+  /// when the host fires a stray empty event.
+  func recordOutput(taskId: String, text: String) {
+    guard !text.isEmpty else { return }
+    outputLock.lock()
+    defer { outputLock.unlock() }
+    latestOutputByTask[taskId] = text
+  }
+
+  /// Returns the most recently recorded streamed text for `taskId`, or nil
+  /// if nothing was ever stashed.
+  func latestOutput(taskId: String) -> String? {
+    outputLock.lock()
+    defer { outputLock.unlock() }
+    return latestOutputByTask[taskId]
+  }
+
+  /// Drop the cached entry for `taskId`. Called from the safety-net path
+  /// after `markReplied` so the cache mirrors the active-dispatch lifetime.
+  func clearOutput(taskId: String) {
+    outputLock.lock()
+    defer { outputLock.unlock() }
+    latestOutputByTask.removeValue(forKey: taskId)
   }
 
   /// Runs `body` exactly once across all callers. Subsequent calls are

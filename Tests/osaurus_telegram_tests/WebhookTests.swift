@@ -196,6 +196,17 @@ final class WebhookTests: XCTestCase {
     let expected = sessionUUID(forChatId: 555, salt: chat.sessionSalt).uuidString
     XCTAssertEqual(sessionId, expected, "session id must be deterministic UUID5")
 
+    // external_session_key is the canonical re-attachment key the host
+    // uses to find an existing session by (plugin_id, key, agent_id).
+    // Without it every webhook delivery starts a fresh session and a
+    // follow-up message (e.g. answer to a clarification question)
+    // lands without prior context.
+    let externalKey = try XCTUnwrap(dispatch["external_session_key"] as? String)
+    XCTAssertEqual(
+      externalKey,
+      externalSessionKey(chatId: 555, salt: chat.sessionSalt),
+      "external_session_key must be derived from (chat_id, salt) so it survives reattachment")
+
     // The dispatch must explicitly request our reply tools on the
     // host's v3+ `tools` field. Without this, an agent with manual
     // tool selection would receive the user's message but have no way
@@ -232,6 +243,40 @@ final class WebhookTests: XCTestCase {
     let s1 = TestHostGlobals.dispatchCalls[0]["session_id"] as? String
     let s2 = TestHostGlobals.dispatchCalls[1]["session_id"] as? String
     XCTAssertEqual(s1, s2, "same chat must reattach to the same session")
+
+    // external_session_key must also be stable — it's what the host
+    // actually uses to look up the existing session row. This is the
+    // missing piece that made clarification follow-ups land in a
+    // brand-new session with no prior context.
+    let k1 = TestHostGlobals.dispatchCalls[0]["external_session_key"] as? String
+    let k2 = TestHostGlobals.dispatchCalls[1]["external_session_key"] as? String
+    XCTAssertEqual(k1, k2, "same chat must reuse the same external_session_key")
+    XCTAssertNotNil(k1)
+  }
+
+  /// `/reset` is supposed to start a fresh conversation. We bump the
+  /// chat's salt; the salt is part of `external_session_key`, so the
+  /// post-reset dispatch must NOT reattach to the pre-reset session.
+  func testWebhookExternalSessionKeyChangesAfterReset() throws {
+    let chatId: Int64 = 888
+
+    _ = route(webhookRequest(
+      secret: secret, update: textUpdate(updateId: 500, chatId: chatId, text: "first")))
+
+    _ = route(webhookRequest(
+      secret: secret, update: textUpdate(updateId: 501, chatId: chatId, text: "/reset")))
+
+    TestHostGlobals.nextDispatchResponse =
+      #"{"id":"task-after-reset","status":"running"}"#
+    _ = route(webhookRequest(
+      secret: secret, update: textUpdate(updateId: 502, chatId: chatId, text: "second")))
+
+    XCTAssertEqual(TestHostGlobals.dispatchCalls.count, 2, "/reset must not dispatch")
+    let preReset = TestHostGlobals.dispatchCalls[0]["external_session_key"] as? String
+    let postReset = TestHostGlobals.dispatchCalls[1]["external_session_key"] as? String
+    XCTAssertNotEqual(
+      preReset, postReset,
+      "/reset must bump the salt so post-reset traffic lands in a new session")
   }
 
   func testWebhookDeduplicatesByUpdateId() {
@@ -499,6 +544,74 @@ final class WebhookTests: XCTestCase {
   }
 
   // MARK: - prompt header includes minted token
+
+  // MARK: - loading-eye reaction
+
+  /// After a successful dispatch the plugin reacts on the user's incoming
+  /// message with the loading 👀 so the user sees "I'm working on it"
+  /// without waiting for the agent's first reply. The reaction targets
+  /// the same message_id that arrived in the webhook update, scoped to
+  /// the same chat.
+  func testWebhookFiresLoadingEyeReactionOnIncomingMessage() throws {
+    var update = textUpdate(updateId: 2_000, chatId: 2_000, text: "hi")
+    // Override message_id so we can pin the reaction targets it precisely.
+    var msg = update["message"] as! [String: Any]
+    msg["message_id"] = 4_242
+    update["message"] = msg
+
+    let req = webhookRequest(secret: secret, update: update)
+    _ = route(req)
+
+    let reactionCalls = TestHostGlobals.httpCalls.filter {
+      ($0["url"] as? String ?? "").contains("/setMessageReaction")
+    }
+    XCTAssertEqual(
+      reactionCalls.count, 1,
+      "exactly one setMessageReaction must fire after a successful dispatch")
+
+    let body = reactionCalls[0]["body"] as? String ?? ""
+    let bodyObj =
+      (try? JSONSerialization.jsonObject(with: Data(body.utf8))) as? [String: Any] ?? [:]
+    XCTAssertEqual(bodyObj["chat_id"] as? Int, 2_000)
+    XCTAssertEqual(bodyObj["message_id"] as? Int, 4_242)
+    let reaction = bodyObj["reaction"] as? [[String: Any]] ?? []
+    XCTAssertEqual(reaction.count, 1)
+    XCTAssertEqual(reaction.first?["type"] as? String, "emoji")
+    XCTAssertEqual(reaction.first?["emoji"] as? String, loadingReactionEmoji)
+  }
+
+  /// Rate-limit errors short-circuit before we'd fire the eye. We only
+  /// post the apology meta-message; nothing should be reacted to (the
+  /// row is unwound, so a later "clear" can't address anything either).
+  func testRateLimitDoesNotFireLoadingEye() {
+    TestHostGlobals.nextDispatchResponse = #"{"error":"rate_limit_exceeded"}"#
+    let req = webhookRequest(
+      secret: secret, update: textUpdate(updateId: 2_100, chatId: 2_100, text: "hi"))
+    _ = route(req)
+
+    XCTAssertTrue(
+      TestHostGlobals.httpCalls.allSatisfy {
+        !(($0["url"] as? String ?? "").contains("/setMessageReaction"))
+      },
+      "no setMessageReaction must fire when dispatch never started")
+  }
+
+  /// The webhook stores `incoming_message_id` so `clearLoadingReaction`
+  /// and the safety net know which message to clear later.
+  func testIncomingMessageIdPersistedOnActiveDispatch() throws {
+    var update = textUpdate(updateId: 2_200, chatId: 2_200, text: "ping")
+    var msg = update["message"] as! [String: Any]
+    msg["message_id"] = 7_777
+    update["message"] = msg
+    _ = route(webhookRequest(secret: secret, update: update))
+
+    let active = try XCTUnwrap(
+      DatabaseManager.activeDispatch(agentId: agentId, forChat: 2_200))
+    XCTAssertEqual(
+      active.incomingMessageId, 7_777,
+      "the user's message_id must be preserved on the binding so the eye "
+        + "can be cleared on first reply")
+  }
 
   func testPromptHeaderIncludesMintedReplyToken() throws {
     let req = webhookRequest(

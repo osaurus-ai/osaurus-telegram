@@ -9,10 +9,17 @@ import Foundation
 // user's message but have no way to respond.
 //
 // MUST stay in sync with the manifest's `capabilities.tools[].id`
-// values. `ManifestTests.testToolsListIsExactlyReplyReplyTypingReplyPhoto`
-// pins the manifest side; `WebhookTests.testWebhookDispatchesValidTextMessage`
+// values. `ManifestTests.testToolsListIsExactlyTheReplySurface` pins the
+// manifest side; `WebhookTests.testWebhookDispatchesValidTextMessage`
 // pins this set on the dispatch payload.
 let dispatchToolNames: [String] = ["reply", "reply_typing", "reply_photo"]
+
+/// Emoji used for the loading-eye reaction set on incoming user messages
+/// while a dispatch is in flight. Cleared by the first content-bearing
+/// reply (`reply` / `reply_photo`), by the artifact auto-forward hook,
+/// or by the terminal safety net. Pinned here so tests can compare
+/// against a single source.
+let loadingReactionEmoji = "\u{1F440}"
 
 // MARK: - Route Handler
 
@@ -73,6 +80,7 @@ private func handleWebhook(state: AgentState, agentId: String, req: RouteRequest
   }
 
   let chatId = message.chat.id
+  let incomingMessageId = message.message_id
 
   // 3. Idempotency: drop duplicate Telegram retries.
   if DatabaseManager.isUpdateAlreadySeen(agentId: agentId, updateId: update.update_id) {
@@ -128,7 +136,7 @@ private func handleWebhook(state: AgentState, agentId: String, req: RouteRequest
     taskId: pendingTaskId(for: replyToken),
     agentId: agentId, chatId: chatId,
     replyToken: replyToken, sessionId: session.uuidString,
-    expiresAt: expiresAt)
+    expiresAt: expiresAt, incomingMessageId: incomingMessageId)
 
   // 8. Soft-stop the previous in-flight task for this chat (if any) so
   //    the host doesn't keep burning tokens on an answer the user has
@@ -150,14 +158,20 @@ private func handleWebhook(state: AgentState, agentId: String, req: RouteRequest
   }
 
   // 9. Dispatch. Fire and forget — the agent will call our reply tools.
-  //    `tools` (v3+) explicitly requests the reply surface so an agent
-  //    with manual tool selection still has it loaded. `session_id` is
-  //    a deterministic UUID5 per chat; the host uses it as the external
-  //    grouping key so repeated turns reattach to the same session row.
+  //    - `tools` (v3+) explicitly requests the reply surface so an agent
+  //      with manual tool selection still has it loaded.
+  //    - `external_session_key` is the canonical re-attachment key on
+  //      v4+ hosts (see `externalSessionKey` for the salt rationale).
+  //      Without it the agent loses context across turns — e.g. a
+  //      follow-up after a clarification has no idea what was asked.
+  //    - `session_id` is the legacy UUID5 path; kept for backwards
+  //      compatibility and stays in sync with `external_session_key` so
+  //      either lookup resolves to the same logical conversation.
   let dispatchPayload: [String: Any] = [
     "prompt": prompt,
     "title": "Telegram \(displayName)",
     "session_id": session.uuidString,
+    "external_session_key": externalSessionKey(chatId: chatId, salt: chat.sessionSalt),
     "tools": dispatchToolNames,
   ]
   guard let dispatchJSON = makeJSONString(dispatchPayload) else {
@@ -200,6 +214,16 @@ private func handleWebhook(state: AgentState, agentId: String, req: RouteRequest
   DatabaseManager.updateTaskId(replyToken: replyToken, newTaskId: taskId)
   logInfo("Dispatched task \(taskId) for chat \(chatId) (token=\(replyToken))")
 
+  // 11. Loading-eye: react with 👀 on the user's message so they see
+  //     "I'm working on it" within a heartbeat. The reaction is best-
+  //     effort (older Telegram clients ignore it; some chat types
+  //     refuse it) — failures are non-fatal and only logged.
+  if let token = state.botToken {
+    _ = telegramSetMessageReaction(
+      token: token, chatId: chatId, messageId: incomingMessageId,
+      emoji: loadingReactionEmoji)
+  }
+
   return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
 }
 
@@ -208,6 +232,15 @@ private func handleWebhook(state: AgentState, agentId: String, req: RouteRequest
 /// prefix is a debugging marker for rows that lost the dispatch race.
 func pendingTaskId(for replyToken: String) -> String {
   "_pending_\(replyToken)"
+}
+
+/// Builds the host's session-re-attachment key for a Telegram chat. The
+/// salt is bumped on `/reset`, so /reset cleanly partitions before and
+/// after into separate sessions even though the chat_id is unchanged.
+/// Format is intentionally human-readable so it shows up legibly in
+/// host-side traces.
+func externalSessionKey(chatId: Int64, salt: Int) -> String {
+  "telegram:chat-\(chatId):salt-\(salt)"
 }
 
 // MARK: - reset commands

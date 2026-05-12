@@ -5,14 +5,21 @@ Conversational Telegram bot for Osaurus. Each Telegram chat becomes a continuous
 ## How it works
 
 ```
-User → Telegram → /webhook  (verify secret, dedup update_id, mint reply_token, dispatch)
+User → Telegram → /webhook  (verify secret, dedup update_id, mint reply_token,
+                              dispatch, react 👀 on the user's message)
                      ↓
                   Agent (background dispatch with deterministic session_id)
                      ↓
                   reply / reply_typing / reply_photo  →  Telegram → User
+                     ↓
+                  (👀 cleared on the first content-bearing reply)
 ```
 
-The plugin is **agent-driven end-to-end**. Every user-visible message flows through tools the agent calls; `handle_route` only verifies the request and starts the run. Multi-message replies, status updates, and rich content all happen because the agent calls `reply` (or `reply_typing` / `reply_photo`) one or more times in a single run.
+The plugin is **agent-driven end-to-end**. Every user-visible message flows through tools the agent calls; `handle_route` only verifies the request and starts the run. Multi-message replies, status updates, and rich content all happen because the agent calls `reply` (or `reply_typing` / `reply_photo`) one or more times in a single run. Files the agent writes into the sandbox are auto-forwarded to the user by the plugin via the host's `invoke(type: "artifact")` hook — there's no agent-facing tool for sandbox attachments.
+
+The plugin's only piece of plugin-owned UI is the loading-eye reaction: as soon as the dispatch is in flight, we react with 👀 on the user's incoming message so they see "I'm working on it" within a heartbeat. The reaction is cleared by the first content-bearing reply (or by the safety net if the agent never replies).
+
+When the agent uses the host's clarify tool, the host fires a `CLARIFICATION` task event (`{"question":"…","options":[…],"allow_multiple":…}`) and suppresses the trailing `COMPLETED` for the pause. The plugin surfaces the question as a Telegram message — question first, then options as a numbered list (`1. …`, `2. …`) so the user can reply by index, and an optional "(reply with one)" / "(reply with one or more)" hint when `allow_multiple` is specified — marks the turn replied so the safety net stays silent, and clears the 👀. The same `(task_id, reply_token)` binding is retained so the paused task can `reply` once it resumes; the user's next chat message lands on the same `external_session_key` and continues the conversation naturally.
 
 ### Why reply tokens
 
@@ -26,24 +33,24 @@ To make the reply contract race-free, the plugin pre-inserts the row in `active_
 
 ## Tools (called by the agent)
 
-| Tool | Description |
-| --- | --- |
-| `reply` | Send a text message. May be called multiple times per run. |
-| `reply_typing` | Show the Telegram "typing…" indicator (~5s). |
-| `reply_photo` | Send a photo by public URL with optional caption. |
+| Tool           | Description                                                                                                                                                            |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `reply`        | Send a text message. May be called multiple times per run.                                                                                                             |
+| `reply_typing` | Show the Telegram "typing…" indicator (~5s).                                                                                                                           |
+| `reply_photo`  | Send a photo by public URL with optional caption.                                                                                                                      |
 
-All three take a `reply_token` (passed verbatim from the user-message header) plus their own arguments.
+All three take a `reply_token` (passed verbatim from the user-message header) plus their own arguments. Sandbox-generated files (images, PDFs, transcripts, etc.) are auto-forwarded by the plugin via the host's `invoke(type: "artifact")` hook — the agent doesn't need a tool call for them.
 
 ## Routes
 
-| Route | Method | Auth | Notes |
-| --- | --- | --- | --- |
-| `/webhook` | POST | `verify` | Telegram delivery endpoint. `tunnel_exposed: true` so it's reachable from Telegram. The plugin still verifies the `X-Telegram-Bot-Api-Secret-Token` header in constant time. |
+| Route      | Method | Auth     | Notes                                                                                                                                                                        |
+| ---------- | ------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/webhook` | POST   | `verify` | Telegram delivery endpoint. `tunnel_exposed: true` so it's reachable from Telegram. The plugin still verifies the `X-Telegram-Bot-Api-Secret-Token` header in constant time. |
 
 ## Bot commands
 
-| Command | Description |
-| --- | --- |
+| Command                                | Description                                                                                                                                                                                                                                           |
+| -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `/clear`, `/reset`, `/new`, `/restart` | All aliases for the same action: bump the chat's session salt and cancel any in-flight task. The next message lands in a fresh transcript. Match is case-insensitive and tolerates Telegram's `@botname` suffix in group chats (e.g. `/clear@MyBot`). |
 
 ## Setup
@@ -93,26 +100,30 @@ If the host is older than ABI v4 (`get_active_agent_id` unavailable), per-agent 
 
 ## Plugin-owned vs agent-owned messages
 
-| Message | Sent by |
-| --- | --- |
-| Conversational reply | Agent (`reply` tool) |
-| Typing indicator | Agent (`reply_typing` tool) |
-| Photo | Agent (`reply_photo` tool) |
-| Rate-limit apology | Plugin (`handle_route`) |
-| `/clear` (and aliases) confirmation | Plugin (`handle_route`) |
-| Safety-net "(done)" / "Sorry, something went wrong" | Plugin (`on_task_event`, only if the agent never called `reply`) |
+| Message                                             | Sent by                                                                                          |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| Conversational reply                                | Agent (`reply` tool)                                                                             |
+| Typing indicator                                    | Agent (`reply_typing` tool)                                                                      |
+| Photo (public URL)                                  | Agent (`reply_photo` tool)                                                                       |
+| File / image attachment (auto-forwarded artifact)   | Plugin (`invoke(type: "artifact")` hook, multipart upload via `host->file_read`; routed to the agent's most recent in-flight chat, deduped per `host_path`) |
+| Loading 👀 reaction set on the user's message       | Plugin (`handle_route`, after dispatch succeeds)                                                 |
+| Loading 👀 reaction cleared                         | Plugin (`Tools.swift` on first content-bearing reply, or `on_task_event` safety net)             |
+| Clarification question (host CLARIFICATION event)   | Plugin (`on_task_event`, posts `question` + numbered `options` + optional `allow_multiple` hint; marks turn replied) |
+| Rate-limit apology                                  | Plugin (`handle_route`)                                                                          |
+| `/clear` (and aliases) confirmation                 | Plugin (`handle_route`)                                                                          |
+| Safety-net "(done)" / "Sorry, something went wrong" | Plugin (`on_task_event`, only if the agent never called `reply`)                                 |
 
-The agent owns content; the plugin owns meta-messages. Plugin-owned posts should be rare in healthy runs.
+The agent owns content; the plugin owns meta-messages and the single 👀 loading indicator. Plugin-owned posts should be rare in healthy runs.
 
 ## Configuration
 
 All keys live in the per-agent (`plugin_id, agent_id`) Keychain scope. You only ever set `bot_token`; everything else is automatic.
 
-| Key | Type | Notes |
-| --- | --- | --- |
-| `bot_token` | secret (user-set) | Telegram bot token from [@BotFather](https://t.me/BotFather). Required. |
-| `webhook_secret` | secret (auto-generated) | 32-byte hex string created on first run. Sent back by Telegram in `X-Telegram-Bot-Api-Secret-Token` and verified in constant time on every webhook delivery. |
-| `tunnel_url` | host-managed | Pushed to the plugin by Osaurus when the agent's tunnel is up. The `webhook_url` field in the plugin's config (templated as `{{plugin_url}}/webhook`) is what tells Osaurus this plugin needs the resolved URL. |
+| Key                  | Type                            | Notes                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| -------------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `bot_token`          | secret (user-set)               | Telegram bot token from [@BotFather](https://t.me/BotFather). Required.                                                                                                                                                                                                                                                                                                                                                  |
+| `webhook_secret`     | secret (auto-generated)         | 32-byte hex string created on first run. Sent back by Telegram in `X-Telegram-Bot-Api-Secret-Token` and verified in constant time on every webhook delivery.                                                                                                                                                                                                                                                             |
+| `tunnel_url`         | host-managed                    | Pushed to the plugin by Osaurus when the agent's tunnel is up. The `webhook_url` field in the plugin's config (templated as `{{plugin_url}}/webhook`) is what tells Osaurus this plugin needs the resolved URL.                                                                                                                                                                                                          |
 | `webhook_registered` | host-managed (status indicator) | Set to `"true"` only after Telegram itself confirms (via `getWebhookInfo`) that our URL is registered AND there's no recent delivery error. Cleared eagerly at the start of any state change that invalidates the previous registration (bot-token swap, tunnel URL change, teardown). The plugin's `webhook_status` config field (`connected_when: "webhook_registered"`) reads this to drive the green/grey indicator. |
 
 ### What "Webhook: connected" means

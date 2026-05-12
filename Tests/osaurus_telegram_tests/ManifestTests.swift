@@ -18,7 +18,7 @@ final class ManifestTests: XCTestCase {
     let m = try parsed()
     XCTAssertEqual(m["plugin_id"] as? String, "osaurus.telegram")
     XCTAssertEqual(m["name"] as? String, "Telegram")
-    XCTAssertEqual(m["version"] as? String, "1.6.0")
+    XCTAssertEqual(m["version"] as? String, "1.5.0")
     XCTAssertEqual(m["license"] as? String, "MIT")
     XCTAssertNotNil(m["description"] as? String)
     XCTAssertNotNil(m["instructions"] as? String)
@@ -45,12 +45,48 @@ final class ManifestTests: XCTestCase {
     XCTAssertEqual(webhook["methods"] as? [String], ["POST"])
   }
 
-  func testToolsListIsExactlyReplyReplyTypingReplyPhoto() throws {
+  func testToolsListIsExactlyTheReplySurface() throws {
     let m = try parsed()
     let caps = try XCTUnwrap(m["capabilities"] as? [String: Any])
     let tools = try XCTUnwrap(caps["tools"] as? [[String: Any]])
     let ids = tools.compactMap { $0["id"] as? String }
-    XCTAssertEqual(Set(ids), Set(["reply", "reply_typing", "reply_photo"]))
+    XCTAssertEqual(
+      Set(ids),
+      Set(["reply", "reply_typing", "reply_photo"]),
+      "manifest tools list must mirror dispatchToolNames; "
+        + "files reach the user via the artifact auto-forward hook, "
+        + "not a tool")
+  }
+
+  /// Telegram has no native clarification UI, so the host `clarify` tool
+  /// lands silently for our users. The agent must be told explicitly to
+  /// use `reply` for any clarifying question instead — otherwise the
+  /// turn ends with the user staring at the safety-net fallback.
+  func testInstructionsForbidClarifyTool() throws {
+    let m = try parsed()
+    let instructions = try XCTUnwrap(m["instructions"] as? String)
+    XCTAssertTrue(
+      instructions.contains("clarify"),
+      "instructions must explicitly address the clarify tool so the agent doesn't call it")
+    XCTAssertTrue(
+      instructions.lowercased().contains("do not call the `clarify`")
+        || instructions.lowercased().contains("not call the `clarify`"),
+      "instructions must forbid the clarify tool by name")
+  }
+
+  /// The agent only ever has the sandbox path of the files it generates
+  /// (host->file_read is restricted to ~/.osaurus/artifacts/), so the
+  /// instructions must teach that the host auto-forwards files instead
+  /// of pointing the agent at a tool that wouldn't work.
+  func testInstructionsExplainArtifactAutoForward() throws {
+    let m = try parsed()
+    let instructions = try XCTUnwrap(m["instructions"] as? String)
+    XCTAssertTrue(
+      instructions.contains("auto-forwarded"),
+      "instructions must explain that files are auto-forwarded by the host")
+    XCTAssertFalse(
+      instructions.contains("reply_file"),
+      "reply_file is gone; instructions must not advertise it")
   }
 
   func testEachToolHasReplyTokenParameter() throws {
@@ -112,11 +148,20 @@ final class ManifestTests: XCTestCase {
     XCTAssertEqual(field["connected_when"] as? String, "webhook_registered")
   }
 
-  func testNoLegacyArtifactHandlerOrSettingsSections() throws {
+  func testManifestDeclaresArtifactHandler() throws {
     let m = try parsed()
     let caps = try XCTUnwrap(m["capabilities"] as? [String: Any])
-    XCTAssertNil(caps["artifact_handler"], "artifact_handler must be removed")
+    // Without this flag the host won't fire invoke(type: "artifact"), so
+    // sandbox files would never auto-forward to Telegram even though the
+    // hook is implemented.
+    XCTAssertEqual(
+      caps["artifact_handler"] as? Bool, true,
+      "artifact_handler must be true so host fires invoke(type: artifact)")
+  }
 
+  func testOnlyBotConfigurationSectionRemains() throws {
+    let m = try parsed()
+    let caps = try XCTUnwrap(m["capabilities"] as? [String: Any])
     // Only the Bot Configuration section should remain; the agent / file /
     // behavior / prompt-customisation sections were intentionally dropped
     // by the rewrite.

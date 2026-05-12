@@ -193,6 +193,73 @@ final class DatabaseTests: XCTestCase {
       "sibling rows for the same chat must be unaffected")
   }
 
+  /// The artifact auto-forward hook resolves "which chat?" via this
+  /// selector — and unlike `activeDispatch(forChat:)`, it must reach
+  /// across chats and pick the most recently dispatched row for the
+  /// agent. Two dispatches in different chats; the latter must win.
+  func testLatestActiveDispatchReturnsMostRecentAcrossChats() {
+    _ = DatabaseManager.upsertChatSession(agentId: agentId, chatId: 40)
+    _ = DatabaseManager.upsertChatSession(agentId: agentId, chatId: 41)
+    let now = Int(Date().timeIntervalSince1970)
+    DatabaseManager.insertActiveDispatch(
+      taskId: "first", agentId: agentId, chatId: 40, replyToken: "TOK_FIRST",
+      sessionId: "s", expiresAt: now + 600)
+    Thread.sleep(forTimeInterval: 0.002)
+    DatabaseManager.insertActiveDispatch(
+      taskId: "second", agentId: agentId, chatId: 41, replyToken: "TOK_SECOND",
+      sessionId: "s", expiresAt: now + 600)
+
+    let latest = DatabaseManager.latestActiveDispatch(agentId: agentId)
+    XCTAssertEqual(
+      latest?.taskId, "second",
+      "the artifact hook must route to the most recent in-flight chat")
+    XCTAssertEqual(latest?.chatId, 41)
+  }
+
+  /// When the agent has no in-flight turns at all, the artifact hook
+  /// must skip cleanly rather than uploading to a stale chat.
+  func testLatestActiveDispatchReturnsNilWhenAgentHasNoneInFlight() {
+    XCTAssertNil(DatabaseManager.latestActiveDispatch(agentId: agentId))
+
+    // A row for a different agent must not leak through.
+    _ = DatabaseManager.upsertChatSession(agentId: "agent-other", chatId: 50)
+    DatabaseManager.insertActiveDispatch(
+      taskId: "other-task", agentId: "agent-other", chatId: 50,
+      replyToken: "TOK_OTHER_AGENT", sessionId: "s",
+      expiresAt: Int(Date().timeIntervalSince1970) + 600)
+    XCTAssertNil(
+      DatabaseManager.latestActiveDispatch(agentId: agentId),
+      "another agent's in-flight row must not be visible to this agent")
+  }
+
+  /// `latestActiveDispatchAcrossAgents` is the no-frame fallback for the
+  /// artifact auto-forward hook. Two agents in flight, the most recent
+  /// must win — that's the only useful heuristic when the host fires
+  /// `invoke(type: "artifact")` outside any per-agent frame.
+  func testLatestActiveDispatchAcrossAgentsReturnsMostRecent() {
+    _ = DatabaseManager.upsertChatSession(agentId: "agent-a", chatId: 60)
+    _ = DatabaseManager.upsertChatSession(agentId: "agent-b", chatId: 61)
+    let now = Int(Date().timeIntervalSince1970)
+    DatabaseManager.insertActiveDispatch(
+      taskId: "older", agentId: "agent-a", chatId: 60, replyToken: "TOK_A",
+      sessionId: "s", expiresAt: now + 600)
+    Thread.sleep(forTimeInterval: 0.002)
+    DatabaseManager.insertActiveDispatch(
+      taskId: "newer", agentId: "agent-b", chatId: 61, replyToken: "TOK_B",
+      sessionId: "s", expiresAt: now + 600)
+
+    let row = DatabaseManager.latestActiveDispatchAcrossAgents()
+    XCTAssertEqual(row?.taskId, "newer")
+    XCTAssertEqual(row?.agentId, "agent-b")
+    XCTAssertEqual(row?.chatId, 61)
+  }
+
+  func testLatestActiveDispatchAcrossAgentsReturnsNilWhenEmpty() {
+    XCTAssertNil(
+      DatabaseManager.latestActiveDispatchAcrossAgents(),
+      "with no in-flight rows the artifact fallback must skip")
+  }
+
   func testAllActiveDispatchesReturnsEveryRowForChat() {
     _ = DatabaseManager.upsertChatSession(agentId: agentId, chatId: 34)
     let now = Int(Date().timeIntervalSince1970)
@@ -304,6 +371,84 @@ final class DatabaseTests: XCTestCase {
 
   // MARK: schema migration
 
+  // MARK: incoming_message_id round-trip + migration
+
+  func testIncomingMessageIdRoundTrips() {
+    _ = DatabaseManager.upsertChatSession(agentId: agentId, chatId: 909)
+    DatabaseManager.insertActiveDispatch(
+      taskId: "task-eye", agentId: agentId, chatId: 909, replyToken: "TOK_EYE",
+      sessionId: "s", expiresAt: Int(Date().timeIntervalSince1970) + 600,
+      incomingMessageId: 42)
+
+    let binding = DatabaseManager.lookupBinding(token: "TOK_EYE")
+    XCTAssertEqual(
+      binding?.incomingMessageId, 42,
+      "incoming_message_id must persist so the safety net + clearer can address it")
+  }
+
+  func testIncomingMessageIdDefaultsToZeroWhenAbsent() {
+    _ = DatabaseManager.upsertChatSession(agentId: agentId, chatId: 910)
+    // Older callers (and most existing test seeds) omit the new arg —
+    // it must default to 0, which our reaction helpers treat as
+    // "no source message recorded; skip the call".
+    DatabaseManager.insertActiveDispatch(
+      taskId: "task-no-eye", agentId: agentId, chatId: 910, replyToken: "TOK_NO_EYE",
+      sessionId: "s", expiresAt: Int(Date().timeIntervalSince1970) + 600)
+    XCTAssertEqual(
+      DatabaseManager.lookupBinding(token: "TOK_NO_EYE")?.incomingMessageId, 0)
+  }
+
+  /// Pre-reaction schema (v3 without `incoming_message_id`) must be
+  /// detected and rebuilt by `initSchema` — the data is transient so
+  /// dropping the row is harmless, but failing to detect would surface
+  /// as "no such column" errors at runtime.
+  func testInitSchemaMigratesPreReactionActiveDispatches() {
+    DatabaseManager.dbExec("DROP TABLE IF EXISTS active_dispatches", params: "[]")
+    DatabaseManager.dbExec(
+      """
+      CREATE TABLE active_dispatches (
+        reply_token    TEXT PRIMARY KEY,
+        task_id        TEXT NOT NULL,
+        agent_id       TEXT NOT NULL,
+        chat_id        INTEGER NOT NULL,
+        session_id     TEXT NOT NULL,
+        started_at     INTEGER NOT NULL,
+        expires_at     INTEGER NOT NULL,
+        has_replied    INTEGER NOT NULL DEFAULT 0
+      )
+      """, params: "[]")
+    DatabaseManager.dbExec(
+      """
+      INSERT INTO active_dispatches
+        (task_id, agent_id, chat_id, reply_token, session_id, started_at, expires_at)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+      """,
+      params: DatabaseManager.serializeParams(
+        [
+          "pre-reaction", agentId, 911, "PRE_REACT", "s",
+          Int(Date().timeIntervalSince1970),
+          Int(Date().timeIntervalSince1970) + 600,
+        ]))
+    // Sanity check that the row landed using a column-agnostic count
+    // (we can't use lookupBinding here because its SELECT references
+    // the new incoming_message_id column that doesn't exist yet).
+    XCTAssertEqual(legacyRowCount(token: "PRE_REACT"), 1)
+
+    DatabaseManager.initSchema()
+
+    XCTAssertNil(
+      DatabaseManager.lookupBinding(token: "PRE_REACT"),
+      "pre-reaction row must be dropped during the column-add migration")
+
+    // Schema is now writable with the new column.
+    DatabaseManager.insertActiveDispatch(
+      taskId: "post", agentId: agentId, chatId: 912, replyToken: "POST_REACT",
+      sessionId: "s", expiresAt: Int(Date().timeIntervalSince1970) + 600,
+      incomingMessageId: 7)
+    XCTAssertEqual(
+      DatabaseManager.lookupBinding(token: "POST_REACT")?.incomingMessageId, 7)
+  }
+
   func testInitSchemaMigratesV2ActiveDispatchesToReplyTokenPK() {
     // Stand up the v2 active_dispatches table (task_id PK + UNIQUE(agent_id,
     // chat_id)) directly so we can assert that initSchema() detects the
@@ -336,7 +481,10 @@ final class DatabaseTests: XCTestCase {
           Int(Date().timeIntervalSince1970),
           Int(Date().timeIntervalSince1970) + 600,
         ]))
-    XCTAssertNotNil(DatabaseManager.lookupBinding(token: "LEGACY_TOK"))
+    // Sanity-check insertion via a column-agnostic count; lookupBinding
+    // can't be used here because its SELECT references columns the
+    // legacy schema doesn't have.
+    XCTAssertEqual(legacyRowCount(token: "LEGACY_TOK"), 1)
 
     // Run the migration.
     DatabaseManager.initSchema()
@@ -410,5 +558,22 @@ final class DatabaseTests: XCTestCase {
     // Post-migration the table has the new agent_id column and is writable.
     let row = DatabaseManager.upsertChatSession(agentId: agentId, chatId: 778)
     XCTAssertEqual(row.chatId, 778)
+  }
+
+  // MARK: helpers
+
+  /// Counts rows in `active_dispatches` matching the given reply_token via
+  /// a column-agnostic SQL query. Used by migration tests to verify legacy
+  /// rows landed in the previous schema without going through the
+  /// production accessors (which now SELECT columns the legacy schema
+  /// doesn't have).
+  private func legacyRowCount(token: String) -> Int {
+    let resultStr = DatabaseManager.dbQuery(
+      "SELECT COUNT(*) FROM active_dispatches WHERE reply_token = ?1",
+      params: DatabaseManager.serializeParams([token])) ?? "{}"
+    guard let rows = DatabaseManager.extractRows(resultStr),
+      let row = rows.first, let count = row.first as? Int
+    else { return 0 }
+    return count
   }
 }

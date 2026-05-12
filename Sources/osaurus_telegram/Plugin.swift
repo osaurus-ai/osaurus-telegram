@@ -44,6 +44,32 @@ private let noAgentInvokeEnvelope = toolEnvelopeError(
   "no_agent_context",
   "Plugin invoked outside any per-agent frame. Host must implement ABI v4.")
 
+/// Best-effort routing for artifact events fired without a per-agent
+/// frame. The host's file watcher can dispatch `invoke(type: "artifact", ...)`
+/// from a thread that doesn't bind a frame — without this fallback the
+/// user would never receive generated files. We pick the most recent
+/// in-flight dispatch across ALL agents; routing is unambiguous in the
+/// common single-agent case and biases to "the latest task" otherwise.
+private func routeArtifactWithoutFrame(
+  ctxPtr: osr_plugin_ctx_t?, payload: String
+) -> String {
+  guard let ctxPtr,
+    let binding = DatabaseManager.latestActiveDispatchAcrossAgents()
+  else {
+    logWarn(
+      "invoke: artifact fired without a per-agent frame AND no in-flight dispatch; "
+        + "skipping (payload=\(payload.count) chars)")
+    return #"{"skipped":true,"reason":"no_agent_frame_no_dispatch"}"#
+  }
+  let registry = Unmanaged<PluginContext>.fromOpaque(ctxPtr).takeUnretainedValue()
+  let state = registry.state(for: binding.agentId)
+  logInfo(
+    "invoke: artifact fallback (no per-agent frame) "
+      + "routing via DB agent=\(binding.agentId) chat=\(binding.chatId) "
+      + "task=\(binding.taskId)")
+  return handleArtifactShare(state: state, payload: payload)
+}
+
 private func makeAPI() -> osr_plugin_api {
   var api = osr_plugin_api()
   api.version = 2
@@ -79,15 +105,21 @@ private func makeAPI() -> osr_plugin_api {
       logWarn("invoke called with nil arguments")
       return nil
     }
-    guard let frame = resolveAgentFrame(ctxPtr, caller: "invoke") else {
-      return makeCString(noAgentInvokeEnvelope)
+    let type = String(cString: typePtr)
+    let id = String(cString: idPtr)
+    let payload = String(cString: payloadPtr)
+
+    if let frame = resolveAgentFrame(ctxPtr, caller: "invoke") {
+      return makeCString(
+        handleInvoke(state: frame.state, type: type, id: id, payload: payload))
     }
-    return makeCString(
-      handleInvoke(
-        state: frame.state,
-        type: String(cString: typePtr),
-        id: String(cString: idPtr),
-        payload: String(cString: payloadPtr)))
+
+    // No per-agent frame. Artifact events specifically have a fallback
+    // path (see `routeArtifactWithoutFrame`); everything else is rejected.
+    if type == "artifact" {
+      return makeCString(routeArtifactWithoutFrame(ctxPtr: ctxPtr, payload: payload))
+    }
+    return makeCString(noAgentInvokeEnvelope)
   }
 
   api.handle_route = { ctxPtr, requestJsonPtr in
@@ -152,6 +184,14 @@ private func handleInvoke(
 ) -> String {
   state.log(.debug, "invoke: type=\(type) id=\(id) payload=\(payload.count) chars")
 
+  // Artifact auto-forward: the host fires this whenever the agent
+  // writes a file under ~/.osaurus/artifacts/. We don't switch on `id`
+  // — historically the host has only ever passed "share" here and there
+  // is no benefit to being strict.
+  if type == "artifact" {
+    return handleArtifactShare(state: state, payload: payload)
+  }
+
   guard type == "tool" else {
     logWarn("invoke: unknown capability type '\(type)'")
     return toolEnvelopeError("unknown_capability", "Type \(type) not supported")
@@ -176,6 +216,7 @@ private func logHostAPIAvailability() {
     ("dispatch_interrupt", hostAPI?.pointee.dispatch_interrupt != nil),
     ("dispatch_cancel", hostAPI?.pointee.dispatch_cancel != nil),
     ("http_request", hostAPI?.pointee.http_request != nil),
+    ("file_read", hostAPI?.pointee.file_read != nil),
     ("db_exec", hostAPI?.pointee.db_exec != nil),
     ("db_query", hostAPI?.pointee.db_query != nil),
     ("config_get", hostAPI?.pointee.config_get != nil),

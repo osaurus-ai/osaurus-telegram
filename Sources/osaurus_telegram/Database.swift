@@ -32,6 +32,10 @@ struct ActiveDispatchRow {
   let sessionId: String
   let expiresAt: Int
   let hasReplied: Int
+  /// Telegram message_id of the user message that triggered this dispatch.
+  /// Used to set/clear the "loading" 👀 reaction. 0 means "unknown" (older
+  /// rows / synthetic test rows without a real Telegram source).
+  let incomingMessageId: Int64
 }
 
 enum DatabaseManager {
@@ -63,6 +67,17 @@ enum DatabaseManager {
       dbExec("DROP TABLE IF EXISTS active_dispatches", params: "[]")
     }
 
+    // v3 → v3.1: incoming_message_id column added so the loading-eye
+    // reaction can address the user's original Telegram message at
+    // terminal/clear time. The row data is transient (10-min TTL) so
+    // dropping is harmless.
+    if tableExists("active_dispatches"),
+      !columnExists(table: "active_dispatches", column: "incoming_message_id")
+    {
+      logInfo("Database: detected pre-reaction active_dispatches; rebuilding")
+      dbExec("DROP TABLE IF EXISTS active_dispatches", params: "[]")
+    }
+
     let statements = [
       """
       CREATE TABLE IF NOT EXISTS chat_sessions (
@@ -77,14 +92,15 @@ enum DatabaseManager {
       """,
       """
       CREATE TABLE IF NOT EXISTS active_dispatches (
-        reply_token    TEXT PRIMARY KEY,
-        task_id        TEXT NOT NULL,
-        agent_id       TEXT NOT NULL,
-        chat_id        INTEGER NOT NULL,
-        session_id     TEXT NOT NULL,
-        started_at     INTEGER NOT NULL,
-        expires_at     INTEGER NOT NULL,
-        has_replied    INTEGER NOT NULL DEFAULT 0
+        reply_token         TEXT PRIMARY KEY,
+        task_id             TEXT NOT NULL,
+        agent_id            TEXT NOT NULL,
+        chat_id             INTEGER NOT NULL,
+        session_id          TEXT NOT NULL,
+        started_at          INTEGER NOT NULL,
+        expires_at          INTEGER NOT NULL,
+        has_replied         INTEGER NOT NULL DEFAULT 0,
+        incoming_message_id INTEGER NOT NULL DEFAULT 0
       )
       """,
       "CREATE INDEX IF NOT EXISTS idx_dispatches_task ON active_dispatches(task_id)",
@@ -208,7 +224,7 @@ enum DatabaseManager {
 
   static func insertActiveDispatch(
     taskId: String, agentId: String, chatId: Int64, replyToken: String,
-    sessionId: String, expiresAt: Int
+    sessionId: String, expiresAt: Int, incomingMessageId: Int64 = 0
   ) {
     // started_at is an ordering key (not a wall-clock); milliseconds give
     // rapid-fire turns and unit tests strict ordering. expires_at stays
@@ -216,13 +232,17 @@ enum DatabaseManager {
     let nowMillis = Int(Date().timeIntervalSince1970 * 1000)
     let sql = """
       INSERT INTO active_dispatches
-        (task_id, agent_id, chat_id, reply_token, session_id, started_at, expires_at, has_replied)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)
+        (task_id, agent_id, chat_id, reply_token, session_id,
+         started_at, expires_at, has_replied, incoming_message_id)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8)
       """
     dbExec(
       sql,
       params: serializeParams(
-        [taskId, agentId, chatId, replyToken, sessionId, nowMillis, expiresAt]))
+        [
+          taskId, agentId, chatId, replyToken, sessionId,
+          nowMillis, expiresAt, incomingMessageId,
+        ]))
   }
 
   /// Returns the most recently dispatched row for `(agentId, chatId)` or nil
@@ -231,13 +251,52 @@ enum DatabaseManager {
   /// for the soft-interrupt branch in `handleWebhook`.
   static func activeDispatch(agentId: String, forChat chatId: Int64) -> ActiveDispatchRow? {
     let sql = """
-      SELECT task_id, agent_id, chat_id, reply_token, session_id, expires_at, has_replied
+      SELECT task_id, agent_id, chat_id, reply_token, session_id, expires_at, has_replied, incoming_message_id
       FROM active_dispatches
       WHERE agent_id = ?1 AND chat_id = ?2
       ORDER BY started_at DESC
       LIMIT 1
       """
     guard let resultStr = dbQuery(sql, params: serializeParams([agentId, chatId])) else {
+      return nil
+    }
+    return parseDispatchRow(resultStr)
+  }
+
+  /// Returns the most recently dispatched in-flight row for `agentId` across
+  /// all chats. Used by the artifact auto-forward hook because the host's
+  /// `invoke(type: "artifact", ...)` payload doesn't carry chat context — the
+  /// only sane heuristic is "the chat the agent is currently working on,"
+  /// which translates to the latest pre-inserted dispatch row for the agent.
+  static func latestActiveDispatch(agentId: String) -> ActiveDispatchRow? {
+    let sql = """
+      SELECT task_id, agent_id, chat_id, reply_token, session_id, expires_at, has_replied, incoming_message_id
+      FROM active_dispatches
+      WHERE agent_id = ?1
+      ORDER BY started_at DESC
+      LIMIT 1
+      """
+    guard let resultStr = dbQuery(sql, params: serializeParams([agentId])) else {
+      return nil
+    }
+    return parseDispatchRow(resultStr)
+  }
+
+  /// Returns the most recently dispatched in-flight row across ALL agents.
+  /// Used as a fallback when the host fires `invoke(type: "artifact")` from
+  /// a thread that doesn't bind a per-agent frame — the artifact must
+  /// belong to an agent that's currently running a task, and "the only
+  /// agent in flight" is the unambiguous case. With multiple agents in
+  /// flight we bias to the latest; the wrong-chat risk is documented at
+  /// the call site in `Plugin.swift`.
+  static func latestActiveDispatchAcrossAgents() -> ActiveDispatchRow? {
+    let sql = """
+      SELECT task_id, agent_id, chat_id, reply_token, session_id, expires_at, has_replied, incoming_message_id
+      FROM active_dispatches
+      ORDER BY started_at DESC
+      LIMIT 1
+      """
+    guard let resultStr = dbQuery(sql, params: "[]") else {
       return nil
     }
     return parseDispatchRow(resultStr)
@@ -251,7 +310,7 @@ enum DatabaseManager {
     agentId: String, forChat chatId: Int64, excluding replyToken: String
   ) -> ActiveDispatchRow? {
     let sql = """
-      SELECT task_id, agent_id, chat_id, reply_token, session_id, expires_at, has_replied
+      SELECT task_id, agent_id, chat_id, reply_token, session_id, expires_at, has_replied, incoming_message_id
       FROM active_dispatches
       WHERE agent_id = ?1 AND chat_id = ?2 AND reply_token != ?3
       ORDER BY started_at DESC
@@ -271,7 +330,7 @@ enum DatabaseManager {
     -> [ActiveDispatchRow]
   {
     let sql = """
-      SELECT task_id, agent_id, chat_id, reply_token, session_id, expires_at, has_replied
+      SELECT task_id, agent_id, chat_id, reply_token, session_id, expires_at, has_replied, incoming_message_id
       FROM active_dispatches
       WHERE agent_id = ?1 AND chat_id = ?2
       ORDER BY started_at DESC
@@ -287,7 +346,7 @@ enum DatabaseManager {
   /// current callback frame.
   static func lookupBinding(token: String) -> ActiveDispatchRow? {
     let sql = """
-      SELECT task_id, agent_id, chat_id, reply_token, session_id, expires_at, has_replied
+      SELECT task_id, agent_id, chat_id, reply_token, session_id, expires_at, has_replied, incoming_message_id
       FROM active_dispatches
       WHERE reply_token = ?1
       LIMIT 1
@@ -298,7 +357,7 @@ enum DatabaseManager {
 
   static func lookupBindingByTask(taskId: String) -> ActiveDispatchRow? {
     let sql = """
-      SELECT task_id, agent_id, chat_id, reply_token, session_id, expires_at, has_replied
+      SELECT task_id, agent_id, chat_id, reply_token, session_id, expires_at, has_replied, incoming_message_id
       FROM active_dispatches
       WHERE task_id = ?1
       LIMIT 1
@@ -386,7 +445,7 @@ enum DatabaseManager {
 
   private static func parseDispatchRow(_ resultStr: String) -> ActiveDispatchRow? {
     guard let rows = extractRows(resultStr),
-      let row = rows.first, row.count >= 7
+      let row = rows.first, row.count >= 8
     else { return nil }
     return dispatchRow(from: row)
   }
@@ -397,7 +456,7 @@ enum DatabaseManager {
   private static func parseDispatchRows(_ resultStr: String) -> [ActiveDispatchRow] {
     guard let rows = extractRows(resultStr) else { return [] }
     return rows.compactMap { row -> ActiveDispatchRow? in
-      guard row.count >= 7 else { return nil }
+      guard row.count >= 8 else { return nil }
       return dispatchRow(from: row)
     }
   }
@@ -410,7 +469,8 @@ enum DatabaseManager {
       replyToken: "\(row[3])",
       sessionId: "\(row[4])",
       expiresAt: intFromAny(row[5]) ?? 0,
-      hasReplied: intFromAny(row[6]) ?? 0
+      hasReplied: intFromAny(row[6]) ?? 0,
+      incomingMessageId: int64FromAny(row[7]) ?? 0
     )
   }
 

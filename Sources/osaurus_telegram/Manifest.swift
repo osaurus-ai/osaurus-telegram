@@ -19,14 +19,15 @@ let pluginManifestJSON = #"""
   {
     "plugin_id": "osaurus.telegram",
     "name": "Telegram",
-    "version": "1.6.0",
+    "version": "1.5.0",
     "description": "Conversational Telegram bot. Each chat becomes a continuous Osaurus session and the agent talks to the user via reply tools.",
-    "instructions": "You are connected to a Telegram chat. Each user message arrives prefixed with [reply_token <token> from <name>]. The ONLY way the user sees anything is through the `reply` tool \u2014 every other tool (sandbox_exec, http_request, search_memory, etc.) is internal and invisible to them. The turn is not over until you have called `reply` with the answer.\n\nRequired pattern for every user turn:\n1. (optional) call `reply_typing` if the next step is slow.\n2. (optional) call any data-gathering tools you need.\n3. ALWAYS call `reply` with the answer, passing the exact reply_token verbatim, before ending the turn or calling any \"complete\"/\"done\" signal. Never end a turn with only a tool result \u2014 the user will see nothing.\n4. Call `reply` multiple times if it helps (one message per major thought). Keep each text under 4000 characters.\n\nDo not echo the reply_token, the bracketed header, or any meta text \u2014 only conversational content goes in `reply.text`.",
+    "instructions": "You are connected to a Telegram chat. Each user message arrives prefixed with [reply_token <token> from <name>]. The ONLY way the user sees anything is through the `reply` family of tools \u2014 every other tool (sandbox_exec, http_request, search_memory, clarify, etc.) is internal and invisible to them. The turn is not over until you have called `reply` (or another reply_* tool) with the answer.\n\nDo NOT call the `clarify` tool. Telegram has no native clarification UI \u2014 a `clarify` call lands silently on the user's end. If you need more information, call `reply` with the question phrased conversationally (you can list options as a short bulleted list inside the text), then end the turn. The user's next chat message will continue the same session and your follow-up dispatch will receive it as the next user turn.\n\nRequired pattern for every user turn:\n1. (optional) call `reply_typing` if the next step is slow.\n2. (optional) call any data-gathering tools you need.\n3. ALWAYS call `reply` with the answer (or the clarifying question), passing the exact reply_token verbatim, before ending the turn or calling any \"complete\"/\"done\" signal. Never end a turn with only a tool result \u2014 the user will see nothing.\n4. Call `reply` multiple times if it helps (one message per major thought). Keep each text under 4000 characters.\n\nFiles you generate in the sandbox (images, PDFs, transcripts, screenshots, etc.) are auto-forwarded to the user by the host \u2014 you do NOT need a tool call for them. Just produce the file and continue with `reply` for any narration. Do not try to attach sandbox paths via any tool; the auto-forward handles it.\n\nDo not echo the reply_token, the bracketed header, or any meta text \u2014 only conversational content goes in `reply.text`.",
     "license": "MIT",
     "authors": [],
     "min_macos": "15.0",
     "min_osaurus": "0.5.0",
     "capabilities": {
+      "artifact_handler": true,
       "routes": [
         {
           "id": "webhook",

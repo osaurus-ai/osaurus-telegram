@@ -72,6 +72,23 @@ enum TestHostGlobals {
   /// just set is now what I have registered").
   nonisolated(unsafe) static var lastRegisteredURL: String = ""
 
+  /// Files exposed to the plugin's `file_read` host callback, keyed by
+  /// requested path. Each entry is the (mime_type, raw bytes) tuple
+  /// `readHostFile` will surface back to the caller. Tests seed this
+  /// before driving `handleArtifactShare` (the auto-forward hook) so
+  /// the upload resolves a real payload instead of an "unavailable"
+  /// failure.
+  nonisolated(unsafe) static var fileReadStore: [String: (mimeType: String, data: Data)] = [:]
+
+  /// When non-nil, the stubbed `file_read` returns this error verbatim
+  /// instead of looking up `fileReadStore`. Used to exercise the
+  /// failure path (missing file, permission denied, etc.).
+  nonisolated(unsafe) static var fileReadError: String?
+
+  /// Captures every path the plugin asked `file_read` for. Lets tests
+  /// assert the artifact hook forwarded the host payload's path verbatim.
+  nonisolated(unsafe) static var fileReadCalls: [String] = []
+
   /// If non-nil, the stubbed `getWebhookInfo` reports this delivery error.
   /// Tests can set this to simulate "Telegram accepted setWebhook but
   /// can't actually reach the URL" scenarios.
@@ -100,6 +117,9 @@ enum TestHost {
     TestHostGlobals.simulatedWebhookErrorMessage = nil
     TestHostGlobals.simulatedWebhookErrorDate = 0
     TestHostGlobals.dispatchInspector = nil
+    TestHostGlobals.fileReadStore = [:]
+    TestHostGlobals.fileReadError = nil
+    TestHostGlobals.fileReadCalls = []
 
     if TestHostGlobals.db != nil {
       sqlite3_close(TestHostGlobals.db)
@@ -122,6 +142,7 @@ enum TestHost {
     api.dispatch_cancel = stub_dispatch_cancel
     api.dispatch_interrupt = stub_dispatch_interrupt
     api.http_request = stub_http_request
+    api.file_read = stub_file_read
     api.list_active_tasks = stub_list_active_tasks
     api.get_active_agent_id = stub_get_active_agent_id
     // v5 / v6 slots — `log_structured` is unused by the plugin but
@@ -151,6 +172,9 @@ enum TestHost {
     TestHostGlobals.cancelCalls = []
     TestHostGlobals.httpCalls = []
     TestHostGlobals.dispatchInspector = nil
+    TestHostGlobals.fileReadStore = [:]
+    TestHostGlobals.fileReadError = nil
+    TestHostGlobals.fileReadCalls = []
   }
 
   // MARK: - Per-agent config helpers
@@ -380,6 +404,39 @@ private func buildGetWebhookInfoResponse() -> String {
 
 private let stub_list_active_tasks: osr_list_active_tasks_fn = {
   return UnsafePointer(strdup(#"{"tasks":[]}"#))
+}
+
+/// Mirrors the production host's `file_read`: takes a JSON request with a
+/// `path` field and returns either `{"data": <base64>, "mime_type": "..."}`
+/// or `{"error": "..."}`. Tests seed `fileReadStore` (success) or
+/// `fileReadError` (failure) before driving `handleArtifactShare`.
+private let stub_file_read: osr_file_read_fn = { reqPtr in
+  guard let reqPtr else { return nil }
+  let req = String(cString: reqPtr)
+  let path = (parseJSONObject(req)?["path"] as? String) ?? ""
+  TestHostGlobals.fileReadCalls.append(path)
+
+  if let errMsg = TestHostGlobals.fileReadError {
+    let env: [String: Any] = ["error": errMsg]
+    let json = String(
+      data: try! JSONSerialization.data(withJSONObject: env), encoding: .utf8)!
+    return UnsafePointer(strdup(json))
+  }
+
+  guard let entry = TestHostGlobals.fileReadStore[path] else {
+    let env: [String: Any] = ["error": "file not found: \(path)"]
+    let json = String(
+      data: try! JSONSerialization.data(withJSONObject: env), encoding: .utf8)!
+    return UnsafePointer(strdup(json))
+  }
+
+  let env: [String: Any] = [
+    "data": entry.data.base64EncodedString(),
+    "mime_type": entry.mimeType,
+  ]
+  let json = String(
+    data: try! JSONSerialization.data(withJSONObject: env), encoding: .utf8)!
+  return UnsafePointer(strdup(json))
 }
 
 // MARK: - SQLite binding helpers
