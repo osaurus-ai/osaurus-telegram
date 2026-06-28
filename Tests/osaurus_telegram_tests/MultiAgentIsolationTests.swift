@@ -203,8 +203,8 @@ final class MultiAgentIsolationTests: XCTestCase {
       envelope.contains("\"ok\":false"),
       "agent B must not be able to send via agent A's reply_token")
     XCTAssertTrue(
-      envelope.contains("stale_token"),
-      "rejection should surface as stale_token to the agent")
+      envelope.contains("\"kind\":\"not_found\""),
+      "cross-agent token replay should surface as a canonical not_found failure")
   }
 
   // MARK: - destroy spans every cached agent

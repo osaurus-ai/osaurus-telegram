@@ -95,6 +95,25 @@ final class ManifestTests: XCTestCase {
       "reply_file is gone; instructions must not advertise it")
   }
 
+  /// Host contract: every tool entry needs a non-empty `id` (the host
+  /// dispatches `invoke` on it) and a non-empty `description` (shown to the
+  /// agent). Also re-pins `plugin_id` here so the contract is asserted in
+  /// one focused place alongside the tool shape.
+  func testEachToolHasNonEmptyIdAndDescriptionAndPluginId() throws {
+    let m = try parsed()
+    XCTAssertEqual(m["plugin_id"] as? String, "osaurus.telegram")
+    let caps = try XCTUnwrap(m["capabilities"] as? [String: Any])
+    let tools = try XCTUnwrap(caps["tools"] as? [[String: Any]])
+    XCTAssertFalse(tools.isEmpty, "manifest must declare at least one tool")
+    for tool in tools {
+      let id = try XCTUnwrap(tool["id"] as? String, "every tool must declare an id")
+      XCTAssertFalse(id.isEmpty, "tool id must be non-empty")
+      let description = try XCTUnwrap(
+        tool["description"] as? String, "tool \(id) must declare a description")
+      XCTAssertFalse(description.isEmpty, "tool \(id) description must be non-empty")
+    }
+  }
+
   func testEachToolHasReplyTokenParameter() throws {
     let m = try parsed()
     let caps = try XCTUnwrap(m["capabilities"] as? [String: Any])

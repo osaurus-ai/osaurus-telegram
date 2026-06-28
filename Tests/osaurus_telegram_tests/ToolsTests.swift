@@ -66,18 +66,19 @@ final class ToolsTests: XCTestCase {
   func testReplyRejectsInvalidJSON() {
     let env = parseEnvelope(handleReply(state: state, payload: "not-json"))
     XCTAssertEqual(env["ok"] as? Bool, false)
-    XCTAssertEqual(env["error"] as? String, "invalid_request")
+    XCTAssertEqual(env["kind"] as? String, "invalid_args")
+    XCTAssertEqual(env["retryable"] as? Bool, true)
   }
 
   func testReplyTypingRejectsMissingToken() {
     let env = parseEnvelope(handleReplyTyping(state: state, payload: "{}"))
-    XCTAssertEqual(env["error"] as? String, "invalid_request")
+    XCTAssertEqual(env["kind"] as? String, "invalid_args")
   }
 
   func testReplyPhotoRejectsMissingURL() {
     let env = parseEnvelope(
       handleReplyPhoto(state: state, payload: #"{"reply_token":"TOK"}"#))
-    XCTAssertEqual(env["error"] as? String, "invalid_request")
+    XCTAssertEqual(env["kind"] as? String, "invalid_args")
   }
 
   // MARK: stale token
@@ -87,7 +88,8 @@ final class ToolsTests: XCTestCase {
       handleReply(
         state: state,
         payload: #"{"reply_token":"NOPE","text":"hi"}"#))
-    XCTAssertEqual(env["error"] as? String, "stale_token")
+    XCTAssertEqual(env["kind"] as? String, "not_found")
+    XCTAssertEqual(env["retryable"] as? Bool, false)
   }
 
   func testReplyStaleTokenWhenExpired() {
@@ -96,7 +98,7 @@ final class ToolsTests: XCTestCase {
       handleReply(
         state: state,
         payload: #"{"reply_token":"\#(token)","text":"hi"}"#))
-    XCTAssertEqual(env["error"] as? String, "stale_token")
+    XCTAssertEqual(env["kind"] as? String, "not_found")
     XCTAssertTrue(TestHostGlobals.httpCalls.isEmpty, "no HTTP call on stale token")
   }
 
@@ -109,7 +111,10 @@ final class ToolsTests: XCTestCase {
       handleReply(
         state: state,
         payload: #"{"reply_token":"\#(token)","text":"hi"}"#))
-    XCTAssertEqual(env["error"] as? String, "chat_blocked")
+    XCTAssertEqual(env["kind"] as? String, "execution_error")
+    XCTAssertEqual(
+      env["retryable"] as? Bool, false, "a blocked chat is permanent — don't ask to retry")
+    XCTAssertTrue((env["message"] as? String ?? "").lowercased().contains("blocked"))
     XCTAssertTrue(TestHostGlobals.httpCalls.isEmpty)
   }
 
@@ -122,7 +127,7 @@ final class ToolsTests: XCTestCase {
       handleReply(
         state: state,
         payload: #"{"reply_token":"\#(token)","text":"hi"}"#))
-    XCTAssertEqual(env["error"] as? String, "not_configured")
+    XCTAssertEqual(env["kind"] as? String, "unavailable")
   }
 
   // MARK: success paths
@@ -207,7 +212,8 @@ final class ToolsTests: XCTestCase {
         state: state,
         payload: #"{"reply_token":"\#(token)","text":"hi"}"#))
 
-    XCTAssertEqual(env["error"] as? String, "chat_blocked")
+    XCTAssertEqual(env["kind"] as? String, "execution_error")
+    XCTAssertEqual(env["retryable"] as? Bool, false)
     XCTAssertTrue(DatabaseManager.isChatBlocked(agentId: agentId, chatId: 300))
     XCTAssertEqual(TestHostGlobals.cancelCalls, ["task-blocked"])
     XCTAssertFalse(
@@ -224,7 +230,9 @@ final class ToolsTests: XCTestCase {
         state: state,
         payload: #"{"reply_token":"\#(token)","text":"hi"}"#))
 
-    XCTAssertEqual(env["error"] as? String, "telegram_api_error")
+    XCTAssertEqual(env["kind"] as? String, "execution_error")
+    XCTAssertEqual(
+      env["retryable"] as? Bool, true, "a generic Telegram error is retryable by default")
     XCTAssertTrue(
       (env["message"] as? String ?? "").contains("chat not found"),
       "telegram description should propagate")

@@ -419,13 +419,13 @@ private func runReplyTool<Args: Decodable>(
   build: (Args, _ botToken: String, _ binding: ActiveDispatchRow) -> ReplyAction
 ) -> String {
   guard let args = parseJSON(payload, as: Args.self) else {
-    return toolEnvelopeError("invalid_request", invalidArgsMessage)
+    return Envelope.failure(.invalidArgs, invalidArgsMessage)
   }
 
   // Pull the reply_token off the args without forcing every caller to
   // re-extract it. Decoded structs always carry it as `reply_token`.
-  guard let replyToken = readReplyToken(from: args) else {
-    return toolEnvelopeError("invalid_request", "missing reply_token")
+  guard let replyToken = readReplyToken(from: args), !replyToken.isEmpty else {
+    return Envelope.failure(.invalidArgs, "missing reply_token")
   }
 
   let binding: ActiveDispatchRow
@@ -437,7 +437,7 @@ private func runReplyTool<Args: Decodable>(
   }
 
   guard let token = state.botToken, !token.isEmpty else {
-    return toolEnvelopeError("not_configured", "Bot token not configured.")
+    return Envelope.failure(.unavailable, "Bot token not configured.")
   }
 
   let plan = build(args, token, binding)
@@ -510,7 +510,8 @@ private func validateBinding(state: AgentState, token: String) -> BindingResult 
       reason: "expired (expires_at=\(binding.expiresAt) now=\(now))")
   }
   if DatabaseManager.isChatBlocked(agentId: state.agentId, chatId: binding.chatId) {
-    return .reject(toolEnvelopeError("chat_blocked", "User has blocked the bot."))
+    // Permanent for this chat — the agent should stop retrying.
+    return .reject(Envelope.failure(.executionError, "User has blocked the bot.", retryable: false))
   }
   return .ok(binding)
 }
@@ -520,8 +521,8 @@ private func rejectStale(state: AgentState, token: String, reason: String) -> Bi
   return .reject(staleTokenEnvelope)
 }
 
-private let staleTokenEnvelope = toolEnvelopeError(
-  "stale_token",
+private let staleTokenEnvelope = Envelope.failure(
+  .notFound,
   "Reply token expired or unknown. End the turn — a new token will arrive on the next user message."
 )
 
@@ -535,9 +536,10 @@ private func mapTelegramFailure(
   if description.lowercased().contains("bot was blocked") {
     DatabaseManager.markChatBlocked(agentId: state.agentId, chatId: binding.chatId)
     binding.taskId.withCString { hostAPI?.pointee.dispatch_cancel?($0) }
-    return toolEnvelopeError("chat_blocked", description)
+    // Blocked is permanent for this chat — don't ask the agent to retry.
+    return Envelope.failure(.executionError, description, retryable: false)
   }
-  return toolEnvelopeError("telegram_api_error", description)
+  return Envelope.failure(.executionError, description)
 }
 
 /// All tool arg structs name the field `reply_token`. Reflect once to pull

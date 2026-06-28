@@ -5,8 +5,8 @@ import XCTest
 /// Pin the Phase 3b outbound-media tools (`reply_document`,
 /// `reply_voice`, `reply_audio`, `reply_video`) and the inline keyboard
 /// option on `reply`. Each handler must:
-///   * reject malformed args with `invalid_request`,
-///   * reject stale tokens with `stale_token`,
+///   * reject malformed args with kind `invalid_args`,
+///   * reject stale tokens with kind `not_found`,
 ///   * route the success path through the right Telegram method
 ///     (`sendDocument` / `sendVoice` / `sendAudio` / `sendVideo`),
 ///   * mark the binding `has_replied=1` on success so the safety net
@@ -68,28 +68,28 @@ final class ReplyMediaTests: XCTestCase {
     let env = parseEnvelope(
       handleReplyDocument(
         state: state, payload: #"{"reply_token":"X"}"#))
-    XCTAssertEqual(env["error"] as? String, "invalid_request")
+    XCTAssertEqual(env["kind"] as? String, "invalid_args")
   }
 
   func testReplyVoiceRejectsMissingURL() {
     let env = parseEnvelope(
       handleReplyVoice(
         state: state, payload: #"{"reply_token":"X"}"#))
-    XCTAssertEqual(env["error"] as? String, "invalid_request")
+    XCTAssertEqual(env["kind"] as? String, "invalid_args")
   }
 
   func testReplyAudioRejectsMissingURL() {
     let env = parseEnvelope(
       handleReplyAudio(
         state: state, payload: #"{"reply_token":"X"}"#))
-    XCTAssertEqual(env["error"] as? String, "invalid_request")
+    XCTAssertEqual(env["kind"] as? String, "invalid_args")
   }
 
   func testReplyVideoRejectsMissingURL() {
     let env = parseEnvelope(
       handleReplyVideo(
         state: state, payload: #"{"reply_token":"X"}"#))
-    XCTAssertEqual(env["error"] as? String, "invalid_request")
+    XCTAssertEqual(env["kind"] as? String, "invalid_args")
   }
 
   // MARK: - stale token
@@ -100,7 +100,7 @@ final class ReplyMediaTests: XCTestCase {
         state: state,
         payload:
           #"{"reply_token":"NOPE","document_url":"https://x/y.pdf"}"#))
-    XCTAssertEqual(env["error"] as? String, "stale_token")
+    XCTAssertEqual(env["kind"] as? String, "not_found")
     XCTAssertTrue(TestHostGlobals.httpCalls.isEmpty)
   }
 
