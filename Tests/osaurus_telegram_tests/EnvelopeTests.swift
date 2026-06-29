@@ -21,12 +21,46 @@ final class EnvelopeTests: XCTestCase {
     XCTAssertNotNil(parsed["data"])
   }
 
-  func testErrorEnvelopeShape() throws {
-    let json = toolEnvelopeError("stale_token", "Reply token expired")
+  // MARK: - canonical failure envelope
+
+  func testFailureEnvelopeShapeUsesKindAndRetryable() throws {
+    let json = Envelope.failure(.executionError, "boom")
     let parsed = try XCTUnwrap(jsonObject(json))
     XCTAssertEqual(parsed["ok"] as? Bool, false)
-    XCTAssertEqual(parsed["error"] as? String, "stale_token")
-    XCTAssertEqual(parsed["message"] as? String, "Reply token expired")
+    XCTAssertEqual(parsed["kind"] as? String, "execution_error")
+    XCTAssertEqual(parsed["message"] as? String, "boom")
+    XCTAssertEqual(parsed["retryable"] as? Bool, true)
+    // The canonical failure envelope must NOT carry the legacy `error` key.
+    XCTAssertNil(parsed["error"])
+  }
+
+  func testFailureEnvelopeDefaultRetryablePerKind() throws {
+    XCTAssertEqual(
+      try XCTUnwrap(jsonObject(Envelope.failure(.invalidArgs, "x")))["retryable"] as? Bool, true)
+    XCTAssertEqual(
+      try XCTUnwrap(jsonObject(Envelope.failure(.executionError, "x")))["retryable"] as? Bool, true)
+    XCTAssertEqual(
+      try XCTUnwrap(jsonObject(Envelope.failure(.unavailable, "x")))["retryable"] as? Bool, true)
+    XCTAssertEqual(
+      try XCTUnwrap(jsonObject(Envelope.failure(.notFound, "x")))["retryable"] as? Bool, false)
+  }
+
+  func testFailureEnvelopeRetryableOverride() throws {
+    let parsed = try XCTUnwrap(
+      jsonObject(Envelope.failure(.executionError, "blocked", retryable: false)))
+    XCTAssertEqual(parsed["kind"] as? String, "execution_error")
+    XCTAssertEqual(parsed["retryable"] as? Bool, false)
+  }
+
+  /// Round-trip: a failure with control characters / quotes in the message
+  /// must escape into valid JSON that parses back to the same message.
+  func testFailureEnvelopeRoundTripEscapesMessage() throws {
+    let message = "line1\nwith \"quotes\", a tab\t and a backslash \\ end"
+    let parsed = try XCTUnwrap(jsonObject(Envelope.failure(.invalidArgs, message)))
+    XCTAssertEqual(parsed["ok"] as? Bool, false)
+    XCTAssertEqual(parsed["kind"] as? String, "invalid_args")
+    XCTAssertEqual(parsed["message"] as? String, message)
+    XCTAssertEqual(parsed["retryable"] as? Bool, true)
   }
 
   // MARK: helpers

@@ -40,8 +40,8 @@ private func resolveAgentFrame(
 private let noAgentRouteResponse =
   #"{"ok":false,"description":"plugin requires per-agent host frame (ABI v4)"}"#
 
-private let noAgentInvokeEnvelope = toolEnvelopeError(
-  "no_agent_context",
+private let noAgentInvokeEnvelope = Envelope.failure(
+  .unavailable,
   "Plugin invoked outside any per-agent frame. Host must implement ABI v4.")
 
 /// Best-effort routing for artifact events fired without a per-agent
@@ -217,7 +217,7 @@ private func handleInvoke(
 
   guard type == "tool" else {
     logWarn("invoke: unknown capability type '\(type)'")
-    return toolEnvelopeError("unknown_capability", "Type \(type) not supported")
+    return Envelope.failure(.invalidArgs, "Type \(type) not supported")
   }
 
   switch id {
@@ -230,7 +230,7 @@ private func handleInvoke(
   case "reply_video": return handleReplyVideo(state: state, payload: payload)
   default:
     logWarn("invoke: unknown tool '\(id)'")
-    return toolEnvelopeError("unknown_tool", "Unknown tool: \(id)")
+    return Envelope.failure(.notFound, "Unknown tool: \(id)")
   }
 }
 
