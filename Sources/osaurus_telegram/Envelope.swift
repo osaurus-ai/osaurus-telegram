@@ -23,17 +23,30 @@ enum Envelope {
     case unavailable = "unavailable"
   }
 
-  static func failure(_ kind: Kind, _ message: String, retryable: Bool? = nil) -> String {
+  /// `data` carries machine-readable failure context (e.g.
+  /// `{"retry_after": 7}` on a Telegram 429) alongside the human-readable
+  /// message. Omitted from the envelope when nil/empty.
+  static func failure(
+    _ kind: Kind, _ message: String, retryable: Bool? = nil, data: [String: Any]? = nil
+  ) -> String {
     let retry = retryable ?? defaultRetryable(for: kind)
-    return "{\"ok\":false,\"kind\":\"\(kind.rawValue)\",\"message\":\"\(escape(message))\",\"retryable\":\(retry)}"
+    var envelope =
+      "{\"ok\":false,\"kind\":\"\(kind.rawValue)\",\"message\":\"\(escape(message))\",\"retryable\":\(retry)"
+    if let data, !data.isEmpty, let dataJSON = makeJSONString(data) {
+      envelope += ",\"data\":\(dataJSON)"
+    }
+    return envelope + "}"
   }
 
   static func successRaw(_ jsonPayload: String) -> String { "{\"ok\":true,\"result\":\(jsonPayload)}" }
 
   private static func defaultRetryable(for kind: Kind) -> Bool {
     switch kind {
-    case .invalidArgs, .executionError, .unavailable: return true
-    case .notFound: return false
+    // Retrying identical invalid arguments can never succeed; a fresh
+    // lookup of a missing resource likewise. Only transient conditions
+    // default to retryable.
+    case .invalidArgs, .notFound: return false
+    case .executionError, .unavailable: return true
     }
   }
 

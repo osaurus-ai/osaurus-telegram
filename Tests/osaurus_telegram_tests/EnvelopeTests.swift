@@ -35,14 +35,28 @@ final class EnvelopeTests: XCTestCase {
   }
 
   func testFailureEnvelopeDefaultRetryablePerKind() throws {
+    // invalid_args / not_found are deterministic: retrying the identical
+    // call can never succeed, so they must NOT default to retryable.
     XCTAssertEqual(
-      try XCTUnwrap(jsonObject(Envelope.failure(.invalidArgs, "x")))["retryable"] as? Bool, true)
+      try XCTUnwrap(jsonObject(Envelope.failure(.invalidArgs, "x")))["retryable"] as? Bool, false)
     XCTAssertEqual(
       try XCTUnwrap(jsonObject(Envelope.failure(.executionError, "x")))["retryable"] as? Bool, true)
     XCTAssertEqual(
       try XCTUnwrap(jsonObject(Envelope.failure(.unavailable, "x")))["retryable"] as? Bool, true)
     XCTAssertEqual(
       try XCTUnwrap(jsonObject(Envelope.failure(.notFound, "x")))["retryable"] as? Bool, false)
+  }
+
+  func testFailureEnvelopeCarriesDataPayload() throws {
+    let parsed = try XCTUnwrap(
+      jsonObject(Envelope.failure(.executionError, "rate limited", data: ["retry_after": 7])))
+    let data = try XCTUnwrap(parsed["data"] as? [String: Any])
+    XCTAssertEqual(data["retry_after"] as? Int, 7)
+  }
+
+  func testFailureEnvelopeOmitsDataWhenAbsent() throws {
+    let parsed = try XCTUnwrap(jsonObject(Envelope.failure(.executionError, "boom")))
+    XCTAssertNil(parsed["data"])
   }
 
   func testFailureEnvelopeRetryableOverride() throws {
@@ -60,7 +74,7 @@ final class EnvelopeTests: XCTestCase {
     XCTAssertEqual(parsed["ok"] as? Bool, false)
     XCTAssertEqual(parsed["kind"] as? String, "invalid_args")
     XCTAssertEqual(parsed["message"] as? String, message)
-    XCTAssertEqual(parsed["retryable"] as? Bool, true)
+    XCTAssertEqual(parsed["retryable"] as? Bool, false)
   }
 
   // MARK: helpers
