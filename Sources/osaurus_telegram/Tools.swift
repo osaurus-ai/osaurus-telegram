@@ -150,13 +150,31 @@ func handleReply(state: AgentState, payload: String) -> String {
 
 // MARK: - reply_typing
 
+/// Upper bound on the in-tool 429 backoff for `reply_typing`. Typing
+/// indicators are worthless once stale, so waiting longer than a couple
+/// of seconds inside the (synchronous) tool call is worse than failing.
+let replyTypingMaxBackoffSeconds = 2
+
+/// `sendChatAction` is the one reply surface where a duplicate send is
+/// literally impossible to observe (the typing indicator is idempotent
+/// state, not a message), so a bounded in-place retry on 429 is safe.
+/// One retry, capped backoff — content-bearing tools must NOT get this
+/// treatment because a retry after an ambiguous failure could double-post.
 func handleReplyTyping(state: AgentState, payload: String) -> String {
   runReplyTool(
     state: state, payload: payload,
     invalidArgsMessage: "reply_typing requires reply_token"
   ) { (_: ReplyTypingArgs, token, binding) in
     ReplyAction(
-      action: { telegramSendChatAction(token: token, chatId: binding.chatId) },
+      action: {
+        let first = telegramSendChatAction(token: token, chatId: binding.chatId)
+        guard !first.ok, let retryAfter = first.retryAfter else { return first }
+        let backoff = min(retryAfter, replyTypingMaxBackoffSeconds)
+        if backoff > 0 {
+          Thread.sleep(forTimeInterval: TimeInterval(backoff))
+        }
+        return telegramSendChatAction(token: token, chatId: binding.chatId)
+      },
       successMarksReplied: false,
       successSummary: nil
     )
@@ -402,7 +420,7 @@ private func artifactSkip(
 
 private struct ReplyAction {
   /// Called inside the per-chat actor. Must be self-contained.
-  let action: @Sendable () -> (ok: Bool, description: String)
+  let action: @Sendable () -> TGSendOutcome
   /// True when the action carries user-visible content (reply, reply_photo).
   /// The typing-indicator does not flip the safety-net flag.
   let successMarksReplied: Bool
@@ -457,7 +475,9 @@ private func runReplyTool<Args: Decodable>(
     }
     return toolEnvelopeSuccess(["sent": true], summary: plan.successSummary)
   }
-  return mapTelegramFailure(state: state, response.description, binding: binding)
+  return mapTelegramFailure(
+    state: state, response.description, binding: binding,
+    retryAfter: response.retryAfter)
 }
 
 /// Clears the loading 👀 reaction set by the webhook handler. Routed
@@ -530,8 +550,13 @@ private let staleTokenEnvelope = Envelope.failure(
 /// special handling for "bot was blocked by the user": flag the chat
 /// blocked, cancel the running task, and surface `chat_blocked` in-band so
 /// the agent stops trying.
+///
+/// `retryAfter` (Telegram's 429 `parameters.retry_after`, seconds) is
+/// surfaced in the envelope's `data` so the agent's retry policy can wait
+/// the right amount instead of hammering the API.
 private func mapTelegramFailure(
-  state: AgentState, _ description: String, binding: ActiveDispatchRow
+  state: AgentState, _ description: String, binding: ActiveDispatchRow,
+  retryAfter: Int? = nil
 ) -> String {
   if description.lowercased().contains("bot was blocked") {
     DatabaseManager.markChatBlocked(agentId: state.agentId, chatId: binding.chatId)
@@ -539,7 +564,8 @@ private func mapTelegramFailure(
     // Blocked is permanent for this chat — don't ask the agent to retry.
     return Envelope.failure(.executionError, description, retryable: false)
   }
-  return Envelope.failure(.executionError, description)
+  let data: [String: Any]? = retryAfter.map { ["retry_after": $0] }
+  return Envelope.failure(.executionError, description, data: data)
 }
 
 /// All tool arg structs name the field `reply_token`. Reflect once to pull
@@ -562,10 +588,10 @@ private func readReplyToken<Args>(from args: Args) -> String? {
 func runOnSendActor(
   agentId: String,
   chatId: Int64,
-  _ work: @Sendable @escaping () -> (ok: Bool, description: String)
-) -> (ok: Bool, description: String) {
+  _ work: @Sendable @escaping () -> TGSendOutcome
+) -> TGSendOutcome {
   let semaphore = DispatchSemaphore(value: 0)
-  let box = ResultBox<(ok: Bool, description: String)>()
+  let box = ResultBox<TGSendOutcome>()
 
   Task {
     box.value = await PerChatSendActor.shared.send(
@@ -574,7 +600,7 @@ func runOnSendActor(
   }
 
   semaphore.wait()
-  return box.value ?? (false, "internal: actor result missing")
+  return box.value ?? TGSendOutcome(ok: false, description: "internal: actor result missing")
 }
 
 /// One-shot value transfer across the Task ↔ semaphore boundary.
