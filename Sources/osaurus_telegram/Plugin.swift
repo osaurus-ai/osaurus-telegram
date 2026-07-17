@@ -1,4 +1,20 @@
 import Foundation
+import OsaurusPluginABI
+import OsaurusPluginKit
+
+// MARK: - C ABI Surface
+//
+// The hand-rolled `osr_host_api` / `osr_plugin_api` mirrors (previously in
+// HostAPI.swift) are replaced by the pinned `osaurus-plugin-sdk`'s
+// `OsrHostAPI` / `OsrPluginAPI`, which pin the frozen v6 layout (offsets
+// 0 / 176 / 184 / 192, stride 200). `HostBridge.shared` (installed by
+// `PluginEntry.enterV2`) covers config, logging, agent-id resolution, and
+// host-string freeing; the raw pointer below is kept for the slots the
+// bridge does not expose (db_exec / db_query / dispatch /
+// dispatch_interrupt / dispatch_cancel / http_request / file_read /
+// list_active_tasks).
+
+nonisolated(unsafe) var hostAPI: UnsafePointer<OsrHostAPI>?
 
 // MARK: - Plugin API table
 //
@@ -8,7 +24,7 @@ import Foundation
 // `resolveAgentFrame`, and call into the per-callback implementations
 // defined in WebhookHandler.swift / Tools.swift / etc.
 
-private nonisolated(unsafe) var api: osr_plugin_api = makeAPI()
+private nonisolated(unsafe) var api: OsrPluginAPI = makeAPI()
 
 /// Resolved agent context for one host callback. nil here means we can't
 /// safely run the per-agent path (either ctx was nil, the host is older
@@ -23,7 +39,7 @@ private struct AgentFrame {
 /// resolve the active agent via `get_active_agent_id`, and look up its
 /// state. Returns nil with a warning logged on any failure.
 private func resolveAgentFrame(
-  _ ctxPtr: osr_plugin_ctx_t?, caller: String
+  _ ctxPtr: OsrPluginCtx?, caller: String
 ) -> AgentFrame? {
   guard let ctxPtr else {
     logWarn("\(caller) called with nil ctx")
@@ -58,7 +74,7 @@ private let noAgentInvokeEnvelope = Envelope.failure(
 /// In the common single-agent install this is exactly the legacy
 /// behaviour.
 private func routeArtifactWithoutFrame(
-  ctxPtr: osr_plugin_ctx_t?, payload: String
+  ctxPtr: OsrPluginCtx?, payload: String
 ) -> String {
   guard let ctxPtr else {
     logWarn(
@@ -93,111 +109,99 @@ private func routeArtifactWithoutFrame(
   return handleArtifactShare(state: state, payload: payload)
 }
 
-private func makeAPI() -> osr_plugin_api {
-  var api = osr_plugin_api()
-  api.version = 2
+private func makeAPI() -> OsrPluginAPI {
+  PluginEntry.makeAPI(
+    version: OsrABIVersion.v2,
+    init: {
+      let ctx = PluginContext()
+      initPlugin(ctx)
+      logHostAPIAvailability()
+      return Unmanaged.passRetained(ctx).toOpaque()
+    },
+    destroy: { ctxPtr in
+      guard let ctxPtr else { return }
+      let ctx = Unmanaged<PluginContext>.fromOpaque(ctxPtr).takeUnretainedValue()
+      // We're outside any per-agent frame — iterate every cached agent and
+      // tear down its Telegram webhook directly. We deliberately skip
+      // `setWebhookRegistered(false)` per-agent because that would write to
+      // the host's default-agent fallback (no TLS).
+      for (_, state) in ctx.allStates() {
+        destroyAgent(state: state)
+      }
+      Unmanaged<PluginContext>.fromOpaque(ctxPtr).release()
+    },
+    getManifest: { _ in osrMakeCString(pluginManifestJSON) },
+    invoke: { ctxPtr, typePtr, idPtr, payloadPtr in
+      guard let typePtr, let idPtr, let payloadPtr else {
+        logWarn("invoke called with nil arguments")
+        return nil
+      }
+      let type = String(cString: typePtr)
+      let id = String(cString: idPtr)
+      let payload = String(cString: payloadPtr)
 
-  api.free_string = { ptr in
-    if let p = ptr { free(UnsafeMutableRawPointer(mutating: p)) }
-  }
+      if let frame = resolveAgentFrame(ctxPtr, caller: "invoke") {
+        return osrMakeCString(
+          handleInvoke(state: frame.state, type: type, id: id, payload: payload))
+      }
 
-  api.`init` = {
-    let ctx = PluginContext()
-    initPlugin(ctx)
-    logHostAPIAvailability()
-    return Unmanaged.passRetained(ctx).toOpaque()
-  }
-
-  api.destroy = { ctxPtr in
-    guard let ctxPtr else { return }
-    let ctx = Unmanaged<PluginContext>.fromOpaque(ctxPtr).takeUnretainedValue()
-    // We're outside any per-agent frame — iterate every cached agent and
-    // tear down its Telegram webhook directly. We deliberately skip
-    // `setWebhookRegistered(false)` per-agent because that would write to
-    // the host's default-agent fallback (no TLS).
-    for (_, state) in ctx.allStates() {
-      destroyAgent(state: state)
-    }
-    Unmanaged<PluginContext>.fromOpaque(ctxPtr).release()
-  }
-
-  api.get_manifest = { _ in makeCString(pluginManifestJSON) }
-
-  api.invoke = { ctxPtr, typePtr, idPtr, payloadPtr in
-    guard let typePtr, let idPtr, let payloadPtr else {
-      logWarn("invoke called with nil arguments")
-      return nil
-    }
-    let type = String(cString: typePtr)
-    let id = String(cString: idPtr)
-    let payload = String(cString: payloadPtr)
-
-    if let frame = resolveAgentFrame(ctxPtr, caller: "invoke") {
-      return makeCString(
-        handleInvoke(state: frame.state, type: type, id: id, payload: payload))
-    }
-
-    // No per-agent frame. Artifact events specifically have a fallback
-    // path (see `routeArtifactWithoutFrame`); everything else is rejected.
-    if type == "artifact" {
-      return makeCString(routeArtifactWithoutFrame(ctxPtr: ctxPtr, payload: payload))
-    }
-    return makeCString(noAgentInvokeEnvelope)
-  }
-
-  api.handle_route = { ctxPtr, requestJsonPtr in
-    guard let requestJsonPtr else {
-      logWarn("handle_route called with nil request")
-      return nil
-    }
-    guard let frame = resolveAgentFrame(ctxPtr, caller: "handle_route") else {
-      return makeCString(makeRouteResponse(status: 503, body: noAgentRouteResponse))
-    }
-    return makeCString(
-      handleRoute(
+      // No per-agent frame. Artifact events specifically have a fallback
+      // path (see `routeArtifactWithoutFrame`); everything else is rejected.
+      if type == "artifact" {
+        return osrMakeCString(routeArtifactWithoutFrame(ctxPtr: ctxPtr, payload: payload))
+      }
+      return osrMakeCString(noAgentInvokeEnvelope)
+    },
+    handleRoute: { ctxPtr, requestJsonPtr in
+      guard let requestJsonPtr else {
+        logWarn("handle_route called with nil request")
+        return nil
+      }
+      guard let frame = resolveAgentFrame(ctxPtr, caller: "handle_route") else {
+        return osrMakeCString(makeRouteResponse(status: 503, body: noAgentRouteResponse))
+      }
+      return osrMakeCString(
+        handleRoute(
+          state: frame.state, agentId: frame.agentId,
+          requestJSON: String(cString: requestJsonPtr)))
+    },
+    onConfigChanged: { ctxPtr, keyPtr, valuePtr in
+      guard let keyPtr else {
+        logWarn("on_config_changed called with nil key")
+        return
+      }
+      let key = String(cString: keyPtr)
+      // Pre-flight ABI probe (v6+). The host fires this synthetic
+      // (key, UUID) pair through `on_config_changed` before any real
+      // per-agent push, specifically to trigger a misalignment crash if
+      // the `osr_host_api` mirror is wrong. Early-return here keeps the
+      // probe cheap and stops a synthetic agent_id from leaking into the
+      // registry (which would generate a webhook_secret for a
+      // non-existent agent). See docs/plugins/HOST_API.md → "Pre-flight
+      // ABI probe".
+      if key == "__osaurus_abi_probe__" {
+        logDebug("on_config_changed: ABI probe acknowledged")
+        return
+      }
+      guard let frame = resolveAgentFrame(ctxPtr, caller: "on_config_changed") else { return }
+      onConfigChanged(
+        state: frame.state,
+        key: key,
+        value: valuePtr.map { String(cString: $0) })
+    },
+    onTaskEvent: { ctxPtr, taskIdPtr, eventType, eventJsonPtr in
+      guard let taskIdPtr, let eventJsonPtr else {
+        logWarn("on_task_event called with nil arguments")
+        return
+      }
+      guard let frame = resolveAgentFrame(ctxPtr, caller: "on_task_event") else { return }
+      handleTaskEvent(
         state: frame.state, agentId: frame.agentId,
-        requestJSON: String(cString: requestJsonPtr)))
-  }
-
-  api.on_config_changed = { ctxPtr, keyPtr, valuePtr in
-    guard let keyPtr else {
-      logWarn("on_config_changed called with nil key")
-      return
+        taskId: String(cString: taskIdPtr),
+        eventType: eventType,
+        eventJSON: String(cString: eventJsonPtr))
     }
-    let key = String(cString: keyPtr)
-    // Pre-flight ABI probe (v6+). The host fires this synthetic
-    // (key, UUID) pair through `on_config_changed` before any real
-    // per-agent push, specifically to trigger a misalignment crash if
-    // our `osr_host_api` mirror is wrong. Early-return here keeps the
-    // probe cheap and stops a synthetic agent_id from leaking into the
-    // registry (which would generate a webhook_secret for a
-    // non-existent agent). See docs/plugins/HOST_API.md → "Pre-flight
-    // ABI probe".
-    if key == "__osaurus_abi_probe__" {
-      logDebug("on_config_changed: ABI probe acknowledged")
-      return
-    }
-    guard let frame = resolveAgentFrame(ctxPtr, caller: "on_config_changed") else { return }
-    onConfigChanged(
-      state: frame.state,
-      key: key,
-      value: valuePtr.map { String(cString: $0) })
-  }
-
-  api.on_task_event = { ctxPtr, taskIdPtr, eventType, eventJsonPtr in
-    guard let taskIdPtr, let eventJsonPtr else {
-      logWarn("on_task_event called with nil arguments")
-      return
-    }
-    guard let frame = resolveAgentFrame(ctxPtr, caller: "on_task_event") else { return }
-    handleTaskEvent(
-      state: frame.state, agentId: frame.agentId,
-      taskId: String(cString: taskIdPtr),
-      eventType: eventType,
-      eventJSON: String(cString: eventJsonPtr))
-  }
-
-  return api
+  )
 }
 
 // MARK: - Invoke dispatcher
@@ -268,11 +272,11 @@ private func logHostAPIAvailability() {
 
 @_cdecl("osaurus_plugin_entry_v2")
 public func osaurus_plugin_entry_v2(_ host: UnsafeRawPointer?) -> UnsafeRawPointer? {
-  hostAPI = host?.assumingMemoryBound(to: osr_host_api.self)
-  return UnsafeRawPointer(&api)
+  hostAPI = host?.assumingMemoryBound(to: OsrHostAPI.self)
+  return PluginEntry.enterV2(host, api: &api)
 }
 
 @_cdecl("osaurus_plugin_entry")
 public func osaurus_plugin_entry() -> UnsafeRawPointer? {
-  return UnsafeRawPointer(&api)
+  return PluginEntry.enterV1(api: &api)
 }

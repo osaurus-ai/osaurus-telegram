@@ -1,4 +1,5 @@
 import Foundation
+import OsaurusPluginABI
 import SQLite3
 
 @testable import osaurus_telegram
@@ -106,7 +107,7 @@ enum TestHostGlobals {
   nonisolated(unsafe) static var simulatedWebhookErrorMessage: String?
   nonisolated(unsafe) static var simulatedWebhookErrorDate: Int = 0
 
-  nonisolated(unsafe) static var apiTable = osr_host_api()
+  nonisolated(unsafe) static var apiTable = OsrHostAPI()
 }
 
 enum TestHost {
@@ -142,7 +143,7 @@ enum TestHost {
     precondition(rc == SQLITE_OK, "failed to open in-memory sqlite")
     TestHostGlobals.db = handle
 
-    var api = osr_host_api()
+    var api = OsrHostAPI()
     api.version = 6
     api.config_get = stub_config_get
     api.config_set = stub_config_set
@@ -166,13 +167,18 @@ enum TestHost {
 
     TestHostGlobals.apiTable = api
     withUnsafePointer(to: &TestHostGlobals.apiTable) { ptr in
+      // Same injection path as production entry_v2: raw pointer for the
+      // slots the bridge doesn't cover (db/http/dispatch/file_read/...),
+      // plus HostBridge for config/log/agent-id/free.
       hostAPI = ptr
+      HostBridge.shared.install(ptr)
     }
   }
 
   /// Tears down the stub host API. Call from `tearDown`.
   static func uninstall() {
     hostAPI = nil
+    HostBridge.shared.install(nil)
     if let handle = TestHostGlobals.db {
       sqlite3_close(handle)
       TestHostGlobals.db = nil
@@ -219,7 +225,7 @@ enum TestHost {
 
 // MARK: - C function pointer stubs
 
-private let stub_config_get: osr_config_get_fn = { keyPtr in
+private let stub_config_get: OsrConfigGetFn = { keyPtr in
   guard let keyPtr else { return nil }
   let key = String(cString: keyPtr)
   // Mirrors the real host: outside a per-agent frame we'd resolve to
@@ -231,7 +237,7 @@ private let stub_config_get: osr_config_get_fn = { keyPtr in
   return UnsafePointer(strdup(value))
 }
 
-private let stub_config_set: osr_config_set_fn = { keyPtr, valuePtr in
+private let stub_config_set: OsrConfigSetFn = { keyPtr, valuePtr in
   guard let keyPtr, let valuePtr,
     let agent = TestHostGlobals.activeAgentId
   else { return }
@@ -239,16 +245,16 @@ private let stub_config_set: osr_config_set_fn = { keyPtr, valuePtr in
     String(cString: valuePtr)
 }
 
-private let stub_config_delete: osr_config_delete_fn = { keyPtr in
+private let stub_config_delete: OsrConfigDeleteFn = { keyPtr in
   guard let keyPtr, let agent = TestHostGlobals.activeAgentId else { return }
   TestHostGlobals.configStore[agent]?.removeValue(forKey: String(cString: keyPtr))
 }
 
-private let stub_log: osr_log_fn = { _, _ in /* swallow */ }
+private let stub_log: OsrLogFn = { _, _ in /* swallow */ }
 
-private let stub_log_structured: osr_log_structured_fn = { _, _, _ in /* swallow */ }
+private let stub_log_structured: OsrLogStructuredFn = { _, _, _ in /* swallow */ }
 
-private let stub_get_active_agent_id: osr_get_active_agent_id_fn = {
+private let stub_get_active_agent_id: OsrGetActiveAgentIdFn = {
   guard let id = TestHostGlobals.activeAgentId else { return nil }
   return UnsafePointer(strdup(id))
 }
@@ -257,12 +263,12 @@ private let stub_get_active_agent_id: osr_get_active_agent_id_fn = {
 /// pointer the host allocated with `strdup`. Wiring this in tests means
 /// the production code path (which prefers `host->free_string` over a
 /// direct `libc free()`) is exercised end-to-end.
-private let stub_host_free_string: osr_host_free_string_fn = { ptr in
+private let stub_host_free_string: OsrHostFreeStringFn = { ptr in
   guard let ptr else { return }
   free(UnsafeMutableRawPointer(mutating: ptr))
 }
 
-private let stub_db_exec: osr_db_exec_fn = { sqlPtr, paramsPtr in
+private let stub_db_exec: OsrDbExecFn = { sqlPtr, paramsPtr in
   guard let sqlPtr else { return nil }
   let sql = String(cString: sqlPtr)
   let params = paramsPtr.map { String(cString: $0) } ?? "[]"
@@ -298,7 +304,7 @@ private let stub_db_exec: osr_db_exec_fn = { sqlPtr, paramsPtr in
   return UnsafePointer(strdup(#"{"changes":\#(changes),"last_insert_rowid":\#(lastId)}"#))
 }
 
-private let stub_db_query: osr_db_query_fn = { sqlPtr, paramsPtr in
+private let stub_db_query: OsrDbQueryFn = { sqlPtr, paramsPtr in
   guard let sqlPtr else { return nil }
   let sql = String(cString: sqlPtr)
   let params = paramsPtr.map { String(cString: $0) } ?? "[]"
@@ -338,7 +344,7 @@ private let stub_db_query: osr_db_query_fn = { sqlPtr, paramsPtr in
   return UnsafePointer(strdup(str))
 }
 
-private let stub_dispatch: osr_dispatch_fn = { reqPtr in
+private let stub_dispatch: OsrDispatchFn = { reqPtr in
   guard let reqPtr else { return nil }
   let req = String(cString: reqPtr)
   if let parsed = parseJSONObject(req) {
@@ -352,18 +358,18 @@ private let stub_dispatch: osr_dispatch_fn = { reqPtr in
   return UnsafePointer(strdup(TestHostGlobals.nextDispatchResponse))
 }
 
-private let stub_dispatch_cancel: osr_dispatch_cancel_fn = { taskIdPtr in
+private let stub_dispatch_cancel: OsrDispatchCancelFn = { taskIdPtr in
   guard let taskIdPtr else { return }
   TestHostGlobals.cancelCalls.append(String(cString: taskIdPtr))
 }
 
-private let stub_dispatch_interrupt: osr_dispatch_interrupt_fn = { taskIdPtr, textPtr in
+private let stub_dispatch_interrupt: OsrDispatchInterruptFn = { taskIdPtr, textPtr in
   guard let taskIdPtr, let textPtr else { return }
   TestHostGlobals.interruptCalls.append(
     (taskId: String(cString: taskIdPtr), text: String(cString: textPtr)))
 }
 
-private let stub_http_request: osr_http_request_fn = { reqPtr in
+private let stub_http_request: OsrHttpRequestFn = { reqPtr in
   guard let reqPtr else { return nil }
   let req = String(cString: reqPtr)
   let parsed = parseJSONObject(req)
@@ -434,7 +440,7 @@ private func buildGetWebhookInfoResponse() -> String {
     data: try! JSONSerialization.data(withJSONObject: env), encoding: .utf8)!
 }
 
-private let stub_list_active_tasks: osr_list_active_tasks_fn = {
+private let stub_list_active_tasks: OsrListActiveTasksFn = {
   return UnsafePointer(strdup(#"{"tasks":[]}"#))
 }
 
@@ -442,7 +448,7 @@ private let stub_list_active_tasks: osr_list_active_tasks_fn = {
 /// `path` field and returns either `{"data": <base64>, "mime_type": "..."}`
 /// or `{"error": "..."}`. Tests seed `fileReadStore` (success) or
 /// `fileReadError` (failure) before driving `handleArtifactShare`.
-private let stub_file_read: osr_file_read_fn = { reqPtr in
+private let stub_file_read: OsrFileReadFn = { reqPtr in
   guard let reqPtr else { return nil }
   let req = String(cString: reqPtr)
   let path = (parseJSONObject(req)?["path"] as? String) ?? ""
