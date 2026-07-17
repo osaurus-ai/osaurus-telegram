@@ -15,17 +15,28 @@ import Foundation
 // plugin can register the webhook with Telegram. Without that field the
 // per-agent autoconfig flow does not fire.
 
+/// Single source of truth for the plugin version. Keep in lockstep with
+/// `osaurus-plugin.json` (ManifestTests pins the alignment).
+let telegramPluginVersion = "1.5.1"
+
+/// Earliest Osaurus host guaranteeing ABI v4 (`get_active_agent_id`),
+/// which every per-agent callback in this plugin depends on. 0.18.14 is
+/// the floor the osaurus-resend plugin (same ABI requirement) ships
+/// with; older hosts leave the v4 slot NULL and per-agent routing
+/// silently degrades.
+let telegramMinOsaurusVersion = "0.18.14"
+
 let pluginManifestJSON = #"""
   {
     "plugin_id": "osaurus.telegram",
     "name": "Telegram",
-    "version": "1.5.0",
+    "version": "\#(telegramPluginVersion)",
     "description": "Conversational Telegram bot. Each chat becomes a continuous Osaurus session and the agent talks to the user via reply tools.",
     "instructions": "You are connected to a Telegram chat. Each user message arrives prefixed with [reply_token <token> from <name>]. In group chats the header also carries `in_group reply_to_message_id=<id>` \u2014 thread your replies by passing that id as `reply_to_message_id` so the answer doesn't get lost in busy chats. The ONLY way the user sees anything is through the `reply` family of tools \u2014 every other tool (sandbox_exec, http_request, search_memory, clarify, etc.) is internal and invisible to them. The turn is not over until you have called `reply` (or another reply_* tool) with the answer.\n\nDo NOT call the `clarify` tool. Telegram has no native clarification UI \u2014 a `clarify` call lands silently on the user's end. If you need more information, call `reply` with the question phrased conversationally (you can list options as a short bulleted list inside the text, or attach an `inline_keyboard` for quick-pick buttons), then end the turn. The user's next chat message will continue the same session and your follow-up dispatch will receive it as the next user turn.\n\nRequired pattern for every user turn:\n1. (optional) call `reply_typing` if the next step is slow.\n2. (optional) call any data-gathering tools you need.\n3. ALWAYS call `reply` (or a `reply_*` media tool) with the answer (or the clarifying question), passing the exact reply_token verbatim, before ending the turn or calling any \"complete\"/\"done\" signal. Never end a turn with only a tool result \u2014 the user will see nothing.\n4. Call `reply` multiple times if it helps (one message per major thought). Keep each text under 4000 characters.\n\nRich media: send `reply_photo` with a public image URL, `reply_document` for files (PDFs, transcripts, archives), `reply_voice` for ogg/opus voice notes, `reply_audio` for music, `reply_video` for video. All of them accept a public URL and an optional caption (max 1024 chars). For inline keyboards on a `reply`, pass `inline_keyboard` as a 2D array of `{text, callback_data}` (or `{text, url}`) buttons; the user's button press will arrive as a follow-up user turn whose body is `[button:<callback_data>]`.\n\nFiles you generate in the sandbox (images, PDFs, transcripts, screenshots, etc.) are auto-forwarded to the user by the host \u2014 you do NOT need a tool call for them. Just produce the file and continue with `reply` for any narration. Do not try to attach sandbox paths via any tool; the auto-forward handles it.\n\nDo not echo the reply_token, the bracketed header, or any meta text \u2014 only conversational content goes in `reply.text`.",
     "license": "MIT",
     "authors": [],
     "min_macos": "15.0",
-    "min_osaurus": "0.5.0",
+    "min_osaurus": "\#(telegramMinOsaurusVersion)",
     "capabilities": {
       "artifact_handler": true,
       "routes": [
