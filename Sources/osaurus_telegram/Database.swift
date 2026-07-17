@@ -169,6 +169,19 @@ enum DatabaseManager {
         "ALTER TABLE seen_updates ADD COLUMN completed INTEGER NOT NULL DEFAULT 1",
         params: "[]")
     }
+
+    // v4.1 → v4.2 (Wave 2 async drain): seen_updates gains `payload`, the
+    // raw Telegram Update JSON persisted atomically WITH the claim. The
+    // webhook handler responds 200 the moment the claim+payload row is
+    // durable; a background worker drains it. Wave-1 rows have no payload
+    // (NULL) — they were processed synchronously, so reconciliation skips
+    // them and they age out via the 24h prune.
+    if tableExists("seen_updates"),
+      !columnExists(table: "seen_updates", column: "payload")
+    {
+      logInfo("Database: adding seen_updates.payload for durable async drain")
+      dbExec("ALTER TABLE seen_updates ADD COLUMN payload TEXT", params: "[]")
+    }
   }
 
   // MARK: - Schema introspection
@@ -606,9 +619,14 @@ enum DatabaseManager {
     case claimed
     /// A previous delivery was fully processed; ack with 200 and skip.
     case alreadyCompleted
-    /// Another delivery of the same update is still inside its lease;
-    /// answer 5xx so Telegram retries after the lease expires.
+    /// Another delivery of the same update is still inside its lease (or
+    /// awaiting reconciliation). Since Wave 2 the payload is durably
+    /// stored with the claim, so retries are acked 200 without enqueueing.
     case inFlight
+    /// The claim could not be durably recorded (host DB unavailable).
+    /// Durable-first: the webhook must answer 5xx so the provider's retry
+    /// remains the recovery path for the enqueue step itself.
+    case storeUnavailable
   }
 
   /// An incomplete claim older than this is treated as abandoned (the
@@ -620,25 +638,72 @@ enum DatabaseManager {
   /// affected-row check. Fresh ids insert an incomplete row; stale
   /// incomplete rows (lease expired) are re-claimed; completed rows and
   /// in-lease claims leave 0 rows affected.
-  static func claimUpdate(agentId: String, updateId: Int) -> UpdateClaim {
+  ///
+  /// `payload` (Wave 2) is the raw Telegram Update JSON, persisted in the
+  /// SAME statement as the claim so "claimed" always implies "durably
+  /// enqueued" — there is no window where a crash loses the update after
+  /// the 200 went out. Pass nil to preserve whatever payload the row
+  /// already carries (lease takeover keeps the original delivery's body).
+  static func claimUpdate(
+    agentId: String, updateId: Int, payload: String? = nil
+  ) -> UpdateClaim {
     let now = Int(Date().timeIntervalSince1970)
     let sql = """
-      INSERT INTO seen_updates (agent_id, update_id, seen_at, completed)
-      VALUES (?1, ?2, ?3, 0)
-      ON CONFLICT(agent_id, update_id) DO UPDATE SET seen_at = ?3
+      INSERT INTO seen_updates (agent_id, update_id, seen_at, completed, payload)
+      VALUES (?1, ?2, ?3, 0, ?4)
+      ON CONFLICT(agent_id, update_id) DO UPDATE SET
+          seen_at = ?3,
+          payload = COALESCE(?4, seen_updates.payload)
         WHERE seen_updates.completed = 0
           AND seen_updates.seen_at < (?3 - \(updateClaimLeaseSeconds))
       """
-    if dbExec(sql, params: serializeParams([agentId, updateId, now])) > 0 {
+    let params = serializeParams([agentId, updateId, now, payload ?? NSNull()])
+    if dbExec(sql, params: params) > 0 {
       return .claimed
     }
     let probe =
       "SELECT completed FROM seen_updates WHERE agent_id = ?1 AND update_id = ?2 LIMIT 1"
     guard let resultStr = dbQuery(probe, params: serializeParams([agentId, updateId])),
-      let rows = extractRows(resultStr),
-      let row = rows.first, !row.isEmpty
-    else { return .inFlight }
+      let rows = extractRows(resultStr)
+    else { return .storeUnavailable }
+    guard let row = rows.first, !row.isEmpty else {
+      // INSERT affected nothing AND no row exists — the write itself
+      // failed (DB unavailable / error), not a claim conflict.
+      return .storeUnavailable
+    }
     return (intFromAny(row[0]) ?? 0) == 1 ? .alreadyCompleted : .inFlight
+  }
+
+  /// One resumable inbox row: an incomplete claim whose lease has expired
+  /// and whose raw payload is still available for reprocessing.
+  struct StaleClaimRow {
+    let updateId: Int
+    let payload: String
+  }
+
+  /// Incomplete claims older than the lease that still carry a payload —
+  /// i.e. updates a crashed/failed worker left behind. Ordered oldest
+  /// first so reconciliation drains in arrival order. Rows without a
+  /// payload (pre-Wave-2, or synthetic test claims) are skipped: there is
+  /// nothing to reprocess, and they age out via the 24h prune.
+  static func staleIncompleteUpdates(agentId: String, limit: Int = 16) -> [StaleClaimRow] {
+    let cutoff = Int(Date().timeIntervalSince1970) - updateClaimLeaseSeconds
+    let sql = """
+      SELECT update_id, payload FROM seen_updates
+      WHERE agent_id = ?1 AND completed = 0 AND payload IS NOT NULL
+        AND seen_at < ?2
+      ORDER BY seen_at ASC
+      LIMIT ?3
+      """
+    guard let resultStr = dbQuery(sql, params: serializeParams([agentId, cutoff, limit])),
+      let rows = extractRows(resultStr)
+    else { return [] }
+    return rows.compactMap { row -> StaleClaimRow? in
+      guard row.count >= 2, let updateId = intFromAny(row[0]),
+        let payload = row[1] as? String
+      else { return nil }
+      return StaleClaimRow(updateId: updateId, payload: payload)
+    }
   }
 
   /// Marks a claimed update as fully processed. Only after this call do
@@ -649,13 +714,11 @@ enum DatabaseManager {
       params: serializeParams([agentId, updateId]))
   }
 
-  /// Releases an incomplete claim after a transient failure so Telegram's
-  /// retry can re-claim immediately instead of waiting out the lease.
-  static func releaseUpdate(agentId: String, updateId: Int) {
-    dbExec(
-      "DELETE FROM seen_updates WHERE agent_id = ?1 AND update_id = ?2 AND completed = 0",
-      params: serializeParams([agentId, updateId]))
-  }
+  // NOTE: Wave 1's `releaseUpdate` (DELETE on transient failure so Telegram's
+  // retry re-claims immediately) was removed in Wave 2: the 200 already went
+  // out at enqueue time, so deleting the row would orphan the update if
+  // Telegram never redelivers. Failed claims now stay incomplete and are
+  // reprocessed from the stored payload once the lease expires.
 
   static func isUpdateAlreadySeen(agentId: String, updateId: Int) -> Bool {
     let sql =

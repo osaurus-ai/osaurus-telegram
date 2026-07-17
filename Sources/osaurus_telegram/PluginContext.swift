@@ -45,6 +45,60 @@ final class AgentState: @unchecked Sendable {
   private let hydrationLock = NSLock()
   private var didHydrate = false
 
+  /// Background webhook worker (Wave 2): drains claimed updates off the
+  /// request path, serialized per chat. Owned here so its lifetime matches
+  /// the agent's and its lanes are naturally agent-scoped.
+  let webhookWorker: WebhookWorkQueue
+
+  // MARK: - Webhook health (Wave 2)
+  //
+  // Written from worker threads (which cannot touch agent-scoped config —
+  // host config resolution is TLS-frame-based), read + persisted by the
+  // next in-frame callback via `persistPendingWebhookHealth`.
+  private let healthLock = NSLock()
+  private var lastVerifiedAt: Int?
+  private var lastDeliveryError: String?
+  private var healthDirty = false
+  private var lastHealthRefreshAt = 0
+
+  /// Telegram confirmed our registration with no recent delivery error.
+  /// Clears any previously recorded delivery error.
+  func recordWebhookVerified(at timestamp: Int) {
+    healthLock.lock()
+    defer { healthLock.unlock() }
+    lastVerifiedAt = timestamp
+    lastDeliveryError = nil
+    healthDirty = true
+  }
+
+  /// Most recent delivery/processing error, kept for health surfacing.
+  func recordDeliveryError(_ message: String) {
+    healthLock.lock()
+    defer { healthLock.unlock() }
+    lastDeliveryError = message
+    healthDirty = true
+  }
+
+  /// Test-and-set throttle for the opportunistic `getWebhookInfo` probe:
+  /// returns true (and stamps the slot) at most once per `interval`.
+  func claimHealthRefreshSlot(now: Int, interval: Int) -> Bool {
+    healthLock.lock()
+    defer { healthLock.unlock() }
+    guard now - lastHealthRefreshAt >= interval else { return false }
+    lastHealthRefreshAt = now
+    return true
+  }
+
+  /// Pops the health snapshot when something changed since the last
+  /// persist; nil when clean. Callers persist to config in-frame.
+  func takeHealthSnapshotIfDirty() -> (lastVerifiedAt: Int?, lastDeliveryError: String?)? {
+    healthLock.lock()
+    defer { healthLock.unlock() }
+    guard healthDirty else { return nil }
+    healthDirty = false
+    return (lastVerifiedAt, lastDeliveryError)
+  }
+
   /// Per-agent set of `host_path`s that the plugin has already uploaded to
   /// Telegram for this agent. Idempotency for the artifact auto-forward
   /// hook: if the host fires `invoke(type: "artifact")` twice for the same
@@ -70,6 +124,8 @@ final class AgentState: @unchecked Sendable {
 
   init(agentId: String) {
     self.agentId = agentId
+    self.webhookWorker = WebhookWorkQueue(
+      label: "osaurus.telegram.webhook-worker.\(agentId)")
   }
 
   /// Atomically inserts `path` into the per-agent uploaded set.
@@ -215,6 +271,11 @@ final class PluginContext: @unchecked Sendable {
       setWebhookRegistered(false)
       logWebhookWaitingState(state: state)
     }
+
+    // Startup reconciliation (Wave 2): claims a previous plugin load left
+    // incomplete (crash mid-drain) are reprocessed from their stored
+    // payloads once the lease has expired.
+    triggerReconciliation(state: state, agentId: state.agentId)
   }
 }
 
@@ -291,10 +352,7 @@ func setupWebhook(state: AgentState, token: String, tunnelURL: String) {
     return
   }
 
-  let pluginId = "osaurus.telegram"
-  let webhookURL =
-    tunnelURL.trimmingCharacters(in: .init(charactersIn: "/"))
-    + "/plugins/\(pluginId)/webhook"
+  let webhookURL = makeWebhookURL(tunnelURL: tunnelURL)
   state.log(.debug, "setupWebhook: registering webhook at \(webhookURL)")
 
   // Decide whether to drop Telegram's pending-update queue. On a fresh
@@ -330,6 +388,11 @@ func setupWebhook(state: AgentState, token: String, tunnelURL: String) {
   // to it (e.g. our tunnel went down between requests).
   if verifyWebhook(token: token, expectedURL: webhookURL) {
     setWebhookRegistered(true)
+    // Registration is one of the opportunistic health checkpoints:
+    // Telegram just confirmed the URL, so stamp last_verified_at. We're
+    // inside a per-agent frame here, so persist immediately.
+    state.recordWebhookVerified(at: Int(Date().timeIntervalSince1970))
+    persistPendingWebhookHealth(state: state)
     state.log(.info, "Webhook registered at \(webhookURL)")
     // Populate the "/" command menu so users discover bot-supported
     // commands without reading docs. Best-effort: failures here don't
@@ -338,11 +401,22 @@ func setupWebhook(state: AgentState, token: String, tunnelURL: String) {
   } else {
     // Don't trust the optimistic setWebhook response — the indicator stays
     // red so the user sees something is wrong.
+    state.recordDeliveryError(
+      "setWebhook accepted but Telegram doesn't confirm \(webhookURL) "
+        + "or reports a recent delivery error")
+    persistPendingWebhookHealth(state: state)
     state.log(
       .error,
       "setWebhook accepted, but Telegram doesn't confirm \(webhookURL) "
         + "or is reporting a recent delivery error.")
   }
+}
+
+/// Canonical webhook URL for a tunnel base URL. Shared by registration
+/// and the opportunistic health probe so both verify the same thing.
+func makeWebhookURL(tunnelURL: String) -> String {
+  tunnelURL.trimmingCharacters(in: .init(charactersIn: "/"))
+    + "/plugins/osaurus.telegram/webhook"
 }
 
 /// Default "/" menu entries exposed to the Telegram client. Mirrors the

@@ -28,11 +28,15 @@ actor PerChatSendActor {
   ) async -> T {
     let key = ChatKey(agentId: agentId, chatId: chatId)
     let prior = inflight[key]
-    let new = Task<Void, Never> {
+    // The chained task must include `work()` ITSELF, not just the wait on
+    // the predecessor — the previous implementation stored a task that
+    // only awaited `prior`, so two rapid callers could both see it finish
+    // and run their work concurrently, breaking FIFO delivery.
+    let current = Task<T, Never> {
       if let prior { await prior.value }
+      return await work()
     }
-    inflight[key] = new
-    await new.value
-    return await work()
+    inflight[key] = Task<Void, Never> { _ = await current.value }
+    return await current.value
   }
 }
