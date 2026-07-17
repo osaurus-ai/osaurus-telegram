@@ -37,27 +37,44 @@ final class ReliabilityRegressionTests: XCTestCase {
       handleRoute(state: state, agentId: agentId, requestJSON: requestJSON))
   }
 
-  // MARK: - Claim-then-complete
+  // MARK: - Claim-then-complete (Wave 2: claim-then-async-drain)
 
-  func testTransientDispatchFailureReturns503AndRedeliveryProcesses() {
+  func testTransientDispatchFailureLeavesClaimResumableAndReconciliationReprocesses() {
     // First delivery: the host's dispatch returns garbage (host mid-crash
-    // / unavailable). The update must NOT be acked with 200 — that would
-    // burn Telegram's only retry mechanism.
+    // / unavailable). Wave 2 contract: the webhook already answered 200
+    // after the durable enqueue; the worker's failure must leave the
+    // claim INCOMPLETE (with the payload intact) so reconciliation can
+    // reprocess it after the lease expires.
     TestHostGlobals.nextDispatchResponse = "not-json"
     let update = textUpdate(updateId: 7_001, chatId: 71, text: "hello")
     let first = route(webhookRequest(secret: secret, update: update))
     XCTAssertEqual(
-      first.status, 503,
-      "transient dispatch failure must surface as retryable 5xx")
+      first.status, 200,
+      "the update was durably enqueued; the 200 must not depend on processing")
+    XCTAssertEqual(TestHostGlobals.dispatchCalls.count, 1)
 
-    // Redelivery of the SAME update_id: dispatch works now, the turn
-    // must go through (the failed claim was released).
+    // Redelivery while the failed claim is still inside its lease: acked
+    // without re-processing (the payload is already durably queued).
+    let inLease = route(webhookRequest(secret: secret, update: update))
+    XCTAssertEqual(inLease.status, 200)
+    XCTAssertEqual(
+      TestHostGlobals.dispatchCalls.count, 1,
+      "an in-lease retry must not double-process")
+
+    // Age the claim past the lease (as if the worker crashed) and let a
+    // redelivery take it over: dispatch works now, so the turn goes
+    // through and the claim completes.
+    let stale = Int(Date().timeIntervalSince1970)
+      - DatabaseManager.updateClaimLeaseSeconds - 10
+    _ = DatabaseManager.dbExec(
+      "UPDATE seen_updates SET seen_at = ?1 WHERE agent_id = ?2 AND update_id = ?3",
+      params: "[\(stale),\"\(agentId)\",7001]")
     TestHostGlobals.nextDispatchResponse = #"{"id":"task-retry","status":"running"}"#
     let second = route(webhookRequest(secret: secret, update: update))
     XCTAssertEqual(second.status, 200)
     XCTAssertEqual(
       TestHostGlobals.dispatchCalls.count, 2,
-      "redelivery after a transient failure must re-process the update")
+      "lease takeover must re-process the update")
 
     // Third delivery is a true duplicate of a COMPLETED update.
     let third = route(webhookRequest(secret: secret, update: update))
@@ -67,16 +84,20 @@ final class ReliabilityRegressionTests: XCTestCase {
       "a completed update must never be re-dispatched")
   }
 
-  func testInFlightClaimReturns503WithoutProcessing() {
-    // Simulate another delivery of the same update still being processed.
+  func testInFlightClaimAcksWithoutProcessing() {
+    // Simulate another delivery of the same update still being processed
+    // by the worker. Wave 2 contract: the retry is acked 200 (payload is
+    // durably enqueued) but MUST NOT enqueue/process a second time.
     XCTAssertEqual(
-      DatabaseManager.claimUpdate(agentId: agentId, updateId: 7_002), .claimed)
+      DatabaseManager.claimUpdate(
+        agentId: agentId, updateId: 7_002, payload: #"{"update_id":7002}"#),
+      .claimed)
 
     let update = textUpdate(updateId: 7_002, chatId: 72, text: "dup")
     let result = route(webhookRequest(secret: secret, update: update))
     XCTAssertEqual(
-      result.status, 503,
-      "an in-lease claim must ask Telegram to retry later, not double-process")
+      result.status, 200,
+      "an in-lease claim is already durably enqueued; ack without double-processing")
     XCTAssertTrue(TestHostGlobals.dispatchCalls.isEmpty)
   }
 

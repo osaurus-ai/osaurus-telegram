@@ -101,6 +101,12 @@ enum TestHostGlobals {
   /// assert the artifact hook forwarded the host payload's path verbatim.
   nonisolated(unsafe) static var fileReadCalls: [String] = []
 
+  /// When true, the db_exec / db_query stubs return nil — simulating a
+  /// host whose database layer is unavailable. Durable-first tests use
+  /// this to verify the webhook refuses to ack un-persisted updates.
+  nonisolated(unsafe) static var failDbExec = false
+  nonisolated(unsafe) static var failDbQuery = false
+
   /// If non-nil, the stubbed `getWebhookInfo` reports this delivery error.
   /// Tests can set this to simulate "Telegram accepted setWebhook but
   /// can't actually reach the URL" scenarios.
@@ -114,6 +120,15 @@ enum TestHost {
 
   /// Installs the stub host API. Call from `setUp`.
   static func install() {
+    // Webhook worker runs inline by default so the existing synchronous
+    // suites can assert right after `handleRoute` returns. Async-drain
+    // regression tests flip this off and synchronize via
+    // `state.webhookWorker.waitUntilIdle()`.
+    WebhookWorkQueue.executeInlineForTesting = true
+    // Health probes are opportunistic and throttled; the throttle state
+    // lives per-AgentState so fresh states in each test start clean.
+    webhookHealthRefreshIntervalSeconds = 15 * 60
+
     TestHostGlobals.configStore = [:]
     TestHostGlobals.activeAgentId = defaultTestAgentId
     TestHostGlobals.dispatchCalls = []
@@ -133,6 +148,8 @@ enum TestHost {
     TestHostGlobals.fileReadStore = [:]
     TestHostGlobals.fileReadError = nil
     TestHostGlobals.fileReadCalls = []
+    TestHostGlobals.failDbExec = false
+    TestHostGlobals.failDbQuery = false
 
     if TestHostGlobals.db != nil {
       sqlite3_close(TestHostGlobals.db)
@@ -269,6 +286,7 @@ private let stub_host_free_string: OsrHostFreeStringFn = { ptr in
 }
 
 private let stub_db_exec: OsrDbExecFn = { sqlPtr, paramsPtr in
+  if TestHostGlobals.failDbExec { return nil }
   guard let sqlPtr else { return nil }
   let sql = String(cString: sqlPtr)
   let params = paramsPtr.map { String(cString: $0) } ?? "[]"
@@ -305,6 +323,7 @@ private let stub_db_exec: OsrDbExecFn = { sqlPtr, paramsPtr in
 }
 
 private let stub_db_query: OsrDbQueryFn = { sqlPtr, paramsPtr in
+  if TestHostGlobals.failDbQuery { return nil }
   guard let sqlPtr else { return nil }
   let sql = String(cString: sqlPtr)
   let params = paramsPtr.map { String(cString: $0) } ?? "[]"
