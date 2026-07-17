@@ -146,6 +146,7 @@ enum DatabaseManager {
         agent_id       TEXT NOT NULL,
         update_id      INTEGER NOT NULL,
         seen_at        INTEGER NOT NULL,
+        completed      INTEGER NOT NULL DEFAULT 1,
         PRIMARY KEY (agent_id, update_id)
       )
       """,
@@ -153,6 +154,20 @@ enum DatabaseManager {
 
     for sql in statements {
       dbExec(sql, params: "[]")
+    }
+
+    // v4 → v4.1: seen_updates gains `completed` so the inbox is a durable
+    // claim (claim-then-complete) instead of mark-before-processing. Legacy
+    // rows were only ever written by fully-acked updates, so backfilling
+    // them as completed (the column default) is correct and avoids a
+    // reprocessing storm on upgrade.
+    if tableExists("seen_updates"),
+      !columnExists(table: "seen_updates", column: "completed")
+    {
+      logInfo("Database: adding seen_updates.completed for claim-then-complete inbox")
+      dbExec(
+        "ALTER TABLE seen_updates ADD COLUMN completed INTEGER NOT NULL DEFAULT 1",
+        params: "[]")
     }
   }
 
@@ -583,7 +598,64 @@ enum DatabaseManager {
     )
   }
 
-  // MARK: - seen_updates
+  // MARK: - seen_updates (claim-then-complete inbox)
+
+  enum UpdateClaim {
+    /// This delivery is ours to process (fresh id, or takeover of a stale
+    /// claim left behind by a crashed/hung run).
+    case claimed
+    /// A previous delivery was fully processed; ack with 200 and skip.
+    case alreadyCompleted
+    /// Another delivery of the same update is still inside its lease;
+    /// answer 5xx so Telegram retries after the lease expires.
+    case inFlight
+  }
+
+  /// An incomplete claim older than this is treated as abandoned (the
+  /// process crashed or hung mid-processing) and may be taken over by a
+  /// Telegram retry. Comfortably above the bounded media-download window.
+  static let updateClaimLeaseSeconds = 120
+
+  /// Atomically claims `update_id` for processing: a single INSERT with an
+  /// affected-row check. Fresh ids insert an incomplete row; stale
+  /// incomplete rows (lease expired) are re-claimed; completed rows and
+  /// in-lease claims leave 0 rows affected.
+  static func claimUpdate(agentId: String, updateId: Int) -> UpdateClaim {
+    let now = Int(Date().timeIntervalSince1970)
+    let sql = """
+      INSERT INTO seen_updates (agent_id, update_id, seen_at, completed)
+      VALUES (?1, ?2, ?3, 0)
+      ON CONFLICT(agent_id, update_id) DO UPDATE SET seen_at = ?3
+        WHERE seen_updates.completed = 0
+          AND seen_updates.seen_at < (?3 - \(updateClaimLeaseSeconds))
+      """
+    if dbExec(sql, params: serializeParams([agentId, updateId, now])) > 0 {
+      return .claimed
+    }
+    let probe =
+      "SELECT completed FROM seen_updates WHERE agent_id = ?1 AND update_id = ?2 LIMIT 1"
+    guard let resultStr = dbQuery(probe, params: serializeParams([agentId, updateId])),
+      let rows = extractRows(resultStr),
+      let row = rows.first, !row.isEmpty
+    else { return .inFlight }
+    return (intFromAny(row[0]) ?? 0) == 1 ? .alreadyCompleted : .inFlight
+  }
+
+  /// Marks a claimed update as fully processed. Only after this call do
+  /// duplicate Telegram deliveries get skipped.
+  static func completeUpdate(agentId: String, updateId: Int) {
+    dbExec(
+      "UPDATE seen_updates SET completed = 1 WHERE agent_id = ?1 AND update_id = ?2",
+      params: serializeParams([agentId, updateId]))
+  }
+
+  /// Releases an incomplete claim after a transient failure so Telegram's
+  /// retry can re-claim immediately instead of waiting out the lease.
+  static func releaseUpdate(agentId: String, updateId: Int) {
+    dbExec(
+      "DELETE FROM seen_updates WHERE agent_id = ?1 AND update_id = ?2 AND completed = 0",
+      params: serializeParams([agentId, updateId]))
+  }
 
   static func isUpdateAlreadySeen(agentId: String, updateId: Int) -> Bool {
     let sql =
@@ -594,11 +666,14 @@ enum DatabaseManager {
     return !rows.isEmpty
   }
 
+  /// Records an update as fully processed in one step. Convenience for
+  /// deterministic-drop paths and tests; equivalent to claim + complete.
   static func markUpdateSeen(agentId: String, updateId: Int) {
     let now = Int(Date().timeIntervalSince1970)
     let sql = """
-      INSERT INTO seen_updates (agent_id, update_id, seen_at) VALUES (?1, ?2, ?3)
-      ON CONFLICT(agent_id, update_id) DO NOTHING
+      INSERT INTO seen_updates (agent_id, update_id, seen_at, completed)
+      VALUES (?1, ?2, ?3, 1)
+      ON CONFLICT(agent_id, update_id) DO UPDATE SET completed = 1
       """
     dbExec(sql, params: serializeParams([agentId, updateId, now]))
   }
@@ -696,22 +771,29 @@ enum DatabaseManager {
     return nil
   }
 
-  static func dbExec(_ sql: String, params: String) {
+  /// Executes a statement and returns the number of affected rows (the
+  /// host replies `{"changes":N,"last_insert_rowid":N}`). 0 on any failure.
+  @discardableResult
+  static func dbExec(_ sql: String, params: String) -> Int {
     guard let exec = hostAPI?.pointee.db_exec else {
       logError("db_exec not available")
-      return
+      return 0
     }
     let result = sql.withCString { sqlPtr in
       params.withCString { paramsPtr in
         exec(sqlPtr, paramsPtr)
       }
     }
-    if let result {
-      let str = String(cString: result)
-      if str.contains("\"error\"") {
-        logWarn("DB exec error: \(str)")
-      }
+    guard let result else { return 0 }
+    let str = String(cString: result)
+    if str.contains("\"error\"") {
+      logWarn("DB exec error: \(str)")
+      return 0
     }
+    guard let data = str.data(using: .utf8),
+      let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return 0 }
+    return intFromAny(dict["changes"] ?? 0) ?? 0
   }
 
   static func dbQuery(_ sql: String, params: String) -> String? {

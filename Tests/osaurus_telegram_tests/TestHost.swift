@@ -31,6 +31,12 @@ let defaultTestAgentId = "agent-default"
 enum TestHostGlobals {
   nonisolated(unsafe) static var db: OpaquePointer?
 
+  /// Serializes every db_exec / db_query against the shared in-memory
+  /// connection, mirroring the real host's per-statement serialization.
+  /// Without it, concurrent claims racing through `sqlite3_changes` (a
+  /// per-connection counter) could observe each other's counts.
+  static let dbLock = NSLock()
+
   /// (agentId → (key → value)). Mirrors the real host's per-agent
   /// (plugin_id, agent_id, key) Keychain partitioning. The active agent
   /// for a given config_get/set call is whatever `activeAgentId` is at
@@ -65,6 +71,11 @@ enum TestHostGlobals {
   /// + getWebhookInfo confirms" or "setWebhook OK + getWebhookInfo shows
   /// recent error" without juggling a queue.
   nonisolated(unsafe) static var httpResponseByMethod: [String: String] = [:]
+
+  /// FIFO response queues per Bot-API method, consulted BEFORE
+  /// `httpResponseByMethod`. Lets a test express sequences like
+  /// "sendChatAction: first a 429, then a 200" for retry-path coverage.
+  nonisolated(unsafe) static var httpResponseQueueByMethod: [String: [String]] = [:]
 
   /// Most recent URL passed to setWebhook. The stubbed `getWebhookInfo`
   /// echoes this when no explicit override is configured, so the
@@ -113,6 +124,7 @@ enum TestHost {
     TestHostGlobals.nextHttpResponse =
       #"{"status":200,"body":"{\"ok\":true,\"result\":{\"message_id\":1}}"}"#
     TestHostGlobals.httpResponseByMethod = [:]
+    TestHostGlobals.httpResponseQueueByMethod = [:]
     TestHostGlobals.lastRegisteredURL = ""
     TestHostGlobals.simulatedWebhookErrorMessage = nil
     TestHostGlobals.simulatedWebhookErrorDate = 0
@@ -171,6 +183,7 @@ enum TestHost {
     TestHostGlobals.interruptCalls = []
     TestHostGlobals.cancelCalls = []
     TestHostGlobals.httpCalls = []
+    TestHostGlobals.httpResponseQueueByMethod = [:]
     TestHostGlobals.dispatchInspector = nil
     TestHostGlobals.fileReadStore = [:]
     TestHostGlobals.fileReadError = nil
@@ -254,6 +267,9 @@ private let stub_db_exec: osr_db_exec_fn = { sqlPtr, paramsPtr in
   let sql = String(cString: sqlPtr)
   let params = paramsPtr.map { String(cString: $0) } ?? "[]"
 
+  TestHostGlobals.dbLock.lock()
+  defer { TestHostGlobals.dbLock.unlock() }
+
   guard let db = TestHostGlobals.db else {
     return UnsafePointer(strdup(#"{"error":"db not open"}"#))
   }
@@ -276,13 +292,19 @@ private let stub_db_exec: osr_db_exec_fn = { sqlPtr, paramsPtr in
     let msg = String(cString: sqlite3_errmsg(db))
     return UnsafePointer(strdup(#"{"error":"\#(msg)"}"#))
   }
-  return UnsafePointer(strdup(#"{"ok":true}"#))
+  // Mirror the real host's exec result: {"changes":N,"last_insert_rowid":N}.
+  let changes = sqlite3_changes(db)
+  let lastId = sqlite3_last_insert_rowid(db)
+  return UnsafePointer(strdup(#"{"changes":\#(changes),"last_insert_rowid":\#(lastId)}"#))
 }
 
 private let stub_db_query: osr_db_query_fn = { sqlPtr, paramsPtr in
   guard let sqlPtr else { return nil }
   let sql = String(cString: sqlPtr)
   let params = paramsPtr.map { String(cString: $0) } ?? "[]"
+
+  TestHostGlobals.dbLock.lock()
+  defer { TestHostGlobals.dbLock.unlock() }
 
   guard let db = TestHostGlobals.db else {
     return UnsafePointer(strdup(#"{"error":"db not open"}"#))
@@ -373,6 +395,16 @@ private let stub_http_request: osr_http_request_fn = { reqPtr in
     TestHostGlobals.httpResponseByMethod["getWebhookInfo"] == nil
   {
     return UnsafePointer(strdup(buildGetWebhookInfoResponse()))
+  }
+
+  // Queued responses win over the static per-method override so tests
+  // can express ordered sequences (e.g. 429 then 200).
+  if let method, var queue = TestHostGlobals.httpResponseQueueByMethod[method],
+    !queue.isEmpty
+  {
+    let response = queue.removeFirst()
+    TestHostGlobals.httpResponseQueueByMethod[method] = queue
+    return UnsafePointer(strdup(response))
   }
 
   let response =

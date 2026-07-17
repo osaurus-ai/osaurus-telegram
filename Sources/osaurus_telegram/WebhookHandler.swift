@@ -9,6 +9,11 @@ let loadingReactionEmoji = "\u{1F440}"
 
 // MARK: - Route Handler
 
+/// Upper bound on accepted request bodies. Telegram Update payloads are a
+/// few KB (text caps at 4096 chars; media arrives as metadata, not bytes);
+/// anything near this size is hostile or corrupt.
+let maxRouteBodyBytes = 1_048_576
+
 func handleRoute(state: AgentState, agentId: String, requestJSON: String) -> String {
   guard let req = parseJSON(requestJSON, as: RouteRequest.self) else {
     logWarn("handleRoute: failed to parse request JSON (\(requestJSON.count) chars)")
@@ -19,11 +24,50 @@ func handleRoute(state: AgentState, agentId: String, requestJSON: String) -> Str
 
   switch req.route_id {
   case "webhook":
+    if let rejection = validateWebhookRequest(req) {
+      return rejection
+    }
     return handleWebhook(state: state, agentId: agentId, req: req)
   default:
     logWarn("handleRoute: unknown route_id '\(req.route_id)'")
     return makeRouteResponse(status: 404, body: #"{"ok":false,"description":"not found"}"#)
   }
+}
+
+/// Method / content-type / body-size gate applied before the webhook handler
+/// runs. Returns a ready-made rejection response, or nil when acceptable.
+private func validateWebhookRequest(_ req: RouteRequest) -> String? {
+  if req.method.uppercased() != "POST" {
+    logWarn("handleRoute: method \(req.method) not allowed for webhook")
+    return makeRouteResponse(
+      status: 405, body: #"{"ok":false,"description":"method not allowed"}"#)
+  }
+  if let body = req.body, body.utf8.count > maxRouteBodyBytes {
+    logWarn("handleRoute: webhook body too large (\(body.utf8.count) bytes)")
+    return makeRouteResponse(
+      status: 413, body: #"{"ok":false,"description":"payload too large"}"#)
+  }
+  if let body = req.body, !body.isEmpty {
+    let contentType = headerValue(req.headers, name: "content-type") ?? ""
+    if !contentType.lowercased().contains("application/json") {
+      logWarn("handleRoute: unsupported webhook content type '\(contentType)'")
+      return makeRouteResponse(
+        status: 415, body: #"{"ok":false,"description":"unsupported media type"}"#)
+    }
+  }
+  return nil
+}
+
+/// Case-insensitive header lookup (HTTP headers are case-insensitive but
+/// the host forwards them verbatim).
+private func headerValue(_ headers: [String: String]?, name: String) -> String? {
+  guard let headers else { return nil }
+  if let exact = headers[name] { return exact }
+  let target = name.lowercased()
+  for (key, value) in headers where key.lowercased() == target {
+    return value
+  }
+  return nil
 }
 
 // MARK: - Webhook Endpoint
@@ -183,21 +227,37 @@ private func handleMessageUpdate(
     return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
   }
 
-  // Idempotency: drop duplicate Telegram retries.
-  if DatabaseManager.isUpdateAlreadySeen(agentId: agentId, updateId: updateId) {
+  // Idempotency: atomically claim the update. The claim is only marked
+  // completed after processing finishes (durable dispatch or a
+  // deterministic drop), so a crash/timeout mid-processing lets Telegram's
+  // retry take over the stale claim instead of being dropped with 200.
+  switch DatabaseManager.claimUpdate(agentId: agentId, updateId: updateId) {
+  case .claimed:
+    break
+  case .alreadyCompleted:
     logDebug("handleMessageUpdate: duplicate update_id=\(updateId), 200 OK")
     return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
+  case .inFlight:
+    logDebug("handleMessageUpdate: update_id=\(updateId) still in flight, asking for retry")
+    return makeRouteResponse(
+      status: 503, body: #"{"ok":false,"description":"update is being processed"}"#)
   }
-  DatabaseManager.markUpdateSeen(agentId: agentId, updateId: updateId)
   DatabaseManager.pruneOldSeenUpdates()
   // active_dispatches rows outlive COMPLETED (see runTerminalSafetyNet),
   // so piggy-back a TTL sweep here instead of running a background timer.
   DatabaseManager.sweepExpiredDispatches()
 
+  // Deterministic drops below complete the claim: retrying them can never
+  // change the outcome, so Telegram should stop redelivering.
+  let completeAndAck: () -> String = {
+    DatabaseManager.completeUpdate(agentId: agentId, updateId: updateId)
+    return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
+  }
+
   // Resolve / refuse blocked chats early.
   if DatabaseManager.isChatBlocked(agentId: agentId, chatId: chatId) {
     logDebug("handleMessageUpdate: chat \(chatId) is blocked, ignoring")
-    return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
+    return completeAndAck()
   }
 
   let userId = effectiveUserId(message: message)
@@ -209,7 +269,7 @@ private func handleMessageUpdate(
   // information the user couldn't already see in any Telegram client.
   if isWhoamiCommand(trimmed) {
     handleWhoami(state: state, message: message)
-    return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
+    return completeAndAck()
   }
 
   // /start and /help are plugin-owned static-text commands. They run
@@ -222,7 +282,7 @@ private func handleMessageUpdate(
         token: token, chatId: chatId, text: staticReply,
         replyToMessageId: incomingMessageId)
     }
-    return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
+    return completeAndAck()
   }
 
   // Allowlist gate (silent). Order: chat-list first (cheap set check),
@@ -231,7 +291,7 @@ private func handleMessageUpdate(
   // explicitly opted for silent drops.
   if let denial = checkAllowlist(state: state, message: message, userId: userId) {
     logInfo(denial)
-    return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
+    return completeAndAck()
   }
 
   // Upsert the per-(agent, chat, user) row so we have a salt to derive
@@ -246,7 +306,7 @@ private func handleMessageUpdate(
     handleReset(
       state: state, agentId: agentId, chatId: chatId, userId: userId,
       scope: resetVerb)
-    return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
+    return completeAndAck()
   }
 
   // Group chats: stay silent unless we're addressed. Doing this AFTER
@@ -259,24 +319,37 @@ private func handleMessageUpdate(
     logDebug(
       "handleMessageUpdate: group chat \(chatId) message not addressed to bot, ignoring "
         + "(user=\(userId))")
-    return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
+    return completeAndAck()
   }
 
-  // Inbound media: download attachments now (synchronously) so the path
-  // is ready to inject into the prompt. Telegram's getFile + bytes
-  // download is fast (single round-trip per file, ~hundreds of ms each
-  // at most for documents under our 20 MB cap); doing it inline keeps
-  // the per-turn order obvious. Failures are logged inside the helper
-  // and return an empty list — the agent still sees the body text.
-  let attachments =
+  // Inbound media: bounded synchronous download (short per-file timeout,
+  // cumulative per-update byte cap, wall-clock budget) so the path is
+  // ready to inject into the prompt without risking a webhook stall long
+  // enough for Telegram to redeliver. Failures don't abort the turn: the
+  // agent is told explicitly which attachments failed instead of the
+  // update silently losing its media.
+  let media =
     hasMedia
     ? downloadInboundMedia(state: state, agentId: agentId, message: message)
-    : []
+    : InboundMediaResult()
 
-  return dispatchUserTurn(
+  // Dispatch, then settle the claim based on the outcome: completed on
+  // durable dispatch (or deterministic drop inside), released on
+  // transient failure so Telegram's retry re-processes the update.
+  switch dispatchUserTurn(
     state: state, agentId: agentId,
     chat: chat, message: message, bodyText: bodyText,
-    incomingMessageId: incomingMessageId, attachments: attachments)
+    incomingMessageId: incomingMessageId, media: media)
+  {
+  case .completed(let response):
+    DatabaseManager.completeUpdate(agentId: agentId, updateId: updateId)
+    return response
+  case .transientFailure(let description):
+    DatabaseManager.releaseUpdate(agentId: agentId, updateId: updateId)
+    logWarn("handleMessageUpdate: transient failure (\(description)), asking Telegram to retry")
+    return makeRouteResponse(
+      status: 503, body: #"{"ok":false,"description":"temporarily unavailable"}"#)
+  }
 }
 
 // MARK: - allowlist gate
@@ -321,16 +394,25 @@ private func checkAllowlist(
   return nil
 }
 
+/// How a user turn ended, from the claim's point of view: `completed`
+/// carries the route response to return after marking the update done;
+/// `transientFailure` means the claim must be released so Telegram's
+/// retry can re-process the turn.
+private enum TurnOutcome {
+  case completed(String)
+  case transientFailure(String)
+}
+
 /// Builds the dispatch payload for a user turn, pre-binds the reply token,
 /// soft-interrupts the prior in-flight task for the same user, and fires
 /// the dispatch. Caller is responsible for the post-dispatch loading-eye
-/// reaction. Returns the route response body.
+/// reaction and for settling the update claim based on the outcome.
 private func dispatchUserTurn(
   state: AgentState, agentId: String,
   chat: ChatSessionRow, message: TGUpdate.Message,
   bodyText: String, incomingMessageId: Int64,
-  attachments: [InboundAttachment] = []
-) -> String {
+  media: InboundMediaResult = InboundMediaResult()
+) -> TurnOutcome {
   let chatId = chat.chatId
   let userId = chat.userId
   let session = sessionUUID(
@@ -354,8 +436,11 @@ private func dispatchUserTurn(
     header += " in_group reply_to_message_id=\(incomingMessageId)"
   }
   header += "] "
-  if let attachmentsSegment = renderAttachmentsHeader(attachments) {
+  if let attachmentsSegment = renderAttachmentsHeader(media.attachments) {
     header += attachmentsSegment + " "
+  }
+  if let failuresSegment = renderAttachmentFailuresHeader(media.failures) {
+    header += failuresSegment + " "
   }
   // For media-only turns Telegram's `text` is empty; tell the agent
   // explicitly so it doesn't think it's missing context.
@@ -420,7 +505,7 @@ private func dispatchUserTurn(
   guard let dispatchJSON = makeJSONString(dispatchPayload) else {
     logError("dispatchUserTurn: failed to serialize dispatch payload")
     DatabaseManager.deleteActiveDispatch(replyToken: replyToken)
-    return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
+    return .transientFailure("dispatch payload serialize failed")
   }
 
   guard let resultStr = callHostString(hostAPI?.pointee.dispatch, dispatchJSON),
@@ -428,13 +513,16 @@ private func dispatchUserTurn(
   else {
     logError("dispatchUserTurn: dispatch unavailable or returned malformed result")
     DatabaseManager.deleteActiveDispatch(replyToken: replyToken)
-    return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
+    return .transientFailure("dispatch unavailable")
   }
 
   if let errCode = parsed.error {
     DatabaseManager.deleteActiveDispatch(replyToken: replyToken)
     if errCode == "rate_limit_exceeded" {
-      // Plugin-owned meta-message: the user must hear *something*.
+      // Plugin-owned meta-message: the user must hear *something*. The
+      // user was told to retry, so the update counts as handled —
+      // letting Telegram redeliver it would double the meta-message
+      // AND eventually re-run a turn the user already re-sent.
       if let token = state.botToken {
         _ = telegramSendMessage(
           token: token, chatId: chatId,
@@ -443,14 +531,14 @@ private func dispatchUserTurn(
     } else {
       logWarn("dispatchUserTurn: dispatch failed: \(errCode)")
     }
-    return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
+    return .completed(makeRouteResponse(status: 200, body: #"{"ok":true}"#))
   }
 
   guard let taskId = parsed.id else {
     logError(
       "dispatchUserTurn: dispatch result missing id: \(String(resultStr.prefix(200)))")
     DatabaseManager.deleteActiveDispatch(replyToken: replyToken)
-    return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
+    return .transientFailure("dispatch result missing id")
   }
 
   // Patch the placeholder task_id so terminal events can resolve back
@@ -467,7 +555,7 @@ private func dispatchUserTurn(
       emoji: loadingReactionEmoji)
   }
 
-  return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
+  return .completed(makeRouteResponse(status: 200, body: #"{"ok":true}"#))
 }
 
 // MARK: - callback_query (inline keyboard button presses)
@@ -477,16 +565,29 @@ private func handleCallbackQuery(
   cb: TGUpdate.CallbackQuery
 ) -> String {
   // Idempotency uses the synthetic update_id Telegram already supplies.
-  if DatabaseManager.isUpdateAlreadySeen(agentId: agentId, updateId: updateId) {
+  // Same claim-then-complete contract as message updates.
+  switch DatabaseManager.claimUpdate(agentId: agentId, updateId: updateId) {
+  case .claimed:
+    break
+  case .alreadyCompleted:
     logDebug("handleCallbackQuery: duplicate update_id=\(updateId), 200 OK")
     return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
+  case .inFlight:
+    logDebug("handleCallbackQuery: update_id=\(updateId) still in flight, asking for retry")
+    return makeRouteResponse(
+      status: 503, body: #"{"ok":false,"description":"update is being processed"}"#)
   }
-  DatabaseManager.markUpdateSeen(agentId: agentId, updateId: updateId)
   DatabaseManager.pruneOldSeenUpdates()
   DatabaseManager.sweepExpiredDispatches()
 
+  let completeAndAck: () -> String = {
+    DatabaseManager.completeUpdate(agentId: agentId, updateId: updateId)
+    return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
+  }
+
   // Always acknowledge the callback first so the spinner clears in
-  // Telegram even if we end up dropping the event.
+  // Telegram even if we end up dropping the event. Safe under retries —
+  // answering the same callback twice is a no-op on Telegram's side.
   if let token = state.botToken, !token.isEmpty {
     _ = telegramAnswerCallbackQuery(token: token, callbackQueryId: cb.id)
   }
@@ -495,13 +596,13 @@ private func handleCallbackQuery(
     logDebug(
       "handleCallbackQuery: callback \(cb.id) has no source message; "
         + "can't route, dropping")
-    return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
+    return completeAndAck()
   }
 
   let chatId = message.chat.id
   if DatabaseManager.isChatBlocked(agentId: agentId, chatId: chatId) {
     logDebug("handleCallbackQuery: chat \(chatId) is blocked, ignoring")
-    return makeRouteResponse(status: 200, body: #"{"ok":true}"#)
+    return completeAndAck()
   }
 
   // Use the BUTTON-PRESSER's user_id (cb.from), not the source message's
@@ -537,10 +638,20 @@ private func handleCallbackQuery(
     photo: nil, document: nil, voice: nil, audio: nil,
     video: nil, animation: nil)
 
-  return dispatchUserTurn(
+  switch dispatchUserTurn(
     state: state, agentId: agentId,
     chat: chatRow, message: synthMessage,
     bodyText: synthetic, incomingMessageId: message.message_id)
+  {
+  case .completed(let response):
+    DatabaseManager.completeUpdate(agentId: agentId, updateId: updateId)
+    return response
+  case .transientFailure(let description):
+    DatabaseManager.releaseUpdate(agentId: agentId, updateId: updateId)
+    logWarn("handleCallbackQuery: transient failure (\(description)), asking Telegram to retry")
+    return makeRouteResponse(
+      status: 503, body: #"{"ok":false,"description":"temporarily unavailable"}"#)
+  }
 }
 
 /// Placeholder task_id stamped on the pre-inserted row before `dispatch`
