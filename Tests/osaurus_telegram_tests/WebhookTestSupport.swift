@@ -14,15 +14,20 @@ import Foundation
 /// Wraps the supplied Telegram `update` dict in the same JSON envelope
 /// the host passes to `handle_route`. The optional `secret` populates
 /// the `X-Telegram-Bot-Api-Secret-Token` header — pass nil to simulate
-/// a forged caller.
+/// a forged caller. Real Telegram deliveries always POST JSON, so the
+/// helper includes `content-type: application/json` by default;
+/// validation tests can override `contentType` (or pass nil to omit
+/// the header entirely).
 func webhookRequest(
-  secret: String?, update: [String: Any], method: String = "POST"
+  secret: String?, update: [String: Any], method: String = "POST",
+  contentType: String? = "application/json"
 ) -> String {
   let body = String(
     data: try! JSONSerialization.data(withJSONObject: update),
     encoding: .utf8)!
   var headers: [String: String] = [:]
   if let secret { headers["x-telegram-bot-api-secret-token"] = secret }
+  if let contentType { headers["content-type"] = contentType }
   let req: [String: Any] = [
     "route_id": "webhook",
     "method": method,

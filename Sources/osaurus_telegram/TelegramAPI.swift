@@ -12,6 +12,28 @@ struct TelegramResult {
   let retryAfter: Int?
 }
 
+/// Outcome of a "send something to a chat" wrapper. `retryAfter` carries
+/// Telegram's 429 `parameters.retry_after` (seconds) so the tool layer
+/// can surface it in the canonical failure envelope instead of dropping
+/// it in a log line.
+struct TGSendOutcome: Sendable {
+  let ok: Bool
+  let description: String
+  let retryAfter: Int?
+
+  init(ok: Bool, description: String, retryAfter: Int? = nil) {
+    self.ok = ok
+    self.description = description
+    self.retryAfter = retryAfter
+  }
+
+  static let success = TGSendOutcome(ok: true, description: "")
+
+  static func failure(_ response: TelegramResult) -> TGSendOutcome {
+    TGSendOutcome(ok: false, description: response.description, retryAfter: response.retryAfter)
+  }
+}
+
 /// Makes a Telegram Bot API request via host->http_request.
 func telegramRequest(token: String, method: String, body: [String: Any]? = nil) -> TelegramResult {
   let bodyKeys = body.map { Array($0.keys).sorted().joined(separator: ", ") } ?? "none"
@@ -245,7 +267,7 @@ func telegramSendMessage(
   parseMode: String? = nil,
   replyToMessageId: Int64? = nil,
   replyMarkupJSON: String? = nil
-) -> (ok: Bool, description: String) {
+) -> TGSendOutcome {
   var body: [String: Any] = [
     "chat_id": chatId,
     "text": text,
@@ -265,7 +287,7 @@ func telegramSendMessage(
   }
 
   let response = telegramRequest(token: token, method: "sendMessage", body: body)
-  if response.ok { return (true, "") }
+  if response.ok { return .success }
 
   // If parse_mode tripped, retry once as plain text (preserving the
   // reply target / markup). The forgiving retry exists because
@@ -286,22 +308,22 @@ func telegramSendMessage(
       plainBody["reply_markup"] = markup
     }
     let retry = telegramRequest(token: token, method: "sendMessage", body: plainBody)
-    return (retry.ok, retry.ok ? "" : retry.description)
+    return retry.ok ? .success : .failure(retry)
   }
 
-  return (false, response.description)
+  return .failure(response)
 }
 
 /// Sends a chat action (e.g. "typing").
 func telegramSendChatAction(
   token: String, chatId: Int64, action: String = "typing"
-) -> (ok: Bool, description: String) {
+) -> TGSendOutcome {
   let body: [String: Any] = [
     "chat_id": chatId,
     "action": action,
   ]
   let response = telegramRequest(token: token, method: "sendChatAction", body: body)
-  return (response.ok, response.ok ? "" : response.description)
+  return response.ok ? .success : .failure(response)
 }
 
 /// Sends a photo by URL. Bot API accepts a public URL string for `photo`,
@@ -310,7 +332,7 @@ func telegramSendChatAction(
 func telegramSendPhotoByURL(
   token: String, chatId: Int64, photoURL: String, caption: String?,
   replyToMessageId: Int64? = nil
-) -> (ok: Bool, description: String) {
+) -> TGSendOutcome {
   var body: [String: Any] = [
     "chat_id": chatId,
     "photo": photoURL,
@@ -325,7 +347,7 @@ func telegramSendPhotoByURL(
     ]
   }
   let response = telegramRequest(token: token, method: "sendPhoto", body: body)
-  return (response.ok, response.ok ? "" : response.description)
+  return response.ok ? .success : .failure(response)
 }
 
 /// Generic "send by URL" helper for non-photo media. Telegram supports
@@ -337,7 +359,7 @@ func telegramSendMediaByURL(
   token: String, method: String, mediaField: String,
   chatId: Int64, mediaURL: String, caption: String?,
   replyToMessageId: Int64? = nil
-) -> (ok: Bool, description: String) {
+) -> TGSendOutcome {
   var body: [String: Any] = [
     "chat_id": chatId,
     mediaField: mediaURL,
@@ -352,7 +374,7 @@ func telegramSendMediaByURL(
     ]
   }
   let response = telegramRequest(token: token, method: method, body: body)
-  return (response.ok, response.ok ? "" : response.description)
+  return response.ok ? .success : .failure(response)
 }
 
 // MARK: - getFile / file download
@@ -391,7 +413,9 @@ func telegramGetFile(token: String, fileId: String) -> TelegramFileDescriptor? {
 /// Downloads a Telegram file by `file_path` (as returned from `getFile`).
 /// Uses the host's HTTP client so SSRF protection still applies (the
 /// host whitelists `api.telegram.org`). Returns the raw bytes on success.
-func telegramDownloadFile(token: String, filePath: String) -> Data? {
+/// The default timeout is deliberately short: this runs synchronously on
+/// the webhook path, which must answer before Telegram redelivers.
+func telegramDownloadFile(token: String, filePath: String, timeoutMs: Int = 15_000) -> Data? {
   guard let httpRequest = hostAPI?.pointee.http_request else {
     logError("telegramDownloadFile: http_request not available")
     return nil
@@ -399,7 +423,7 @@ func telegramDownloadFile(token: String, filePath: String) -> Data? {
   let request: [String: Any] = [
     "method": "GET",
     "url": "https://api.telegram.org/file/bot\(token)/\(filePath)",
-    "timeout_ms": 60_000,
+    "timeout_ms": timeoutMs,
     // We MUST receive bytes back as base64; UTF-8 framing would corrupt
     // the binary payload (and Telegram serves arbitrary bytes here).
     "response_encoding": "base64",
@@ -453,11 +477,11 @@ func telegramAnswerCallbackQuery(
 // swallow them at debug level.
 func telegramSetMessageReaction(
   token: String, chatId: Int64, messageId: Int64, emoji: String?
-) -> (ok: Bool, description: String) {
+) -> TGSendOutcome {
   // messageId == 0 is our "no source message recorded" sentinel (older
   // rows / synthetic test seeds). Calling setMessageReaction with an
   // invalid id would only earn a 400; short-circuit to silent success.
-  guard messageId > 0 else { return (true, "") }
+  guard messageId > 0 else { return .success }
 
   var body: [String: Any] = [
     "chat_id": chatId,
@@ -470,7 +494,7 @@ func telegramSetMessageReaction(
     body["reaction"] = [[String: Any]]()
   }
   let response = telegramRequest(token: token, method: "setMessageReaction", body: body)
-  return (response.ok, response.ok ? "" : response.description)
+  return response.ok ? .success : .failure(response)
 }
 
 // MARK: - File upload (multipart/form-data)
@@ -525,10 +549,10 @@ func telegramMultipartUpload(
   mimeType: String,
   caption: String?,
   replyToMessageId: Int64? = nil
-) -> (ok: Bool, description: String) {
+) -> TGSendOutcome {
   guard let httpRequest = hostAPI?.pointee.http_request else {
     logError("http_request not available for \(method)")
-    return (false, "http_request unavailable")
+    return TGSendOutcome(ok: false, description: "http_request unavailable")
   }
 
   let boundary = "OsaurusTelegram\(randomHexString(bytes: 16))"
@@ -561,11 +585,11 @@ func telegramMultipartUpload(
 
   guard let requestJSON = makeJSONString(request) else {
     logError("Failed to serialize \(method) request")
-    return (false, "request serialize failed")
+    return TGSendOutcome(ok: false, description: "request serialize failed")
   }
   guard let responseStr = callHostString(httpRequest, requestJSON) else {
     logError("No response from \(method)")
-    return (false, "no response")
+    return TGSendOutcome(ok: false, description: "no response")
   }
   guard let httpResponse = parseJSONObject(responseStr),
     let httpBody = httpResponse["body"] as? String,
@@ -573,15 +597,17 @@ func telegramMultipartUpload(
     let tgResponse = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any]
   else {
     logError("\(method) returned non-JSON envelope: \(String(responseStr.prefix(200)))")
-    return (false, "non-json telegram body")
+    return TGSendOutcome(ok: false, description: "non-json telegram body")
   }
 
   let ok = tgResponse["ok"] as? Bool ?? false
   let description = tgResponse["description"] as? String ?? ""
+  let retryAfter = (tgResponse["parameters"] as? [String: Any])?["retry_after"] as? Int
   if !ok {
     logWarn("Telegram \(method) failed: \(description)")
   }
-  return (ok, ok ? "" : description)
+  return TGSendOutcome(
+    ok: ok, description: ok ? "" : description, retryAfter: ok ? nil : retryAfter)
 }
 
 /// Sends a photo by uploading bytes (sendPhoto multipart variant). MIME
@@ -591,7 +617,7 @@ func telegramSendPhoto(
   token: String, chatId: Int64,
   fileData: Data, filename: String,
   caption: String?, replyToMessageId: Int64? = nil
-) -> (ok: Bool, description: String) {
+) -> TGSendOutcome {
   let mimeType: String
   switch (filename as NSString).pathExtension.lowercased() {
   case "png": mimeType = "image/png"
@@ -612,7 +638,7 @@ func telegramSendDocument(
   token: String, chatId: Int64,
   fileData: Data, filename: String, mimeType: String,
   caption: String?, replyToMessageId: Int64? = nil
-) -> (ok: Bool, description: String) {
+) -> TGSendOutcome {
   return telegramMultipartUpload(
     token: token, method: "sendDocument", fileField: "document",
     chatId: chatId, fileData: fileData, filename: filename,
@@ -628,7 +654,7 @@ func telegramSendVoice(
   token: String, chatId: Int64,
   fileData: Data, filename: String,
   caption: String?, replyToMessageId: Int64? = nil
-) -> (ok: Bool, description: String) {
+) -> TGSendOutcome {
   return telegramMultipartUpload(
     token: token, method: "sendVoice", fileField: "voice",
     chatId: chatId, fileData: fileData, filename: filename,
@@ -642,7 +668,7 @@ func telegramSendAudio(
   token: String, chatId: Int64,
   fileData: Data, filename: String, mimeType: String,
   caption: String?, replyToMessageId: Int64? = nil
-) -> (ok: Bool, description: String) {
+) -> TGSendOutcome {
   return telegramMultipartUpload(
     token: token, method: "sendAudio", fileField: "audio",
     chatId: chatId, fileData: fileData, filename: filename,
@@ -656,7 +682,7 @@ func telegramSendVideo(
   token: String, chatId: Int64,
   fileData: Data, filename: String, mimeType: String,
   caption: String?, replyToMessageId: Int64? = nil
-) -> (ok: Bool, description: String) {
+) -> TGSendOutcome {
   return telegramMultipartUpload(
     token: token, method: "sendVideo", fileField: "video",
     chatId: chatId, fileData: fileData, filename: filename,

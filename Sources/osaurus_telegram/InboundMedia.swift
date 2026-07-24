@@ -190,11 +190,38 @@ private func collectCandidates(_ message: TGUpdate.Message) -> [InboundCandidate
 /// us spend network bandwidth before discovering the file is too large.
 private let maxDownloadBytes: Int64 = 20 * 1024 * 1024
 
-/// Downloads every media attachment on `message` for `agentId`. Returns
-/// the list of attachments that landed on disk; failures are logged but
-/// don't abort the rest of the batch (one bad file shouldn't drop the
-/// whole user turn). Returns `[]` on a fully-text message or when the
-/// bot token is missing.
+/// Cumulative byte budget across every attachment of one update. The
+/// download happens synchronously on the webhook path, so the budget
+/// exists to bound how long a single (possibly hostile) update can hold
+/// the response open. 20 MB total: one max-size file, or several small
+/// ones.
+let maxCumulativeDownloadBytes: Int64 = 20 * 1024 * 1024
+
+/// Wall-clock budget for the whole download batch, checked between
+/// files. Telegram redelivers updates it considers unacknowledged, so
+/// the synchronous path must stay comfortably below Telegram's patience
+/// (and our own claim lease).
+let maxDownloadWallClockSeconds: TimeInterval = 30
+
+/// Per-file HTTP timeout for the bytes download. Files under the 20 MB
+/// cap complete in single-digit seconds on any sane link; 15 s is the
+/// "something is wrong, give up on this file" threshold.
+let perFileDownloadTimeoutMs = 15_000
+
+/// Outcome of the inbound media pass: attachments that landed on disk,
+/// plus human-readable failure notes (surfaced to the agent in the
+/// prompt header so a lost attachment is explicit, never silent).
+struct InboundMediaResult {
+  var attachments: [InboundAttachment] = []
+  var failures: [String] = []
+}
+
+/// Downloads every media attachment on `message` for `agentId`, bounded
+/// by per-file size (20 MB, Telegram's own getFile cap), a cumulative
+/// per-update byte budget, a per-file HTTP timeout, and a wall-clock
+/// budget across the batch. Failures don't abort the rest of the batch
+/// (one bad file shouldn't drop the whole user turn); each one is
+/// recorded in `failures` so the agent hears about it.
 ///
 /// Pre-claims each path via `state.claimArtifactUpload(_:)` BEFORE the
 /// file lands so the host's artifact watcher's `invoke(type: "artifact")`
@@ -202,13 +229,14 @@ private let maxDownloadBytes: Int64 = 20 * 1024 * 1024
 /// pong the user's own upload back to them.
 func downloadInboundMedia(
   state: AgentState, agentId: String, message: TGUpdate.Message
-) -> [InboundAttachment] {
+) -> InboundMediaResult {
   let candidates = collectCandidates(message)
-  if candidates.isEmpty { return [] }
+  if candidates.isEmpty { return InboundMediaResult() }
 
   guard let token = state.botToken, !token.isEmpty else {
     logWarn("inbound media: no bot_token configured; skipping \(candidates.count) attachment(s)")
-    return []
+    return InboundMediaResult(
+      failures: candidates.map { "\($0.kind): skipped (bot token unavailable)" })
   }
 
   let chatId = message.chat.id
@@ -218,7 +246,8 @@ func downloadInboundMedia(
       agentId: agentId, chatId: chatId, messageId: messageId)
   else {
     logWarn("inbound media: cannot resolve artifact directory; skipping")
-    return []
+    return InboundMediaResult(
+      failures: candidates.map { "\($0.kind): skipped (no artifact directory)" })
   }
 
   do {
@@ -227,37 +256,67 @@ func downloadInboundMedia(
   } catch {
     logWarn(
       "inbound media: failed to mkdir \(dir.path): \(error.localizedDescription) — skipping")
-    return []
+    return InboundMediaResult(
+      failures: candidates.map { "\($0.kind): skipped (artifact directory unavailable)" })
   }
 
-  var results: [InboundAttachment] = []
+  var result = InboundMediaResult()
+  var remainingBudget = maxCumulativeDownloadBytes
+  let deadline = Date().addingTimeInterval(maxDownloadWallClockSeconds)
   for candidate in candidates {
-    guard
-      let attachment = downloadOne(
-        token: token, candidate: candidate, dir: dir, state: state)
-    else { continue }
-    results.append(attachment)
+    if Date() > deadline {
+      logWarn("inbound media: wall-clock budget exhausted; skipping \(candidate.kind)")
+      result.failures.append("\(candidate.kind): skipped (download time budget exhausted)")
+      continue
+    }
+    switch downloadOne(
+      token: token, candidate: candidate, dir: dir, state: state,
+      byteBudget: remainingBudget)
+    {
+    case .downloaded(let attachment, let bytes):
+      remainingBudget -= bytes
+      result.attachments.append(attachment)
+    case .failed(let reason):
+      result.failures.append("\(candidate.kind): \(reason)")
+    }
   }
-  return results
+  return result
+}
+
+/// Result of one candidate download. `bytes` feeds the cumulative
+/// budget; cached files count too (they occupied the budget when first
+/// fetched, and counting them keeps retry behaviour identical to the
+/// first delivery).
+private enum DownloadOutcome {
+  case downloaded(InboundAttachment, bytes: Int64)
+  case failed(reason: String)
 }
 
 /// Downloads one candidate file. Centralises the size check, file naming,
-/// pre-claim, and on-disk write. Returns nil on any failure (logged).
+/// pre-claim, and on-disk write.
 private func downloadOne(
-  token: String, candidate: InboundCandidate, dir: URL, state: AgentState
-) -> InboundAttachment? {
+  token: String, candidate: InboundCandidate, dir: URL, state: AgentState,
+  byteBudget: Int64
+) -> DownloadOutcome {
   guard let descriptor = telegramGetFile(token: token, fileId: candidate.fileId) else {
     logWarn(
       "inbound media: getFile failed for kind=\(candidate.kind) "
         + "file_id=\(String(candidate.fileId.prefix(16)))…")
-    return nil
+    return .failed(reason: "download failed (could not resolve file)")
   }
 
   if descriptor.fileSize > maxDownloadBytes {
     logWarn(
       "inbound media: skipping \(candidate.kind) (\(descriptor.fileSize) bytes > "
         + "\(maxDownloadBytes) byte cap)")
-    return nil
+    return .failed(reason: "skipped (file exceeds \(maxDownloadBytes / (1024 * 1024)) MB limit)")
+  }
+
+  if descriptor.fileSize > byteBudget {
+    logWarn(
+      "inbound media: skipping \(candidate.kind) (\(descriptor.fileSize) bytes exceeds "
+        + "remaining per-update budget \(byteBudget))")
+    return .failed(reason: "skipped (per-message download budget exhausted)")
   }
 
   // Resolve final filename + MIME. Telegram-supplied filename wins when
@@ -287,15 +346,23 @@ private func downloadOne(
   // re-download (the file already exists). We still pre-claim above so
   // a second-pass retry doesn't accidentally trigger the auto-forward.
   if FileManager.default.fileExists(atPath: destination.path) {
-    return InboundAttachment(
-      path: destination.path, mimeType: mime, kind: candidate.kind)
+    let size =
+      (try? FileManager.default.attributesOfItem(atPath: destination.path)[.size] as? Int64)
+      .flatMap { $0 } ?? 0
+    return .downloaded(
+      InboundAttachment(path: destination.path, mimeType: mime, kind: candidate.kind),
+      bytes: size)
   }
 
-  guard let bytes = telegramDownloadFile(token: token, filePath: descriptor.filePath) else {
+  guard
+    let bytes = telegramDownloadFile(
+      token: token, filePath: descriptor.filePath,
+      timeoutMs: perFileDownloadTimeoutMs)
+  else {
     logWarn(
       "inbound media: download failed for kind=\(candidate.kind) "
         + "telegram_path=\(descriptor.filePath)")
-    return nil
+    return .failed(reason: "download failed (transfer error or timeout)")
   }
 
   do {
@@ -303,14 +370,15 @@ private func downloadOne(
   } catch {
     logWarn(
       "inbound media: write failed at \(destination.path): \(error.localizedDescription)")
-    return nil
+    return .failed(reason: "download failed (could not write file)")
   }
 
   logDebug(
     "inbound media: stashed kind=\(candidate.kind) bytes=\(bytes.count) "
       + "mime=\(mime) path=\(destination.path)")
-  return InboundAttachment(
-    path: destination.path, mimeType: mime, kind: candidate.kind)
+  return .downloaded(
+    InboundAttachment(path: destination.path, mimeType: mime, kind: candidate.kind),
+    bytes: Int64(bytes.count))
 }
 
 // MARK: - Prompt header rendering
@@ -329,4 +397,12 @@ func renderAttachmentsHeader(_ attachments: [InboundAttachment]) -> String? {
     "path\(index + 1)=\(a.path) type=\(a.mimeType) kind=\(a.kind)"
   }
   return "[attachments \(parts.joined(separator: ", "))]"
+}
+
+/// Renders download failures into an explicit header segment so the agent
+/// (and, through it, the user) learns an attachment was lost rather than
+/// silently answering as if it never existed. Returns nil when empty.
+func renderAttachmentFailuresHeader(_ failures: [String]) -> String? {
+  guard !failures.isEmpty else { return nil }
+  return "[attachment_errors \(failures.joined(separator: "; "))]"
 }

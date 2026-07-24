@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import OsaurusPluginABI
 
 // MARK: - JSON Helpers
 
@@ -187,25 +188,16 @@ func parseAllowedChatIds(_ csv: String?) -> Set<Int64> {
 
 // MARK: - Host string ownership
 
-/// Frees a string allocated by the host on our behalf.
-///
-/// On v6+ hosts we MUST go through `host->free_string` — calling
-/// `libc free()` directly is documented to keep working today, but a
-/// future host allocator change would silently corrupt the heap. On
-/// older hosts the v6 slot is NULL and we fall back to `libc free()`,
-/// which is what every host's `free_string` does internally.
+/// Frees a string allocated by the host on our behalf, via
+/// `HostBridge.hostFree` (host `free_string` on v6+ hosts, libc `free()`
+/// on older ones).
 ///
 /// The host's `free_string` is the *opposite* direction from the
 /// plugin's own `free_string`. NEVER pass a host-returned pointer to
 /// `osr_plugin_api.free_string` — that one is only for strings the
 /// host received from us.
 func freeHostString(_ ptr: UnsafePointer<CChar>?) {
-  guard let ptr else { return }
-  if let host = hostAPI?.pointee, host.version >= 6, let hostFree = host.free_string {
-    hostFree(ptr)
-  } else {
-    free(UnsafeMutableRawPointer(mutating: ptr))
-  }
+  HostBridge.shared.hostFree(ptr)
 }
 
 /// Calls a `(C-string in) -> C-string out` host function with a Swift
@@ -243,42 +235,43 @@ private func printStderr(_ message: String) {
   fputs(message + "\n", Darwin.stderr)
 }
 
+// Host logging goes through `HostBridge` using the header's canonical
+// `OsrLogLevel` scale (0=trace ... 4=error). The pre-SDK code passed a
+// shifted 0..3 scale (debug logged as trace, error logged as warn); Wave 2
+// fixed the mapping. The stderr echo is kept for local debugging.
+
 func logDebug(_ message: String) {
   printStderr("[TELEGRAM][DEBUG] \(message)")
-  withCString(message) { hostAPI?.pointee.log?(0, $0) }
+  HostBridge.shared.log(OsrLogLevel.debug, message)
 }
 
 func logInfo(_ message: String) {
   printStderr("[TELEGRAM][INFO] \(message)")
-  withCString(message) { hostAPI?.pointee.log?(1, $0) }
+  HostBridge.shared.log(OsrLogLevel.info, message)
 }
 
 func logWarn(_ message: String) {
   printStderr("[TELEGRAM][WARN] \(message)")
-  withCString(message) { hostAPI?.pointee.log?(2, $0) }
+  HostBridge.shared.log(OsrLogLevel.warn, message)
 }
 
 func logError(_ message: String) {
   printStderr("[TELEGRAM][ERROR] \(message)")
-  withCString(message) { hostAPI?.pointee.log?(3, $0) }
+  HostBridge.shared.log(OsrLogLevel.error, message)
 }
 
 // MARK: - Config Helpers
 
 func configGet(_ key: String) -> String? {
-  callHostString(hostAPI?.pointee.config_get, key)
+  HostBridge.shared.configGet(key)
 }
 
 func configSet(_ key: String, _ value: String) {
-  key.withCString { k in
-    value.withCString { v in
-      hostAPI?.pointee.config_set?(k, v)
-    }
-  }
+  HostBridge.shared.configSet(key, value)
 }
 
 func configDelete(_ key: String) {
-  key.withCString { hostAPI?.pointee.config_delete?($0) }
+  HostBridge.shared.configDelete(key)
 }
 
 func listActiveTasks() -> String? {
@@ -343,10 +336,5 @@ func readHostFile(path: String) -> Result<HostFileResult, HostFileError> {
 /// plugin spawned). Callers MUST handle the nil case — never cache the result
 /// across callbacks.
 func getActiveAgentId() -> String? {
-  guard let host = hostAPI?.pointee, host.version >= 4,
-    let fn = host.get_active_agent_id
-  else { return nil }
-  guard let ptr = fn() else { return nil }
-  defer { freeHostString(ptr) }
-  return String(cString: ptr)
+  HostBridge.shared.activeAgentId()
 }

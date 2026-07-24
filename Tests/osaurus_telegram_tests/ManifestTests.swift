@@ -18,10 +18,33 @@ final class ManifestTests: XCTestCase {
     let m = try parsed()
     XCTAssertEqual(m["plugin_id"] as? String, "osaurus.telegram")
     XCTAssertEqual(m["name"] as? String, "Telegram")
-    XCTAssertEqual(m["version"] as? String, "1.5.0")
+    XCTAssertEqual(m["version"] as? String, telegramPluginVersion)
+    XCTAssertEqual(m["version"] as? String, "1.5.1")
     XCTAssertEqual(m["license"] as? String, "MIT")
     XCTAssertNotNil(m["description"] as? String)
     XCTAssertNotNil(m["instructions"] as? String)
+  }
+
+  /// The manifest version and `osaurus-plugin.json` must stay in
+  /// lockstep — the repo-root JSON is what the packaging pipeline reads.
+  func testVersionMatchesPluginJSON() throws {
+    let jsonURL = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent()  // osaurus_telegram_tests
+      .deletingLastPathComponent()  // Tests
+      .deletingLastPathComponent()  // repo root
+      .appendingPathComponent("osaurus-plugin.json")
+    let data = try Data(contentsOf: jsonURL)
+    let obj = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: data) as? [String: Any])
+    XCTAssertEqual(obj["version"] as? String, telegramPluginVersion)
+  }
+
+  /// Every per-agent callback requires host ABI v4 (`get_active_agent_id`),
+  /// so the manifest must not admit hosts older than the v4 floor.
+  func testMinOsaurusGuaranteesABIv4() throws {
+    let m = try parsed()
+    XCTAssertEqual(m["min_osaurus"] as? String, telegramMinOsaurusVersion)
+    XCTAssertEqual(m["min_osaurus"] as? String, "0.18.14")
   }
 
   func testInstructionsExplainReplyTokenContract() throws {

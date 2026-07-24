@@ -1,0 +1,15 @@
+{
+  "originHash" : "d851afc409d6b9648bf5dc4b868439b4a65096eaa8cd83a39642b8fc5075a564",
+  "pins" : [
+    {
+      "identity" : "osaurus-plugin-sdk",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/osaurus-ai/osaurus-plugin-sdk.git",
+      "state" : {
+        "revision" : "f5fac88621aa174531c0aac3c1d1dbbbd8142522",
+        "version" : "1.0.0"
+      }
+    }
+  ],
+  "version" : 3
+}

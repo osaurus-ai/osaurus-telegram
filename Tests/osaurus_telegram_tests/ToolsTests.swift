@@ -67,7 +67,9 @@ final class ToolsTests: XCTestCase {
     let env = parseEnvelope(handleReply(state: state, payload: "not-json"))
     XCTAssertEqual(env["ok"] as? Bool, false)
     XCTAssertEqual(env["kind"] as? String, "invalid_args")
-    XCTAssertEqual(env["retryable"] as? Bool, true)
+    // Deterministic failure: resending the identical bad payload can
+    // never succeed, so invalid_args must not invite a retry.
+    XCTAssertEqual(env["retryable"] as? Bool, false)
   }
 
   func testReplyTypingRejectsMissingToken() {
