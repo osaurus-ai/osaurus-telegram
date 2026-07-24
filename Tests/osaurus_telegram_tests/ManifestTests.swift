@@ -19,7 +19,7 @@ final class ManifestTests: XCTestCase {
     XCTAssertEqual(m["plugin_id"] as? String, "osaurus.telegram")
     XCTAssertEqual(m["name"] as? String, "Telegram")
     XCTAssertEqual(m["version"] as? String, telegramPluginVersion)
-    XCTAssertEqual(m["version"] as? String, "1.5.1")
+    XCTAssertEqual(m["version"] as? String, "1.6.0")
     XCTAssertEqual(m["license"] as? String, "MIT")
     XCTAssertNotNil(m["description"] as? String)
     XCTAssertNotNil(m["instructions"] as? String)

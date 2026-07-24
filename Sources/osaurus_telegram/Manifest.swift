@@ -17,7 +17,7 @@ import Foundation
 
 /// Single source of truth for the plugin version. Keep in lockstep with
 /// `osaurus-plugin.json` (ManifestTests pins the alignment).
-let telegramPluginVersion = "1.5.1"
+let telegramPluginVersion = "1.6.0"
 
 /// Earliest Osaurus host guaranteeing ABI v4 (`get_active_agent_id`),
 /// which every per-agent callback in this plugin depends on. 0.18.14 is
